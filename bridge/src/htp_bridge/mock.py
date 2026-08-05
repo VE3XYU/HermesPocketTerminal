@@ -6,8 +6,11 @@ from typing import Any, Callable
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
+from htp_bridge.errors import install_error_handlers
+
 MOCK_WAV = b"RIFF" + b"\x00" * 128
 MOCK_REV = "mockrev1"
+MOCK_SYNC_INTERVAL = 600  # ServerConfig's sync_interval_seconds default
 MOCK_ITEMS = [
     {"id": "t-9f2", "text": "Buy milk", "done": False},
     {"id": "t-c41", "text": "Call dentist", "done": True, "style": "dim"},
@@ -21,6 +24,9 @@ def create_mock_app(clock: Callable[[], int] = lambda: int(time.time())) -> Fast
     device can be brought up against a laptop with nothing else running.
     """
     app = FastAPI(title="HTP Bridge (mock)", docs_url=None, redoc_url=None)
+    # D2 parity with the real API: firmware developed against the mock must see
+    # the same {"error": "<slug>"} envelope, never FastAPI's {"detail": ...}.
+    install_error_handlers(app)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -54,8 +60,19 @@ def create_mock_app(clock: Callable[[], int] = lambda: int(time.time())) -> Fast
     @app.get("/htp/v1/dashboard")
     async def dashboard(rev: str = "") -> dict[str, Any]:
         if rev == MOCK_REV:
-            return {"rev": MOCK_REV, "unchanged": True, "server_time": clock()}
-        return {"rev": MOCK_REV, "server_time": clock(), "title": "Today", "items": MOCK_ITEMS}
+            return {
+                "rev": MOCK_REV,
+                "unchanged": True,
+                "server_time": clock(),
+                "sync_interval": MOCK_SYNC_INTERVAL,
+            }
+        return {
+            "rev": MOCK_REV,
+            "server_time": clock(),
+            "title": "Today",
+            "items": MOCK_ITEMS,
+            "sync_interval": MOCK_SYNC_INTERVAL,
+        }
 
     @app.post("/htp/v1/complete")
     async def complete(payload: dict[str, Any]) -> dict[str, Any]:

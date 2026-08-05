@@ -51,3 +51,36 @@ def test_mock_notifications_and_ack():
 
 def test_mock_complete_returns_ok():
     assert client().post("/htp/v1/complete", json={"item_id": "t-1"}, headers=AUTH).json()["ok"]
+
+
+def test_mock_dashboard_serves_sync_interval_on_full_body():
+    body = client().get("/htp/v1/dashboard", headers=AUTH).json()
+    assert body["sync_interval"] == 600
+
+
+def test_mock_dashboard_serves_sync_interval_when_unchanged():
+    c = client()
+    rev = c.get("/htp/v1/dashboard", headers=AUTH).json()["rev"]
+    body = c.get("/htp/v1/dashboard", params={"rev": rev}, headers=AUTH).json()
+    assert body["unchanged"] is True
+    assert body["sync_interval"] == 600
+
+
+def test_mock_unknown_path_returns_not_found_slug():
+    response = client().get("/htp/v1/nope", headers=AUTH)
+    assert response.status_code == 404
+    assert response.json() == {"error": "not_found"}
+
+
+def test_mock_wrong_method_returns_method_not_allowed_slug():
+    response = client().delete("/htp/v1/dashboard", headers=AUTH)
+    assert response.status_code == 405
+    assert response.json() == {"error": "method_not_allowed"}
+
+
+def test_mock_invalid_body_returns_invalid_request_slug():
+    response = client().post(
+        "/htp/v1/complete", content=b"not json", headers={**AUTH, "Content-Type": "application/json"}
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": "invalid_request"}
