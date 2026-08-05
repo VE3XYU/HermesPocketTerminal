@@ -8,6 +8,10 @@ wifi.json
 *.env
 .env.*
 
+# Local tooling scratch
+.superpowers/
+.venv/
+
 # OS and editor cruft
 .DS_Store
 Thumbs.db
@@ -20,3 +24,7 @@ build/
 dist/
 *.bin
 *.elf
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/

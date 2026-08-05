@@ -1,0 +1,37 @@
+[server]
+host = "127.0.0.1"
+port = 8787
+max_upload_bytes = 4200000
+sync_interval_seconds = 600
+
+# One block per device. Generate tokens with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+[[devices]]
+id = "pocket-01"
+token = "replace-with-a-long-random-string"
+
+[salutations]
+prefixes = ["hey hermes", "hermes"]
+
+[agent]
+base_url = "http://127.0.0.1:8080/v1"
+model = "hermes-fast"
+api_key = ""
+timeout_seconds = 60
+
+[speech]
+provider = "openai"
+api_key = "replace-with-your-speech-api-key"
+stt_model = "whisper-1"
+tts_model = "tts-1"
+tts_voice = "alloy"
+timeout_seconds = 60
+
+[storage]
+db_path = "/var/lib/htp-bridge/htp.db"
+audio_dir = "/var/lib/htp-bridge/audio"
+upload_retention_days = 365
+reply_retention_days = 7
+
+[dashboard]
+max_items = 32
+max_text_chars = 40

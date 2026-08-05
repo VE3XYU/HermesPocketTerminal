@@ -1,0 +1,19 @@
+{
+  "items": [
+    {
+      "done": false,
+      "id": "t-9f2",
+      "text": "Buy milk"
+    },
+    {
+      "done": true,
+      "id": "t-c41",
+      "style": "dim",
+      "text": "Call dentist"
+    }
+  ],
+  "rev": "44818d09",
+  "server_time": 1000000,
+  "sync_interval": 600,
+  "title": "Today"
+}
