@@ -99,6 +99,7 @@ def app_context(db, fake_clock, tmp_path, device_config):
         "dashboard": dashboard,
         "notifications": notifications,
         "devices": devices,
+        "pipeline": pipeline,
         "agent": agent,
         "speech": speech,
         "clock": fake_clock,

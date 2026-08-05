@@ -138,6 +138,17 @@ class Pipeline:
         transcription stage, so this wrapper is a safety net for other
         unforeseen failures rather than the primary defense against a missing
         WAV -- that defense now lives on the direct-call path too.)
+
+        Fix (review): the failure branch must not blindly overwrite the
+        capture's state. _finish_note writes done/ingest_failed *before*
+        calling agent.ingest, precisely so an interrupted ingest stays visible
+        to sweep_ingestion(). If a non-AgentError then escapes process() (e.g.
+        a bare exception from a still-misbehaving agent client), blindly
+        setting the row to failed/pipeline_error here would erase that
+        write-ahead flag -- removing the capture from ingestion_backlog() and
+        losing the note permanently instead of leaving it for retry. The row
+        is therefore re-fetched and only overwritten if it hasn't already
+        reached a terminal state.
         """
         pending = self._captures.unfinished_ids()
         for capture_id in pending:
@@ -145,6 +156,9 @@ class Pipeline:
                 await self.process(capture_id)
             except Exception:
                 log.exception("capture %s: unexpected error during resume", capture_id)
+                capture = self._captures.get(capture_id)
+                if capture is None or capture.state in TERMINAL_STATES:
+                    continue
                 if not self._storage.upload_path(capture_id).exists():
                     error = "audio_missing"
                 else:

@@ -290,6 +290,39 @@ async def test_resume_reprocesses_captures_left_mid_pipeline(parts, fake_clock):
     assert captures.get("c-1").state == "done"
 
 
+async def test_resume_does_not_clobber_ingest_failed_when_agent_raises_unexpectedly(parts, fake_clock):
+    """Fix round 2: resume()'s per-capture except must not blindly overwrite the
+    row to failed/pipeline_error. _finish_note writes done/ingest_failed BEFORE
+    calling agent.ingest, precisely so an interrupted ingest is visible to
+    sweep_ingestion(). If agent.ingest raises something other than AgentError
+    (simulating a still-misbehaving agent client) after that write-ahead flag
+    has landed, resume()'s safety net must leave the row alone -- clobbering it
+    would silently drop the note instead of leaving it for sweep_ingestion() to
+    retry.
+    """
+    captures, _, _ = parts
+
+    class ExplodingAgent:
+        async def ingest(self, text, recorded_at):
+            raise RuntimeError("simulated ongoing agent misbehavior")
+
+        async def converse(self, text, history):
+            raise AssertionError("not used in this test")
+
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk"})
+    agent = ExplodingAgent()
+    upload(parts, "c-1")
+    captures.set_state("c-1", "received")  # simulate a crash before this capture finished
+
+    resumed = await build(parts, fake_clock, speech=speech, agent=agent).resume()
+
+    assert resumed == 1
+    capture = captures.get("c-1")
+    assert capture.state == "done", "the write-ahead flag must survive, not be clobbered to failed"
+    assert capture.error == "ingest_failed"
+    assert [c.id for c in captures.ingestion_backlog()] == ["c-1"]
+
+
 async def test_sweep_redirects_queues_unclaimed_reply_as_notification(parts, fake_clock):
     captures, _, notifications = parts
     speech = FakeSpeechProvider(transcripts={"c-1": "Hey Hermes, what's for dinner?"})

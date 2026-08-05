@@ -1,3 +1,4 @@
+from htp_bridge.captures import INGEST_FAILED
 from tests.conftest import AUTH
 
 WAV = b"RIFF" + b"\x00" * 64
@@ -108,6 +109,29 @@ def test_background_pipeline_failure_marks_capture_pipeline_error(client, app_co
     capture = app_context["captures"].get("c-1")
     assert capture.state == "failed"
     assert capture.error == "pipeline_error"
+
+
+def test_background_pipeline_failure_after_terminal_state_is_not_clobbered(client, app_context):
+    # Fix round 2: Pipeline._finish_note writes done/ingest_failed *before*
+    # calling agent.ingest, specifically so an interrupted ingest stays visible
+    # to sweep_ingestion(). If pipeline.process raises something unexpected
+    # AFTER that write-ahead flag has landed, the background wrapper's failure
+    # guard must not clobber it back to failed/pipeline_error -- that would
+    # silently drop the note from ingestion_backlog() instead of retrying it.
+    captures = app_context["captures"]
+
+    async def stub_process(capture_id):
+        captures.set_state(capture_id, "done", error=INGEST_FAILED)
+        raise RuntimeError("boom after the write-ahead flag landed")
+
+    app_context["pipeline"].process = stub_process
+
+    upload(client, "c-1")
+
+    capture = captures.get("c-1")
+    assert capture.state == "done"
+    assert capture.error == INGEST_FAILED
+    assert capture.id in {c.id for c in captures.ingestion_backlog()}
 
 
 def test_status_poll_returns_requested_captures(client, app_context):

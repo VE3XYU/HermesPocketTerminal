@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from htp_bridge.agent import AgentError
-from htp_bridge.captures import CaptureStore
+from htp_bridge.captures import TERMINAL_STATES, CaptureStore
 from htp_bridge.config import DeviceConfig, ServerConfig
 from htp_bridge.dashboard import DashboardStore
 from htp_bridge.devices import DeviceRegistry
@@ -298,11 +298,23 @@ async def _run_pipeline(deps: Deps, capture_id: str) -> None:
     save_reply) must not vanish silently and leave the capture wedged in a
     non-terminal state forever. Mirrors the per-capture safety net
     Pipeline.resume() applies to each capture it retries.
+
+    Fix (review): must not blindly overwrite the capture's state. Pipeline's
+    _finish_note writes done/ingest_failed *before* calling agent.ingest, so an
+    interrupted ingest stays visible to sweep_ingestion(). If a non-AgentError
+    then escapes process(), blindly setting the row to failed/pipeline_error
+    here would erase that write-ahead flag -- dropping the note from
+    ingestion_backlog() and losing it permanently instead of leaving it for
+    retry. The row is re-fetched and only overwritten if it hasn't already
+    reached a terminal state.
     """
     try:
         await deps.pipeline.process(capture_id)
     except Exception:
         log.exception("capture %s: unexpected error during background processing", capture_id)
+        capture = deps.captures.get(capture_id)
+        if capture is None or capture.state in TERMINAL_STATES:
+            return
         if deps.storage.upload_path(capture_id).exists():
             error = "pipeline_error"
         else:
