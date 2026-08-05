@@ -16,6 +16,37 @@ def is_valid_capture_id(value: str) -> bool:
     return bool(_ID_PATTERN.match(value or ""))
 
 
+def _repaired_wav(data: bytes) -> bytes:
+    """Rewrite streaming placeholder sizes to describe the bytes actually present.
+
+    Speech providers synthesize as a stream and cannot know the length up front,
+    so they emit 0xFFFFFFFF for the RIFF and data sizes (OpenAI /audio/speech
+    does exactly this). The device plays a reply by reading its WAV header, so
+    the bridge must not hand it a file that claims to be 4 GiB. Anything that is
+    not a RIFF/WAVE container is passed through untouched.
+    """
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return data
+
+    index = 12
+    while index + 8 <= len(data):
+        chunk_id = data[index : index + 4]
+        declared = int.from_bytes(data[index + 4 : index + 8], "little")
+        body = index + 8
+        if chunk_id == b"data":
+            actual = len(data) - body
+            if declared == actual and int.from_bytes(data[4:8], "little") == len(data) - 8:
+                return data
+            repaired = bytearray(data)
+            repaired[4:8] = (len(data) - 8).to_bytes(4, "little")
+            repaired[index + 4 : index + 8] = actual.to_bytes(4, "little")
+            return bytes(repaired)
+        if declared > len(data) - body:
+            return data  # unwalkable header; leave it alone rather than corrupt it
+        index = body + declared + (declared % 2)
+    return data
+
+
 class AudioStorage:
     def __init__(
         self,
@@ -47,7 +78,7 @@ class AudioStorage:
     def save_reply(self, capture_id: str, data: bytes) -> Path:
         path = self.reply_path(capture_id)
         temporary = path.with_suffix(".wav.part")
-        temporary.write_bytes(data)
+        temporary.write_bytes(_repaired_wav(data))
         temporary.replace(path)
         self._stamp(path)
         return path

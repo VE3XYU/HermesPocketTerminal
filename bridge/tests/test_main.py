@@ -72,6 +72,37 @@ def test_full_app_mounts_the_mcp_endpoint(config_path):
     assert any(getattr(route, "path", "").startswith("/mcp") for route in app.routes)
 
 
+def test_mcp_endpoint_answers_initialize_at_the_documented_url(config_path):
+    """The README tells Hermes Agent to use <base>/mcp -- that URL must work.
+
+    A route existing under /mcp is not enough: FastMCP's own app serves at its
+    configured streamable_http_path, so mounting it without pinning that path
+    puts the real endpoint one level deeper and every request 404s.
+    """
+    app = create_full_app(load_config(config_path))
+    # base_url pins the Host header: the MCP SDK enables DNS-rebinding
+    # protection by default and only allows 127.0.0.1/localhost/[::1], which is
+    # how Hermes Agent reaches this mount. TestClient's default "testserver"
+    # host would be rejected with 421 before routing is ever reached.
+    with TestClient(app, base_url="http://127.0.0.1:8787") as client:
+        response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "1.0"},
+                },
+            },
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+    assert response.status_code == 200
+    assert "serverInfo" in response.text
+
+
 def test_main_reports_missing_config_without_traceback(tmp_path, capsys):
     exit_code = main(["--config", str(tmp_path / "absent.toml")])
     assert exit_code == 1

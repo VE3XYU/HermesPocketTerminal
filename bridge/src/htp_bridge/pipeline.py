@@ -40,6 +40,11 @@ class Pipeline:
         clock: Callable[[], int] = lambda: int(time.time()),
         conversation_id_factory: Callable[[], str] = _default_conversation_id,
     ) -> None:
+        # Captures whose ingest call is in flight right now. Deliberately in
+        # memory and never persisted: the ingest-failed flag on disk cannot tell
+        # a slow agent from a failed one, and after a crash the set is empty --
+        # which is correct, because an interrupted ingest does need retrying.
+        self._ingesting: set[str] = set()
         self._captures = captures
         self._storage = storage
         self._notifications = notifications
@@ -87,11 +92,14 @@ class Pipeline:
         always visible to sweep_ingestion(); a clean success clears it again.
         """
         self._captures.set_state(capture_id, "done", error=INGEST_FAILED)
+        self._ingesting.add(capture_id)
         try:
             await self._agent.ingest(transcript, recorded_at)
         except AgentError:
             log.exception("capture %s: agent ingestion failed, queued for retry", capture_id)
             return
+        finally:
+            self._ingesting.discard(capture_id)
         self._captures.set_state(capture_id, "done", error=None)
 
     async def _answer(self, capture_id: str, prompt: str, conversation_id: str | None) -> None:
@@ -187,7 +195,7 @@ class Pipeline:
         """Retry notes the agent refused or was unavailable for."""
         retried = 0
         for capture in self._captures.ingestion_backlog():
-            if not capture.transcript:
+            if not capture.transcript or capture.id in self._ingesting:
                 continue
             try:
                 await self._agent.ingest(capture.transcript, capture.recorded_at)

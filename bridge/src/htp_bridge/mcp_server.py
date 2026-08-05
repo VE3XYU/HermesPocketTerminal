@@ -70,7 +70,11 @@ class HermesTools:
 
 
 def create_mcp_server(tools: HermesTools, name: str = "htp-bridge") -> FastMCP:
-    server = FastMCP(name)
+    # FastMCP's streamable_http_app() serves at streamable_http_path, which
+    # defaults to "/mcp". The app is mounted under "/mcp" (main.create_full_app),
+    # so leaving the default would put the endpoint at "/mcp/mcp" and 404 the
+    # documented URL. Pin it to the mount root and let the mount own the prefix.
+    server = FastMCP(name, streamable_http_path="/")
     server.add_tool(tools.publish_dashboard)
     server.add_tool(tools.queue_notification)
     server.add_tool(tools.get_device_status)

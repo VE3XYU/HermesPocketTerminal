@@ -1,5 +1,6 @@
 """Cross-cutting tests for the guarantees in design section 8."""
 
+import asyncio
 import itertools
 
 import pytest
@@ -159,3 +160,52 @@ def test_oversized_upload_is_rejected_without_storing(client, app_context):
 
     assert app_context["captures"].get("c-big") is None
     assert not app_context["storage"].upload_path("c-big").exists()
+
+
+class SlowIngestAgent(FakeAgentClient):
+    """Agent whose first ingest hangs until released; later calls return at once.
+
+    Models the real deployment, where a note takes the agent longer to absorb
+    than the bridge's sweep interval.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self._first = True
+
+    async def ingest(self, text: str, recorded_at: int | None) -> None:
+        if self._first:
+            self._first = False
+            self.started.set()
+            await self.release.wait()
+        await FakeAgentClient.ingest(self, text, recorded_at)
+
+
+async def test_sweep_leaves_a_note_whose_ingest_is_still_in_flight(db, fake_clock, tmp_path):
+    """A slow agent must not be mistaken for a failed one (design section 8).
+
+    _finish_note writes the ingest-failed flag *before* calling the agent so a
+    crash mid-ingest stays visible. The cost is that an ingest still in flight is
+    indistinguishable from one that failed, so a sweep landing in that window
+    delivers the same note to the agent twice.
+    """
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk"})
+    agent = SlowIngestAgent()
+    captures, storage, _, pipeline = build_pipeline(
+        db, fake_clock, tmp_path, speech=speech, agent=agent
+    )
+    captures.create(capture_id="c-1", device_id="pocket-01", recorded_at=1, conversation_id=None)
+    storage.save_upload("c-1", WAV)
+
+    processing = asyncio.create_task(pipeline.process("c-1"))
+    await asyncio.wait_for(agent.started.wait(), timeout=5)
+
+    await pipeline.sweep_ingestion()
+
+    agent.release.set()
+    await asyncio.wait_for(processing, timeout=5)
+
+    assert agent.ingested == [("Add milk", 1)]
+    assert captures.get("c-1").error is None
