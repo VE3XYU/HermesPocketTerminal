@@ -84,6 +84,32 @@ def test_upload_rejects_oversized_body(client):
     assert response.json() == {"error": "capture_too_large"}
 
 
+def test_oversized_upload_leaves_no_orphan_wav_or_capture_row(client, app_context):
+    # Protects the D1 ordering: the size cap is enforced before storage.save_upload
+    # is ever called, so a rejected upload must leave neither an orphan WAV file
+    # nor a capture row behind.
+    upload(client, "c-1", body=b"x" * 1001)
+    assert not app_context["storage"].upload_path("c-1").exists()
+    assert app_context["captures"].get("c-1") is None
+
+
+def test_background_pipeline_failure_marks_capture_pipeline_error(client, app_context):
+    # An unexpected exception from deep inside the pipeline (here, from the
+    # speech provider, which process() does not catch beyond SpeechError/OSError)
+    # must not vanish silently after the 200 has already been returned -- it
+    # must mark the capture failed so it isn't wedged non-terminal forever.
+    async def explode(_wav_path):
+        raise RuntimeError("boom")
+
+    app_context["speech"].transcribe = explode
+
+    upload(client, "c-1")
+
+    capture = app_context["captures"].get("c-1")
+    assert capture.state == "failed"
+    assert capture.error == "pipeline_error"
+
+
 def test_status_poll_returns_requested_captures(client, app_context):
     upload(client, "c-1")
     response = client.get("/htp/v1/captures", params={"ids": "c-1"}, headers=AUTH)

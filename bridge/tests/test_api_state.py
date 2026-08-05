@@ -1,4 +1,7 @@
-from tests.conftest import AUTH
+import httpx
+
+from htp_bridge.api import authenticate_token
+from tests.conftest import AUTH, TOKEN
 
 
 def test_healthz_needs_no_token(client):
@@ -175,3 +178,34 @@ def test_wrong_method_on_known_path_returns_method_not_allowed(client):
     response = client.delete("/htp/v1/dashboard", headers=AUTH)
     assert response.status_code == 405
     assert response.json() == {"error": "method_not_allowed"}
+
+
+def test_authenticate_token_rejects_non_ascii_token_without_raising(app_context):
+    # httpx (and real HTTP clients) refuse to send non-ASCII header values, so
+    # this can't be exercised through client.post(...). Starlette itself
+    # decodes headers as latin-1, though, so a garbled Authorization header can
+    # still carry non-ASCII bytes into the app. hmac.compare_digest raises
+    # TypeError on non-ASCII str input rather than returning False; the fix
+    # rejects such tokens before they reach DeviceRegistry.authenticate.
+    result = authenticate_token(app_context["devices"], "tok-\xff")
+    assert result is None
+
+
+def test_authenticate_token_still_accepts_a_valid_token(app_context):
+    result = authenticate_token(app_context["devices"], TOKEN)
+    assert result is not None
+    assert result.id == "pocket-01"
+
+
+async def test_unhandled_exception_returns_generic_500(app_context):
+    def boom():
+        raise RuntimeError("boom")
+
+    app_context["notifications"].pending = boom
+
+    transport = httpx.ASGITransport(app=app_context["client"].app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as raw_client:
+        response = await raw_client.get("/htp/v1/notifications", headers=AUTH)
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "internal_error"}

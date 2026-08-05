@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -17,6 +18,8 @@ from htp_bridge.devices import DeviceRegistry
 from htp_bridge.notifications import NotificationStore
 from htp_bridge.pipeline import Pipeline
 from htp_bridge.storage import AudioStorage, is_valid_capture_id
+
+log = logging.getLogger(__name__)
 
 MAX_STATUS_IDS = 64
 EMPTY_REVISION = "0"
@@ -54,6 +57,29 @@ def _int_or_none(value: str | None) -> int | None:
         return None
 
 
+def _extract_token(authorization: str | None) -> str:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def authenticate_token(devices: DeviceRegistry, token: str) -> DeviceConfig | None:
+    """Resolve a bearer token to its device, or None if it doesn't match.
+
+    Non-ASCII tokens are rejected here rather than passed to
+    DeviceRegistry.authenticate. Starlette decodes headers as latin-1, so a
+    garbled Authorization header can carry non-ASCII characters through to this
+    point; DeviceRegistry.authenticate compares with hmac.compare_digest, which
+    raises TypeError when either string contains non-ASCII characters instead of
+    returning False. Left unguarded, that TypeError would escape as an
+    unhandled 500 -- and per the design's retry table, a 5xx tells the device to
+    retry with backoff, when this is really just an auth failure (401).
+    """
+    if not token or not token.isascii():
+        return None
+    return devices.authenticate(token)
+
+
 def create_app(deps: Deps, lifespan=None) -> FastAPI:
     app = FastAPI(title="HTP Bridge", docs_url=None, redoc_url=None, lifespan=lifespan)
 
@@ -74,14 +100,20 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
         slug = _STATUS_SLUGS.get(exc.status_code, _DEFAULT_HTTP_SLUG)
         return JSONResponse(status_code=exc.status_code, content={"error": slug})
 
+    # D2 (completed per review): any exception not already caught by a more
+    # specific handler above must still produce the {"error": "<slug>"} shape
+    # rather than Starlette's default text/plain 500 traceback page.
+    @app.exception_handler(Exception)
+    async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+        log.exception("unhandled exception on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"error": "internal_error"})
+
     def authenticate(
         authorization: str | None = Header(default=None),
         x_battery: str | None = Header(default=None),
     ) -> DeviceConfig:
-        token = ""
-        if authorization and authorization.lower().startswith("bearer "):
-            token = authorization[7:].strip()
-        device = deps.devices.authenticate(token)
+        token = _extract_token(authorization)
+        device = authenticate_token(deps.devices, token)
         if device is None:
             raise HTPError(401, "unauthorized")
         deps.devices.record_telemetry(device.id, _int_or_none(x_battery))
@@ -136,7 +168,7 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
             conversation_id=x_conversation_id or None,
         )
         if created:
-            background.add_task(deps.pipeline.process, x_capture_id)
+            background.add_task(_run_pipeline, deps, x_capture_id)
             return {"id": x_capture_id, "state": "received"}
         return {"id": capture.id, "state": capture.state}
 
@@ -257,6 +289,25 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
         return {"ok": True, "acked": acked}
 
     return app
+
+
+async def _run_pipeline(deps: Deps, capture_id: str) -> None:
+    """Run pipeline.process in the background, isolated from the request that
+    scheduled it. The 200 has already gone out by the time this runs, so an
+    unexpected exception here (e.g. OSError from a full disk during
+    save_reply) must not vanish silently and leave the capture wedged in a
+    non-terminal state forever. Mirrors the per-capture safety net
+    Pipeline.resume() applies to each capture it retries.
+    """
+    try:
+        await deps.pipeline.process(capture_id)
+    except Exception:
+        log.exception("capture %s: unexpected error during background processing", capture_id)
+        if deps.storage.upload_path(capture_id).exists():
+            error = "pipeline_error"
+        else:
+            error = "audio_missing"
+        deps.captures.set_state(capture_id, "failed", error=error)
 
 
 async def _notify_completion(deps: Deps, item_id: str, text: str) -> None:
