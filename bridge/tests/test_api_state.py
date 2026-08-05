@@ -173,6 +173,20 @@ def test_ack_with_unknown_ids_is_accepted(client):
     assert response.json() == {"ok": True, "acked": 0}
 
 
+def test_ack_rejects_oversized_ids_list(client):
+    ids = [f"n-{i}" for i in range(65)]
+    response = client.post("/htp/v1/notifications/ack", json={"ids": ids}, headers=AUTH)
+    assert response.status_code == 400
+    assert response.json() == {"error": "too_many_ids"}
+
+
+def test_ack_accepts_a_full_batch_at_the_cap(client):
+    ids = [f"n-{i}" for i in range(64)]
+    response = client.post("/htp/v1/notifications/ack", json={"ids": ids}, headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "acked": 0}
+
+
 def test_ack_rejects_missing_ids_field(client):
     response = client.post("/htp/v1/notifications/ack", json={}, headers=AUTH)
     assert response.status_code == 400

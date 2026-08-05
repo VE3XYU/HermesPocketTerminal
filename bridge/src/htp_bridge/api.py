@@ -21,6 +21,7 @@ from htp_bridge.storage import AudioStorage, is_valid_capture_id
 log = logging.getLogger(__name__)
 
 MAX_STATUS_IDS = 64
+MAX_ACK_IDS = 64
 EMPTY_REVISION = "0"
 
 
@@ -252,6 +253,8 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
     ) -> dict[str, Any]:
         if "ids" not in payload or not isinstance(payload["ids"], list):
             raise HTPError(400, "missing_ids")
+        if len(payload["ids"]) > MAX_ACK_IDS:
+            raise HTPError(400, "too_many_ids")
         acked = deps.notifications.ack([str(i) for i in payload["ids"]])
         return {"ok": True, "acked": acked}
 
