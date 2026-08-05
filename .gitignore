@@ -1,0 +1,22 @@
+# Third-party firmware kept locally for hardware reference only.
+# Not part of this project and not redistributed.
+/reference/
+
+# Local configuration and credentials — never commit.
+secrets.h
+wifi.json
+*.env
+.env.*
+
+# OS and editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Build output
+build/
+dist/
+*.bin
+*.elf

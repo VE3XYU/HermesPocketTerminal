@@ -33,7 +33,7 @@ Three components:
 ```
 ┌──────────────────┐   HTP over HTTPS    ┌──────────────────────┐
 │ Pocket Terminal  │ ──────────────────▶ │  HTP Bridge          │
-│ (ESP32-S3)       │ ◀────────────────── │  (Ubuntu VM)         │
+│ (ESP32-S3)       │ ◀────────────────── │  (server host)       │
 │                  │                     │                      │
 │ • record → SD    │                     │ • HTP endpoints      │
 │ • upload WAV     │                     │ • device auth        │
@@ -99,9 +99,9 @@ Hermes Agent is never exposed to the internet. Only HTP is.
 only an experimental community port of `libzt` exists. Beyond maturity, an overlay
 requires re-establishing a peer session after every deep-sleep wake, adding seconds of
 radio-on time to every capture. That conflicts with both the 250 ms capture target and
-multi-day battery life. ZeroTier remains the operator's private admin path to the VM and
-is unrelated to HTP. Because HTP is ordinary HTTPS, a future ESP32 overlay client could
-be placed underneath it without protocol changes.
+multi-day battery life. An overlay network may still be used for operator access to the
+server; that is unrelated to HTP. Because HTP is ordinary HTTPS, a future ESP32 overlay
+client could be placed underneath it without protocol changes.
 
 ### Authentication
 
@@ -509,8 +509,8 @@ A single configuration file holds: device tokens, salutation list, speech provid
 selection and API keys, Hermes Agent API URL, model hint, audio retention policy, and the
 default sync interval served to devices.
 
-Deployment is a systemd unit in the Ubuntu VM, with Caddy in front terminating TLS on the
-public hostname and forwarding only `/htp/v1/*`.
+Deployment is a systemd unit on the Linux host running Hermes Agent, with Caddy in front
+terminating TLS on the public hostname and forwarding only `/htp/v1/*`.
 
 ---
 
@@ -590,8 +590,7 @@ overwriting.
 ### 7.5 Wi-Fi profiles
 
 The device stores multiple network profiles in `wifi.json` on the SD card — an ordered
-list, each with SSID, password, and optional per-profile extras: static IP configuration,
-and enterprise credentials where a network requires WPA2-Enterprise. Editing requires no
+list, each with SSID, password, and optional static IP configuration. Editing requires no
 reflash. Credentials never leave the device and never appear in HTP.
 
 **Connection strategy.** Scanning is expensive radio time, so the device caches the BSSID
@@ -601,10 +600,9 @@ every wake. On failure it falls back to a full scan and selects the highest-prio
 profile present. The common case — same network as last time — is fast; changing
 locations costs one slow wake.
 
-**MAC address.** The device uses its own factory MAC on every network. Networks with
-MAC-based admission control are handled by registering that address with the network
-administrator; the Settings screen displays it for this purpose. The firmware does not
-override or randomize its MAC.
+**MAC address.** The device uses its own factory MAC on every network; the firmware
+neither overrides nor randomizes it. The Settings screen displays it, since some networks
+require the address to be known in advance.
 
 **Protocol impact: none.** Device identity is the bearer token, not the network or MAC
 address. The terminal is the same device on every network.
@@ -715,8 +713,6 @@ protocol design.
    bridge's MCP server, and the mechanism for instructing it to republish the dashboard.
 3. **Speech provider selection** — specific STT and TTS vendors and voices.
 4. **Public hostname and certificate** — domain, DNS, and proxy configuration.
-5. **Work network requirements** — whether WPA2-Enterprise is needed, and MAC
-   registration with the network administrator.
 
 ---
 
