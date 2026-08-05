@@ -58,9 +58,13 @@ class Pipeline:
         self._captures.set_state(capture_id, "transcribing")
         try:
             transcript = await self._speech.transcribe(self._storage.upload_path(capture_id))
-        except SpeechError:
+        except (SpeechError, OSError):
             log.exception("capture %s: transcription failed", capture_id)
-            self._captures.set_state(capture_id, "failed", error="transcription_failed")
+            if self._storage.upload_path(capture_id).exists():
+                error = "transcription_failed"
+            else:
+                error = "audio_missing"
+            self._captures.set_state(capture_id, "failed", error=error)
             return
 
         self._captures.set_transcript(capture_id, transcript)
@@ -72,13 +76,23 @@ class Pipeline:
             await self._answer(capture_id, remainder or transcript, capture.conversation_id)
 
     async def _finish_note(self, capture_id: str, transcript: str, recorded_at: int | None) -> None:
-        """Mark the note done first: the device is waiting, the agent is not."""
-        self._captures.set_state(capture_id, "done")
+        """Mark the note done first: the device is waiting, the agent is not.
+
+        The ingest-failed flag is written *before* calling ingest, not only after
+        a caught AgentError. A process that dies between marking the row done and
+        hearing back from the agent would otherwise leave the row `done` with
+        `error IS NULL`: not active (resume() would skip it) and not in the
+        ingestion backlog (which requires error=INGEST_FAILED) -- the note would
+        be silently lost. Writing the flag first means an interrupted ingest is
+        always visible to sweep_ingestion(); a clean success clears it again.
+        """
+        self._captures.set_state(capture_id, "done", error=INGEST_FAILED)
         try:
             await self._agent.ingest(transcript, recorded_at)
         except AgentError:
             log.exception("capture %s: agent ingestion failed, queued for retry", capture_id)
-            self._captures.set_state(capture_id, "done", error=INGEST_FAILED)
+            return
+        self._captures.set_state(capture_id, "done", error=None)
 
     async def _answer(self, capture_id: str, prompt: str, conversation_id: str | None) -> None:
         self._captures.set_state(capture_id, "processing")
@@ -106,6 +120,12 @@ class Pipeline:
     async def resume(self) -> int:
         """Reprocess captures that were mid-pipeline when the process last stopped.
 
+        Must complete before the API begins accepting uploads: concurrent
+        invocation with live process() calls can double-deliver (e.g. ingest a
+        note twice, or open a second conversation turn for a capture still
+        being resumed). The server wires this in at startup, ahead of
+        accepting requests -- resume() itself takes no lock.
+
         Deviation from the brief (human-approved): a crash window can leave a
         capture row without its upload WAV ever landing on disk. A real
         SpeechProvider reads that file directly, so a missing file surfaces as
@@ -114,7 +134,10 @@ class Pipeline:
         entirely, wedging every other unfinished capture behind the one with
         the missing file. Each capture's process() call is therefore isolated:
         an unexpected exception marks just that capture failed and the loop
-        continues.
+        continues. (process() now also catches OSError directly at the
+        transcription stage, so this wrapper is a safety net for other
+        unforeseen failures rather than the primary defense against a missing
+        WAV -- that defense now lives on the direct-call path too.)
         """
         pending = self._captures.unfinished_ids()
         for capture_id in pending:
