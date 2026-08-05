@@ -36,6 +36,8 @@ def detect(transcript: str, prefixes: list[str]) -> str | None:
 
     if longest_match == 0:
         return None
-    if longest_match >= len(spans):
+    # A remainder of detached punctuation only ("Hey Hermes .") is the
+    # salutation-alone case: every trailing word normalizes to nothing.
+    if longest_match >= len(spans) or not any(words[longest_match:]):
         return ""
     return transcript[spans[longest_match][1] :].strip()
