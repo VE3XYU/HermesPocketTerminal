@@ -1,0 +1,21 @@
+# Only the device-facing protocol is exposed. Hermes Agent and the /mcp mount
+# stay on localhost — note that the catch-all below is what keeps /mcp private.
+#
+# Rate limiting needs the caddy-ratelimit plugin, which is not in the standard
+# build. Until it is installed, the bridge is protected by bearer auth and the
+# body-size cap only; add the plugin before exposing this to the internet
+# long-term.
+terminal.example.com {
+    encode gzip
+
+    handle /htp/v1/* {
+        request_body {
+            max_size 5MB
+        }
+        reverse_proxy 127.0.0.1:8787
+    }
+
+    handle {
+        respond "Not found" 404
+    }
+}
