@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from htp_bridge.config import StorageConfig
@@ -63,6 +65,31 @@ def test_prune_removes_only_expired_files(storage, fake_clock):
     assert storage.upload_path("c-old").exists(), "upload retention is 365 days"
     assert storage.reply_path("c-new").exists()
     assert removed == 1
+
+
+def test_prune_removes_expired_orphaned_part_files(storage, fake_clock):
+    """A crash between write_bytes and replace strands a .wav.part forever;
+    prune must clean those up on the directory's retention window."""
+    orphan = storage.reply_path("c-crash").with_suffix(".wav.part")
+    orphan.write_bytes(b"partial")
+    os.utime(orphan, (fake_clock.now, fake_clock.now))
+    fake_clock.advance(8 * 86400)
+
+    removed = storage.prune()
+
+    assert not orphan.exists()
+    assert removed == 1
+
+
+def test_prune_keeps_part_files_inside_retention(storage, fake_clock):
+    fresh = storage.reply_path("c-live").with_suffix(".wav.part")
+    fresh.write_bytes(b"partial")
+    os.utime(fresh, (fake_clock.now, fake_clock.now))
+
+    removed = storage.prune()
+
+    assert fresh.exists()
+    assert removed == 0
 
 
 def _streaming_wav(payload: bytes) -> bytes:
