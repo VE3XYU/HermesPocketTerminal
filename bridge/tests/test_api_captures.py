@@ -42,8 +42,9 @@ def test_upload_runs_the_pipeline(client, app_context):
 
 def test_repeat_upload_does_not_reprocess(client, app_context):
     upload(client, "c-1")
-    upload(client, "c-1")
+    repeat = upload(client, "c-1")
     assert len(app_context["agent"].ingested) == 1
+    assert repeat.json() == {"id": "c-1", "state": "done"}
 
 
 def test_reupload_after_terminal_state_does_not_rewrite_audio(client, app_context):

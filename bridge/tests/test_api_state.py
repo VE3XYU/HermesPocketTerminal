@@ -58,6 +58,7 @@ def test_dashboard_returns_full_body_for_stale_revision(client, app_context):
     app_context["dashboard"].publish("Today", [{"id": "t-1", "text": "Buy milk", "done": False}])
     body = client.get("/htp/v1/dashboard", params={"rev": "stale123"}, headers=AUTH).json()
     assert "items" in body
+    assert body["rev"] != "stale123", "the device stores this rev; echoing the stale one wedges sync"
 
 
 def test_dashboard_requires_a_token(client):
