@@ -46,6 +46,20 @@ def test_repeat_upload_does_not_reprocess(client, app_context):
     assert len(app_context["agent"].ingested) == 1
 
 
+def test_reupload_after_terminal_state_does_not_rewrite_audio(client, app_context):
+    # Once a capture is terminal, a retried upload is a pure acknowledgment:
+    # it must not touch disk. Otherwise a WAV already removed by retention
+    # pruning would reappear (and a fresh mtime would restart its clock).
+    upload(client, "c-1")
+    assert app_context["captures"].get("c-1").state == "done"
+    app_context["storage"].upload_path("c-1").unlink()
+
+    response = upload(client, "c-1")
+
+    assert response.json() == {"id": "c-1", "state": "done"}
+    assert not app_context["storage"].upload_path("c-1").exists()
+
+
 def test_upload_without_token_is_unauthorized(client):
     response = client.post(
         "/htp/v1/captures", content=WAV, headers={"X-Capture-Id": "c-1", "Content-Type": "audio/wav"}

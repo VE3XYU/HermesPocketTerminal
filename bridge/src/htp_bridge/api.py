@@ -116,6 +116,13 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
         if len(body) > deps.server.max_upload_bytes:
             raise HTPError(413, "capture_too_large")
 
+        # A retry of a capture that already reached a terminal state is a pure
+        # acknowledgment: answer from the DB without rewriting the WAV, so a
+        # file already removed by retention pruning cannot reappear.
+        existing = deps.captures.get(x_capture_id)
+        if existing is not None and existing.state in TERMINAL_STATES:
+            return {"id": existing.id, "state": existing.state}
+
         # D1 (human-approved deviation from the brief): write the audio to disk
         # BEFORE creating the capture DB row. The brief's ordering (row first,
         # then WAV) loses audio permanently if the process dies in between --
