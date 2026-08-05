@@ -8,6 +8,10 @@ wifi.json
 *.env
 .env.*
 
+# Local tooling scratch
+.superpowers/
+.venv/
+
 # OS and editor cruft
 .DS_Store
 Thumbs.db
