@@ -223,7 +223,11 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
         if item is None:
             raise HTPError(404, "unknown_item")
 
+        # The snapshot check above is advisory: an MCP publish can remove the
+        # item before the write lands, in which case complete() returns None.
         rev = deps.dashboard.complete(item_id)
+        if rev is None:
+            raise HTPError(404, "unknown_item")
         background.add_task(_notify_completion, deps, item_id, item.text)
         return {"ok": True, "rev": rev}
 

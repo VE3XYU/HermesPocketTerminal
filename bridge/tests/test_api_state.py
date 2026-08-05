@@ -111,6 +111,27 @@ def test_complete_404s_for_unknown_item(client, app_context):
     assert response.json() == {"error": "unknown_item"}
 
 
+def test_complete_404s_when_item_vanishes_between_check_and_write(client, app_context):
+    # An MCP publish can remove the item after the endpoint's snapshot check
+    # but before DashboardStore.complete runs; complete() then returns None.
+    # The device must get unknown_item, not {"ok": true, "rev": null}.
+    dashboard = app_context["dashboard"]
+    dashboard.publish("Today", [{"id": "t-1", "text": "Buy milk", "done": False}])
+
+    original = dashboard.complete
+
+    def racing_complete(item_id):
+        dashboard.publish("Today", [])
+        return original(item_id)
+
+    dashboard.complete = racing_complete
+
+    response = client.post("/htp/v1/complete", json={"item_id": "t-1"}, headers=AUTH)
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "unknown_item"}
+
+
 def test_complete_rejects_missing_item_id(client):
     response = client.post("/htp/v1/complete", json={}, headers=AUTH)
     assert response.status_code == 400
