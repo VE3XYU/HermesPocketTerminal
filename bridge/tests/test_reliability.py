@@ -53,6 +53,20 @@ def test_repeated_upload_delivers_the_note_exactly_once(client, app_context):
 
 
 def test_repeat_upload_does_not_reset_an_in_flight_capture(client, app_context):
+    # "transcribing" is genuinely mid-pipeline: the retry must take the
+    # created=False path (not the terminal short-circuit), report the live
+    # state, and never schedule a second pipeline run.
+    headers = {**AUTH, "X-Capture-Id": "c-1", "Content-Type": "audio/wav"}
+    client.post("/htp/v1/captures", content=WAV, headers=headers)
+    app_context["captures"].set_state("c-1", "transcribing")
+
+    response = client.post("/htp/v1/captures", content=WAV, headers=headers)
+
+    assert response.json() == {"id": "c-1", "state": "transcribing"}
+    assert len(app_context["agent"].ingested) == 1, "a racing retry must not re-run the pipeline"
+
+
+def test_repeat_upload_acknowledges_a_failed_capture_without_reprocessing(client, app_context):
     headers = {**AUTH, "X-Capture-Id": "c-1", "Content-Type": "audio/wav"}
     client.post("/htp/v1/captures", content=WAV, headers=headers)
     app_context["captures"].set_state("c-1", "failed", error="transcription_failed")
@@ -60,6 +74,7 @@ def test_repeat_upload_does_not_reset_an_in_flight_capture(client, app_context):
     response = client.post("/htp/v1/captures", content=WAV, headers=headers)
 
     assert response.json()["state"] == "failed"
+    assert len(app_context["agent"].ingested) == 1
 
 
 @pytest.mark.parametrize("crash_state", ["received", "transcribing", "processing"])

@@ -131,6 +131,7 @@ def test_complete_404s_when_item_vanishes_between_check_and_write(client, app_co
 
     assert response.status_code == 404
     assert response.json() == {"error": "unknown_item"}
+    assert app_context["agent"].ingested == [], "no phantom completion may reach the agent"
 
 
 def test_complete_rejects_missing_item_id(client):
