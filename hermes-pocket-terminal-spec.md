@@ -316,7 +316,7 @@ Version 1 should include only:
 
 - Record button
 - Voice upload
-- Whisper transcription
+- Cloud speech-to-text transcription
 - Hermes ingestion
 - E-paper status
 - Display task list

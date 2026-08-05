@@ -43,6 +43,10 @@ assume a fixed rate.
 htp-bridge --config config.toml
 ```
 
+The bridge binds to loopback (`127.0.0.1:8787`, the `[server]` block in `config.toml`)
+and is meant to sit behind a TLS-terminating reverse proxy — it should never face the
+internet directly. Nothing is reachable from other machines until a proxy is in front.
+
 For firmware development without a database, speech provider, or Hermes Agent running,
 serve canned responses instead:
 
