@@ -27,6 +27,9 @@ int wav_parse_header(const uint8_t *buf, size_t len, wav_info_t *out) {
     int have_fmt = 0;
     while (pos + 8 <= len) {
         uint32_t csz = rd32(buf + pos + 4);
+        size_t advance = 8 + (size_t)csz + (csz & 1);
+        if (advance < 8) return -1;
+        if (pos + advance <= pos) return -1;
         if (!memcmp(buf + pos, "fmt ", 4)) {
             if (pos + 8 + 16 > len) return -1;
             const uint8_t *f = buf + pos + 8;
@@ -40,7 +43,7 @@ int wav_parse_header(const uint8_t *buf, size_t len, wav_info_t *out) {
             out->data_offset = (uint32_t)(pos + 8);
             return 0;
         }
-        pos += 8 + csz + (csz & 1);
+        pos += advance;
     }
     return -1;
 }

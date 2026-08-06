@@ -47,5 +47,15 @@ int main(void) {
     /* Garbage and short buffers are rejected */
     CHECK_EQ_INT(wav_parse_header((const uint8_t *)"nope", 4, &inf), -1);
     CHECK_EQ_INT(wav_parse_header(h, 10, &inf), -1);
+
+    /* Chunk size near wraparound (0xFFFFFFF7) must be rejected, not hang */
+    uint8_t y[60] = {0};
+    memcpy(y, "RIFF", 4); uint32_t ysz = 52; memcpy(y + 4, &ysz, 4);
+    memcpy(y + 8, "WAVEfmt ", 8); uint32_t yfl = 16; memcpy(y + 16, &yfl, 4);
+    uint16_t yfmt = 1, ych = 1, yba = 2, ybits = 16; uint32_t yrate = 16000, ybr = 32000;
+    memcpy(y + 20, &yfmt, 2); memcpy(y + 22, &ych, 2); memcpy(y + 24, &yrate, 4);
+    memcpy(y + 28, &ybr, 4); memcpy(y + 32, &yba, 2); memcpy(y + 34, &ybits, 2);
+    memcpy(y + 36, "XXXX", 4); uint32_t ywrap = 0xFFFFFFF7; memcpy(y + 40, &ywrap, 4);
+    CHECK_EQ_INT(wav_parse_header(y, sizeof y, &inf), -1);
     return HARNESS_REPORT();
 }
