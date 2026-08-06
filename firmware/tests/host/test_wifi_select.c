@@ -29,5 +29,27 @@ int main(void) {
     CHECK_EQ_INT(fj.channel, 6);
     CHECK_EQ_INT(fj.bssid[0], 0xa0);
     CHECK_EQ_INT(fj.bssid[5], 0xf5);
+
+    /* Malformed BSSID: 11 chars (truncated) + valid channel */
+    fkv_init(&fk, &kv);
+    kv.set(kv.ctx, "bssid", "a0b1c2d3e4f");  /* 11 chars, missing last digit */
+    kv.set(kv.ctx, "chan", "6");
+    wifi_fast_join_load(&kv, &fj);
+    CHECK_EQ_INT(fj.valid, 0);
+
+    /* Malformed channel: valid BSSID + trailing garbage */
+    fkv_init(&fk, &kv);
+    kv.set(kv.ctx, "bssid", "a0b1c2d3e4f5");  /* valid 12-char BSSID */
+    kv.set(kv.ctx, "chan", "6x");             /* trailing garbage */
+    wifi_fast_join_load(&kv, &fj);
+    CHECK_EQ_INT(fj.valid, 0);
+
+    /* Malformed BSSID: all non-hex chars + valid channel */
+    fkv_init(&fk, &kv);
+    kv.set(kv.ctx, "bssid", "zzzzzzzzzzzz");  /* 12 chars but not hex */
+    kv.set(kv.ctx, "chan", "6");
+    wifi_fast_join_load(&kv, &fj);
+    CHECK_EQ_INT(fj.valid, 0);
+
     return HARNESS_REPORT();
 }

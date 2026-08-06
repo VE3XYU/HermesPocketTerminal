@@ -45,21 +45,29 @@ void wifi_fast_join_load(port_kv_t *kv, wifi_fast_join_t *out) {
         return;  /* valid remains 0 */
     }
 
-    /* Parse BSSID from 12 lowercase hex chars */
-    if (sscanf(bssid_hex, "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx",
+    /* Parse BSSID from exactly 12 lowercase hex chars */
+    if (strlen(bssid_hex) != 12) {
+        return;  /* valid remains 0 */
+    }
+    int consumed = 0;
+    if (sscanf(bssid_hex, "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%n",
                &out->bssid[0], &out->bssid[1], &out->bssid[2],
-               &out->bssid[3], &out->bssid[4], &out->bssid[5]) != 6) {
+               &out->bssid[3], &out->bssid[4], &out->bssid[5], &consumed) != 6
+        || consumed != 12) {
         memset(out, 0, sizeof *out);
         return;  /* valid remains 0 */
     }
 
-    /* Parse channel as decimal */
-    unsigned char c;
-    if (sscanf(channel_str, "%hhu", &c) != 1) {
+    /* Parse channel as decimal with full consumption */
+    unsigned int ch;
+    consumed = 0;
+    if (sscanf(channel_str, "%u%n", &ch, &consumed) != 1
+        || consumed != (int)strlen(channel_str)
+        || ch > 255) {
         memset(out, 0, sizeof *out);
         return;  /* valid remains 0 */
     }
-    out->channel = c;
+    out->channel = (uint8_t)ch;
 
     out->valid = 1;
 }
