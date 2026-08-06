@@ -25,4 +25,7 @@ void epd_full(const uint8_t *fb5000);      /* full refresh (~1.5 s, flashes) */
 void epd_partial(const uint8_t *fb5000);   /* partial refresh (fast, may ghost) */
 void epd_sleep(void);                      /* deep-sleep cmd + rail off */
 
+/* SD card storage (Task 14). SD-MMC 1-bit mode: CLK 39, CMD 41, D0 40. */
+int board_sd_mount(void);                  /* mounts FAT at /sdcard, creates /sdcard/rec; 0 ok */
+
 #endif
