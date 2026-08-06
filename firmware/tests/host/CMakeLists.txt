@@ -21,6 +21,7 @@ add_library(fw_components
   ${FW}/components/app_core/src/sidecar.c
   ${FW}/components/app_core/src/rec_index.c
   ${FW}/components/app_core/src/capture_flow.c
+  ${FW}/components/app_core/src/sync.c
 )
 target_include_directories(fw_components PUBLIC
   ${FW}/components/htp_client/include
@@ -49,3 +50,4 @@ host_test(test_wifi_select)
 host_test(test_sidecar)
 host_test(test_rec_index)
 host_test(test_capture_flow)
+host_test(test_sync)
