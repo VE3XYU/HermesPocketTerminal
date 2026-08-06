@@ -59,3 +59,17 @@ host_test(test_fb)
 host_test(test_widgets)
 host_test(test_gesture)
 host_test(test_ui_flow)
+
+option(HTP_INTEGRATION "run integration tests against bridge --mock" ON)
+if(HTP_INTEGRATION)
+  add_executable(test_mock_bridge integration/test_mock_bridge.c
+                 fakes/posix_transport.c ${FAKES})
+  target_link_libraries(test_mock_bridge fw_components)
+  target_compile_definitions(test_mock_bridge PRIVATE FIXDIR="${FIXDIR}")
+  target_include_directories(test_mock_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME test_mock_bridge
+           COMMAND bash -c "${FW}/../bridge/.venv/bin/htp-bridge --mock --port 18787 & P=$!; \
+                            trap 'kill $P' EXIT; \
+                            for i in $(seq 1 100); do curl -sf -H 'Authorization: Bearer x' http://127.0.0.1:18787/htp/v1/dashboard >/dev/null 2>&1 && break; sleep 0.2; done; \
+                            $<TARGET_FILE:test_mock_bridge>")
+endif()
