@@ -16,6 +16,8 @@ add_library(fw_components
   ${FW}/components/htp_client/src/client.c
   ${FW}/components/app_core/src/util.c
   ${FW}/components/app_core/src/wav.c
+  ${FW}/components/app_core/src/app_config.c
+  ${FW}/components/app_core/src/wifi_select.c
 )
 target_include_directories(fw_components PUBLIC
   ${FW}/components/htp_client/include
@@ -26,7 +28,7 @@ target_include_directories(fw_components PUBLIC
 target_link_libraries(fw_components PUBLIC vendor_cjson)
 
 enable_testing()
-set(FAKES fakes/fake_transport.c)
+set(FAKES fakes/fake_transport.c fakes/fake_kv.c)
 function(host_test name)
   add_executable(${name} ${name}.c ${FAKES})
   target_link_libraries(${name} fw_components)
@@ -39,3 +41,5 @@ host_test(test_ids)
 host_test(test_backoff)
 host_test(test_wav)
 host_test(test_client)
+host_test(test_config)
+host_test(test_wifi_select)
