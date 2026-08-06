@@ -22,7 +22,9 @@ add_library(fw_components
   ${FW}/components/app_core/src/rec_index.c
   ${FW}/components/app_core/src/capture_flow.c
   ${FW}/components/app_core/src/sync.c
+  ${FW}/components/app_core/src/gesture.c
   ${FW}/components/ui/src/fb.c
+  ${FW}/components/ui/src/widgets.c
 )
 target_include_directories(fw_components PUBLIC
   ${FW}/components/htp_client/include
@@ -53,3 +55,5 @@ host_test(test_rec_index)
 host_test(test_capture_flow)
 host_test(test_sync)
 host_test(test_fb)
+host_test(test_widgets)
+host_test(test_gesture)
