@@ -1,5 +1,6 @@
 #include "harness.h"
 #include "htp_ids.h"
+#include "ports.h"
 #include <ctype.h>
 
 static int valid_alphabet(const char *s) {
