@@ -38,6 +38,13 @@ def test_salutation_alone_returns_empty_remainder():
     assert detect("Hey Hermes.", PREFIXES) == ""
 
 
+@pytest.mark.parametrize("transcript", ["Hey Hermes .", "Hey Hermes ...", "Hey Hermes , !"])
+def test_detached_punctuation_after_salutation_is_an_empty_remainder(transcript):
+    """STT sometimes emits punctuation as its own token; a remainder with no
+    word characters is the salutation-alone case, not a prompt of '.'."""
+    assert detect(transcript, PREFIXES) == ""
+
+
 def test_longest_matching_prefix_wins():
     """With both 'hermes' and 'hey hermes' configured, the longer must match first
     so the remainder is not left containing the word 'hermes'."""

@@ -58,6 +58,7 @@ def test_dashboard_returns_full_body_for_stale_revision(client, app_context):
     app_context["dashboard"].publish("Today", [{"id": "t-1", "text": "Buy milk", "done": False}])
     body = client.get("/htp/v1/dashboard", params={"rev": "stale123"}, headers=AUTH).json()
     assert "items" in body
+    assert body["rev"] != "stale123", "the device stores this rev; echoing the stale one wedges sync"
 
 
 def test_dashboard_requires_a_token(client):
@@ -111,6 +112,28 @@ def test_complete_404s_for_unknown_item(client, app_context):
     assert response.json() == {"error": "unknown_item"}
 
 
+def test_complete_404s_when_item_vanishes_between_check_and_write(client, app_context):
+    # An MCP publish can remove the item after the endpoint's snapshot check
+    # but before DashboardStore.complete runs; complete() then returns None.
+    # The device must get unknown_item, not {"ok": true, "rev": null}.
+    dashboard = app_context["dashboard"]
+    dashboard.publish("Today", [{"id": "t-1", "text": "Buy milk", "done": False}])
+
+    original = dashboard.complete
+
+    def racing_complete(item_id):
+        dashboard.publish("Today", [])
+        return original(item_id)
+
+    dashboard.complete = racing_complete
+
+    response = client.post("/htp/v1/complete", json={"item_id": "t-1"}, headers=AUTH)
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "unknown_item"}
+    assert app_context["agent"].ingested == [], "no phantom completion may reach the agent"
+
+
 def test_complete_rejects_missing_item_id(client):
     response = client.post("/htp/v1/complete", json={}, headers=AUTH)
     assert response.status_code == 400
@@ -149,6 +172,20 @@ def test_ack_removes_notifications(client, app_context):
 
 def test_ack_with_unknown_ids_is_accepted(client):
     response = client.post("/htp/v1/notifications/ack", json={"ids": ["n-nope"]}, headers=AUTH)
+    assert response.json() == {"ok": True, "acked": 0}
+
+
+def test_ack_rejects_oversized_ids_list(client):
+    ids = [f"n-{i}" for i in range(65)]
+    response = client.post("/htp/v1/notifications/ack", json={"ids": ids}, headers=AUTH)
+    assert response.status_code == 400
+    assert response.json() == {"error": "too_many_ids"}
+
+
+def test_ack_accepts_a_full_batch_at_the_cap(client):
+    ids = [f"n-{i}" for i in range(64)]
+    response = client.post("/htp/v1/notifications/ack", json={"ids": ids}, headers=AUTH)
+    assert response.status_code == 200
     assert response.json() == {"ok": True, "acked": 0}
 
 

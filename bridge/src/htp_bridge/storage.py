@@ -87,14 +87,19 @@ class AudioStorage:
         return self.reply_path(capture_id).exists()
 
     def prune(self) -> int:
-        """Delete audio past its retention window. Returns the number removed."""
+        """Delete audio past its retention window. Returns the number removed.
+
+        Also covers *.wav.part: a crash between write_bytes and replace strands
+        the temporary file, and nothing else ever looks at it again.
+        """
         now = self._clock()
         removed = 0
         for directory, retention in ((self._uploads, self._upload_retention), (self._replies, self._reply_retention)):
-            for path in directory.glob("*.wav"):
-                if now - int(path.stat().st_mtime) > retention:
-                    path.unlink(missing_ok=True)
-                    removed += 1
+            for pattern in ("*.wav", "*.wav.part"):
+                for path in directory.glob(pattern):
+                    if now - int(path.stat().st_mtime) > retention:
+                        path.unlink(missing_ok=True)
+                        removed += 1
         return removed
 
     def _stamp(self, path: Path) -> None:

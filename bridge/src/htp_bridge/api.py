@@ -6,15 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.responses import FileResponse
 
 from htp_bridge.agent import AgentError
 from htp_bridge.captures import TERMINAL_STATES, CaptureStore
 from htp_bridge.config import DeviceConfig, ServerConfig
 from htp_bridge.dashboard import DashboardStore
 from htp_bridge.devices import DeviceRegistry
+from htp_bridge.errors import HTPError, install_error_handlers
 from htp_bridge.notifications import NotificationStore
 from htp_bridge.pipeline import Pipeline
 from htp_bridge.storage import AudioStorage, is_valid_capture_id
@@ -22,13 +21,8 @@ from htp_bridge.storage import AudioStorage, is_valid_capture_id
 log = logging.getLogger(__name__)
 
 MAX_STATUS_IDS = 64
+MAX_ACK_IDS = 64
 EMPTY_REVISION = "0"
-
-# D2: framework-generated errors (unknown route, wrong method) map to slugs by
-# status code. Anything else Starlette might raise falls back to a generic slug
-# rather than leaking the framework's default {"detail": ...} shape.
-_STATUS_SLUGS = {404: "not_found", 405: "method_not_allowed"}
-_DEFAULT_HTTP_SLUG = "http_error"
 
 
 @dataclass
@@ -42,12 +36,6 @@ class Deps:
     pipeline: Pipeline
     agent: Any
     clock: Callable[[], int] = field(default=lambda: int(time.time()))
-
-
-class HTPError(Exception):
-    def __init__(self, status_code: int, slug: str) -> None:
-        self.status_code = status_code
-        self.slug = slug
 
 
 def _int_or_none(value: str | None) -> int | None:
@@ -82,31 +70,7 @@ def authenticate_token(devices: DeviceRegistry, token: str) -> DeviceConfig | No
 
 def create_app(deps: Deps, lifespan=None) -> FastAPI:
     app = FastAPI(title="HTP Bridge", docs_url=None, redoc_url=None, lifespan=lifespan)
-
-    @app.exception_handler(HTPError)
-    async def _htp_error(request: Request, exc: HTPError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"error": exc.slug})
-
-    # D2: RequestValidationError (malformed/invalid request bodies FastAPI rejects
-    # before our handlers run) and Starlette's HTTPException fallback (unmatched
-    # routes/methods) must still produce the {"error": "<slug>"} shape, not the
-    # framework's default {"detail": ...}.
-    @app.exception_handler(RequestValidationError)
-    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        return JSONResponse(status_code=422, content={"error": "invalid_request"})
-
-    @app.exception_handler(StarletteHTTPException)
-    async def _http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-        slug = _STATUS_SLUGS.get(exc.status_code, _DEFAULT_HTTP_SLUG)
-        return JSONResponse(status_code=exc.status_code, content={"error": slug})
-
-    # D2 (completed per review): any exception not already caught by a more
-    # specific handler above must still produce the {"error": "<slug>"} shape
-    # rather than Starlette's default text/plain 500 traceback page.
-    @app.exception_handler(Exception)
-    async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
-        log.exception("unhandled exception on %s %s", request.method, request.url.path)
-        return JSONResponse(status_code=500, content={"error": "internal_error"})
+    install_error_handlers(app)
 
     def authenticate(
         authorization: str | None = Header(default=None),
@@ -151,6 +115,13 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
             raise HTPError(400, "empty_capture")
         if len(body) > deps.server.max_upload_bytes:
             raise HTPError(413, "capture_too_large")
+
+        # A retry of a capture that already reached a terminal state is a pure
+        # acknowledgment: answer from the DB without rewriting the WAV, so a
+        # file already removed by retention pruning cannot reappear.
+        existing = deps.captures.get(x_capture_id)
+        if existing is not None and existing.state in TERMINAL_STATES:
+            return {"id": existing.id, "state": existing.state}
 
         # D1 (human-approved deviation from the brief): write the audio to disk
         # BEFORE creating the capture DB row. The brief's ordering (row first,
@@ -260,7 +231,11 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
         if item is None:
             raise HTPError(404, "unknown_item")
 
+        # The snapshot check above is advisory: an MCP publish can remove the
+        # item before the write lands, in which case complete() returns None.
         rev = deps.dashboard.complete(item_id)
+        if rev is None:
+            raise HTPError(404, "unknown_item")
         background.add_task(_notify_completion, deps, item_id, item.text)
         return {"ok": True, "rev": rev}
 
@@ -285,6 +260,8 @@ def create_app(deps: Deps, lifespan=None) -> FastAPI:
     ) -> dict[str, Any]:
         if "ids" not in payload or not isinstance(payload["ids"], list):
             raise HTPError(400, "missing_ids")
+        if len(payload["ids"]) > MAX_ACK_IDS:
+            raise HTPError(400, "too_many_ids")
         acked = deps.notifications.ack([str(i) for i in payload["ids"]])
         return {"ok": True, "acked": acked}
 
