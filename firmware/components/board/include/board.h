@@ -27,5 +27,6 @@ void epd_sleep(void);                      /* deep-sleep cmd + rail off */
 
 /* SD card storage (Task 14). SD-MMC 1-bit mode: CLK 39, CMD 41, D0 40. */
 int board_sd_mount(void);                  /* mounts FAT at /sdcard, creates /sdcard/rec; 0 ok */
+int board_sd_format_and_mount(void);       /* erase+format (only call after board_sd_mount() failed), then mount; 0 ok */
 
 #endif

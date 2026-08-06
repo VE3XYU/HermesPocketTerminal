@@ -6,6 +6,7 @@
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
 #include "esp_log.h"
+#include <stdbool.h>
 #include <sys/stat.h>
 #include <errno.h>
 
@@ -16,7 +17,7 @@
 static const char *TAG = "sdcard";
 static sdmmc_card_t *s_card;
 
-int board_sd_mount(void) {
+static int mount(bool format_if_mount_failed) {
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;         /* only CLK/CMD/D0 are wired */
 
@@ -27,7 +28,7 @@ int board_sd_mount(void) {
     slot.d0  = PIN_SD_D0;
 
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
-        .format_if_mount_failed = false,       /* never silently wipe the operator's card */
+        .format_if_mount_failed = format_if_mount_failed,   /* never true unless the operator asked for it */
         .max_files = 8,
         .allocation_unit_size = 0,
     };
@@ -47,3 +48,27 @@ int board_sd_mount(void) {
     }
     return 0;
 }
+
+int board_sd_mount(void) { return mount(false); }
+
+/* Erase-and-reformat path for Task 14's serial-provisioning fallback
+ * (operator's card reads RAW / won't mount at all). Only meaningful after
+ * board_sd_mount() has already failed once.
+ *
+ * This is deliberately NOT esp_vfs_fat_sdcard_format(): that API requires
+ * a card handle from an *already-mounted* esp_vfs_fat_sdmmc_mount() call —
+ * it looks the card up by pointer in FatFs's internal per-mount context
+ * table, which is only populated once mount_to_vfs_fat() has succeeded
+ * (see esp-idf's fatfs/vfs/vfs_fat_sdmmc.c: on a failed mount, that table
+ * entry is never created, out_card is never written, and the SDMMC
+ * host/slot/pdrv registration is fully unwound in the failure path). A
+ * card that doesn't mount in the first place therefore has no valid
+ * handle to hand esp_vfs_fat_sdcard_format() — there's nothing to look up.
+ *
+ * A second esp_vfs_fat_sdmmc_mount() call with format_if_mount_failed=true
+ * reaches the same underlying f_fdisk()+f_mkfs() codepath (partition_card()
+ * in the same source file) from exactly the starting state we're in: no
+ * mount, corrupt/absent filesystem. Since the first failed mount attempt
+ * fully unwinds its host/slot state on the way out, this second call is a
+ * clean, independent attempt, not a retry on top of stale state. */
+int board_sd_format_and_mount(void) { return mount(true); }

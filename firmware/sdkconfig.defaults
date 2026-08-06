@@ -10,3 +10,9 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# Task 14 serial provisioning (C3): stdin must reach the USB-Serial-JTAG
+# port as the *primary* console, not just the (output-only, non-blocking)
+# secondary channel the default config already routes logs through. This
+# also pulls stdin/stdout onto /dev/usbserjtag before app_main runs.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
