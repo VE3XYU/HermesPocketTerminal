@@ -43,7 +43,7 @@ static int status_to_err(const htp_response_t *r) {
  * On HTP_OK, *out_json holds the parsed body (caller must cJSON_Delete),
  * unless req->sink_file was set, in which case out_json is untouched. */
 static int perform(htp_client_t *c, htp_request_t *req, cJSON **out_json) {
-    static char battery[8];
+    static char battery[12];   /* fits any int %d (incl. sign) + NUL; -Wformat-truncation on the IDF cross-compiler needs the full range provable, not just the 0-100 domain */
     char auth[192];
     snprintf(auth, sizeof auth, "Bearer %s", c->token);
     req->headers[req->header_count++] = (htp_header_t){ "Authorization", auth };

@@ -6,8 +6,8 @@ add_compile_options(-Wall -Wextra -Werror -g)
 set(FW ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 set(FIXDIR ${FW}/../bridge/tests/fixtures/contract)
 
-add_library(vendor_cjson ${FW}/components/vendor/cjson/cJSON.c)
-target_include_directories(vendor_cjson PUBLIC ${FW}/components/vendor/cjson)
+add_library(vendor_cjson ${FW}/components/vendor_cjson/cJSON.c)
+target_include_directories(vendor_cjson PUBLIC ${FW}/components/vendor_cjson)
 
 # Component source lists grow as tasks add files; keep them explicit.
 add_library(fw_components
