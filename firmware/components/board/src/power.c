@@ -14,6 +14,8 @@ void board_early_init(void) {
         .pin_bit_mask = (1ULL << PIN_EPD_PWR) | (1ULL << PIN_AUDIO_PWR) | (1ULL << PIN_VBAT_HOLD) };
     gpio_config(&out);
     gpio_hold_dis(PIN_VBAT_HOLD);
+    gpio_hold_dis(PIN_EPD_PWR);                /* release the hold armed before sleeping */
+    gpio_hold_dis(PIN_AUDIO_PWR);
     gpio_set_level(PIN_VBAT_HOLD, 1);          /* keep the board alive */
     gpio_set_level(PIN_EPD_PWR, 1);            /* rails off until needed */
     gpio_set_level(PIN_AUDIO_PWR, 1);
@@ -40,6 +42,10 @@ wake_cause_t board_wake_cause(void) {
 void board_deep_sleep(unsigned seconds) {
     gpio_set_level(PIN_VBAT_HOLD, 1);
     gpio_hold_en(PIN_VBAT_HOLD);               /* survives deep sleep */
+    gpio_set_level(PIN_EPD_PWR, 1);            /* rail off (active-low) before sleeping ... */
+    gpio_hold_en(PIN_EPD_PWR);                 /* ... else sleep_gpio isolation lets it float */
+    gpio_set_level(PIN_AUDIO_PWR, 1);
+    gpio_hold_en(PIN_AUDIO_PWR);
     esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_REC) | (1ULL << PIN_BTN_PWR),
                                  ESP_EXT1_WAKEUP_ANY_LOW);
     if (seconds) esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);

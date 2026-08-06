@@ -27,8 +27,10 @@
 
 #define EPD_FRAME_BYTES 5000   /* 25 bytes/row * 200 rows; matches ui_fb_t */
 
-#define EPD_BUSY_POLL_MS    5
-#define EPD_BUSY_TIMEOUT_MS 3000
+#define EPD_BUSY_POLL_MS         5
+#define EPD_BUSY_TIMEOUT_MS      3000
+#define EPD_BUSY_ASSERT_MS       50     /* time BUSY may take to rise after a trigger */
+#define EPD_BUSY_TRIGGER_TIMEOUT_MS 5000 /* full-refresh headroom once BUSY is asserted */
 
 static const char *TAG = "epd";
 static spi_device_handle_t s_spi;
@@ -42,6 +44,38 @@ static bool busy_wait(void) {
         waited += EPD_BUSY_POLL_MS;
         if (waited >= EPD_BUSY_TIMEOUT_MS) {
             ESP_LOGE(TAG, "BUSY timeout");
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Same as busy_wait(), but for use right after an update trigger (cmd 0x20).
+ * BUSY takes a moment to rise once the controller starts driving the
+ * waveform; polling for "clear" immediately can catch it still LOW from
+ * before the trigger and return instantly, letting the caller (and then
+ * epd_sleep's rail cut) run while the panel is mid-refresh. So: first wait
+ * up to EPD_BUSY_ASSERT_MS for BUSY to assert (go HIGH), then wait for it
+ * to clear, with the longer timeout a full refresh needs. If BUSY never
+ * asserts within the window we still fall through to the clear-wait rather
+ * than failing outright -- a real controller could plausibly finish inside
+ * one poll tick and we'd rather not false-fail on a fast partial. */
+static bool busy_wait_after_trigger(void) {
+    int waited = 0;
+    while (gpio_get_level(PIN_BUSY) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(EPD_BUSY_POLL_MS));
+        waited += EPD_BUSY_POLL_MS;
+        if (waited >= EPD_BUSY_ASSERT_MS) {
+            ESP_LOGW(TAG, "BUSY did not assert within %d ms of trigger", EPD_BUSY_ASSERT_MS);
+            break;
+        }
+    }
+    waited = 0;
+    while (gpio_get_level(PIN_BUSY) == 1) {
+        vTaskDelay(pdMS_TO_TICKS(EPD_BUSY_POLL_MS));
+        waited += EPD_BUSY_POLL_MS;
+        if (waited >= EPD_BUSY_TRIGGER_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "BUSY timeout after trigger");
             return false;
         }
     }
@@ -168,14 +202,14 @@ void epd_full(const uint8_t *fb5000) {
 
     cmd(0x22); data1(0xF7);                      /* OTP full-update sequence */
     cmd(0x20);
-    busy_wait();
+    busy_wait_after_trigger();
 }
 
 void epd_partial(const uint8_t *fb5000) {
     frame_write(fb5000);
     cmd(0x22); data1(0xFF);                      /* OTP mode-2 (ping-pong) partial */
     cmd(0x20);
-    busy_wait();
+    busy_wait_after_trigger();
 }
 
 void epd_sleep(void) {
