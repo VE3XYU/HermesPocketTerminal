@@ -52,8 +52,9 @@ static int log_rec_entry(const char *name, void *u) {
  *
  * RX line-ending conversion is left at ESP_LINE_ENDINGS_LF (no
  * conversion) rather than the example's ESP_LINE_ENDINGS_CR: read_line()
- * does its own "\n" termination with a trailing "\r" strip, so raw,
- * unconverted bytes are what it expects.
+ * (below) does its own line-ending handling -- both '\n' and bare '\r'
+ * terminate a line, with '\r' peeking for and swallowing a following
+ * '\n' -- so it needs raw, unconverted bytes to work with.
  */
 static void console_init_usb_serial_jtag(void) {
     fflush(stdout);
@@ -80,18 +81,30 @@ static void provisioning_fatal(const char *msg) {
     board_deep_sleep(0);
 }
 
+#define CRLF_PEEK_MS 5
+
 /* Reads one line from stdin into buf (NUL-terminated; cap includes the
  * NUL). stdin is non-blocking (console_init_usb_serial_jtag()), so this
  * polls fgetc() and checks the deadline only when nothing is available
  * yet -- bytes that do arrive are consumed immediately, back-to-back,
- * with no artificial per-byte delay. Accepts both "\n" and "\r\n" line
- * endings, stripping a trailing "\r" either way. Bytes beyond cap-1 are
- * silently dropped (but still consumed, so the stream stays in sync)
- * rather than overflowing the caller's buffer.
+ * with no artificial per-byte delay. Bytes beyond cap-1 are silently
+ * dropped (but still consumed, so the stream stays in sync) rather than
+ * overflowing the caller's buffer.
  *
- * Returns the line length (>= 0) once "\n" is seen, or -1 if timeout_ms
- * elapses with no line completed (a partial line already typed is
- * discarded). */
+ * Line endings: both '\n' and '\r' terminate a line. This matters because
+ * miniterm's default Enter key sends a bare '\r' with no '\n' at all --
+ * treating only '\n' as a terminator (as an earlier version of this
+ * function did) means every prompt would silently time out under
+ * miniterm. On '\r', a brief (CRLF_PEEK_MS) non-blocking peek swallows
+ * exactly one immediately-following '\n' so a real "\r\n" pair still
+ * consumes both bytes and behaves identically to before; a lone '\r'
+ * (nothing follows within the peek window) terminates the line on its
+ * own. A lone '\n' (Unix-style input) terminates immediately, no peek
+ * needed -- this path, and CRLF's net effect, are unchanged from before.
+ *
+ * Returns the line length (>= 0) once a line end is seen, or -1 if
+ * timeout_ms elapses with no line completed (a partial line already
+ * typed is discarded). */
 static int read_line(char *buf, size_t cap, unsigned timeout_ms) {
     size_t n = 0;
     int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
@@ -102,12 +115,20 @@ static int read_line(char *buf, size_t cap, unsigned timeout_ms) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        if (c == '\n') {
-            if (n > 0 && buf[n - 1] == '\r') n--;
+        if (c == '\n' || c == '\r') {
             buf[n] = 0;
+            if (c == '\r') {
+                int64_t peek_deadline_ms = (esp_timer_get_time() / 1000) + CRLF_PEEK_MS;
+                while (1) {
+                    int c2 = fgetc(stdin);
+                    if (c2 == '\n') break;                        /* "\r\n": both consumed */
+                    if (c2 != EOF) { ungetc(c2, stdin); break; }   /* bare '\r': push back, done */
+                    if ((esp_timer_get_time() / 1000) >= peek_deadline_ms) break;  /* bare '\r', nothing followed */
+                }
+            }
             return (int)n;
         }
-        if (n + 1 < cap) buf[n++] = (char)c;   /* else: drop, but keep reading for '\n' */
+        if (n + 1 < cap) buf[n++] = (char)c;   /* else: drop, but keep reading for line end */
     }
 }
 
@@ -184,12 +205,42 @@ static int provision_paste_and_write(port_storage_t *st, const char *path, const
     return -1;
 }
 
+#define PWR_HOLD_DEBOUNCE_MS 1500
+#define PWR_HOLD_POLL_MS 20
+
+/* "Power button held at boot" forces re-provisioning even when the SD
+ * card and config are otherwise fine -- so it needs real debounce, not a
+ * single instantaneous GPIO sample. Two guards:
+ *   - wake-cause gate: only WAKE_COLD (fresh power-on) or WAKE_PWR_BUTTON
+ *     (woke specifically because of this button) are eligible. A timer
+ *     wake or a rec-button wake can never trigger this, no matter what
+ *     the Power GPIO happens to read at that instant.
+ *   - continuous-press debounce: the button must read pressed on every
+ *     20ms poll for a full 1500ms. On a latch-on-press power circuit, a
+ *     normal power-on can leave the button transiently/momentarily
+ *     pressed (that's how the board powers on at all); requiring it to
+ *     *stay* pressed for 1.5s of continuous re-sampling is what tells
+ *     that apart from an operator deliberately holding it down.
+ * Returns as soon as the button releases early (not held) or once the
+ * debounce window is satisfied (held). */
+static int power_button_held_at_boot(wake_cause_t wc) {
+    if (wc != WAKE_COLD && wc != WAKE_PWR_BUTTON) return 0;
+    int elapsed_ms = 0;
+    while (board_btn_pwr()) {
+        elapsed_ms += PWR_HOLD_POLL_MS;
+        if (elapsed_ms >= PWR_HOLD_DEBOUNCE_MS) return 1;
+        vTaskDelay(pdMS_TO_TICKS(PWR_HOLD_POLL_MS));
+    }
+    return 0;   /* released before the debounce window elapsed */
+}
+
 void app_main(void) {
     board_early_init();
     console_init_usb_serial_jtag();
 
+    wake_cause_t wc = board_wake_cause();
     const char *cause[] = { "cold", "rec-button", "pwr-button", "timer" };
-    ESP_LOGI(TAG, "HTP terminal bring-up C1, wake=%s", cause[board_wake_cause()]);
+    ESP_LOGI(TAG, "HTP terminal bring-up C1, wake=%s", cause[wc]);
 
     ESP_LOGI(TAG, "C3 SD/NVS/config test");
 
@@ -197,7 +248,7 @@ void app_main(void) {
     idf_ports_init(&st, &kv, &ck, &rng);
 
     int mounted = (board_sd_mount() == 0);
-    int pwr_held = board_btn_pwr();
+    int pwr_held = power_button_held_at_boot(wc);
 
     char buf[2048]; size_t len;
     app_config_t cfg;
@@ -210,23 +261,40 @@ void app_main(void) {
                  mounted, config_ok, pwr_held);
         printf("\n=== HTP serial provisioning ===\n");
 
-        if (!mounted) {
-            provision_format();   /* fatal on decline/timeout/failure; SD is mounted on return */
-            mounted = 1;
+        /* Escape hatch: only offered when Power-held is the *sole* reason
+         * we're here (card mounts, config already parses) -- if the card
+         * genuinely needs fixing, "boot normally" isn't a safe option
+         * regardless of what's typed here, so we skip straight past this
+         * prompt into the mandatory format/paste flow below. */
+        int proceed = 1;
+        if (mounted && config_ok && pwr_held) {
+            printf("\nRe-provision requested. Type YES to continue, anything else boots normally:\n");
+            fflush(stdout);
+            char line[8];
+            int n = read_line(line, sizeof line, PROVISION_TIMEOUT_MS);
+            proceed = (n >= 0 && strcmp(line, "YES") == 0);
+            if (!proceed) { printf("Booting normally.\n\n"); fflush(stdout); }
         }
 
-        if (provision_paste_and_write(&st, "/config.json",
-                "Paste config.json, end with a line containing only EOF:",
-                buf, sizeof buf, is_valid_config_json) != 0)
-            provisioning_fatal("config.json provisioning failed after 3 attempts");
+        if (proceed) {
+            if (!mounted) {
+                provision_format();   /* fatal on decline/timeout/failure; SD is mounted on return */
+                mounted = 1;
+            }
 
-        if (provision_paste_and_write(&st, "/wifi.json",
-                "Paste wifi.json, end with a line containing only EOF:",
-                buf, sizeof buf, is_valid_wifi_json) != 0)
-            provisioning_fatal("wifi.json provisioning failed after 3 attempts");
+            if (provision_paste_and_write(&st, "/config.json",
+                    "Paste config.json, end with a line containing only EOF:",
+                    buf, sizeof buf, is_valid_config_json) != 0)
+                provisioning_fatal("config.json provisioning failed after 3 attempts");
 
-        printf("\nProvisioning complete.\n\n");
-        fflush(stdout);
+            if (provision_paste_and_write(&st, "/wifi.json",
+                    "Paste wifi.json, end with a line containing only EOF:",
+                    buf, sizeof buf, is_valid_wifi_json) != 0)
+                provisioning_fatal("wifi.json provisioning failed after 3 attempts");
+
+            printf("\nProvisioning complete.\n\n");
+            fflush(stdout);
+        }
     }
 
     /* ---- existing C3 checks (unchanged) ---- */
