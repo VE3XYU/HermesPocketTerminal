@@ -1,6 +1,7 @@
 #include "rec_index.h"
 #include "util.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define REC_INDEX_PATH "/rec/index"
@@ -16,38 +17,68 @@ int rec_index_list(port_storage_t *st, char ids[][64], int max) {
     char buf[REC_INDEX_CAP];
     size_t len = 0;
 
-    /* Read the entire index file. If it doesn't exist, that's OK (empty index). */
-    if (st->read(st->ctx, REC_INDEX_PATH, buf, sizeof buf - 1, &len) != 0) {
-        /* File doesn't exist; empty index is valid. */
+    if (st == NULL || ids == NULL) return 0;
+    if (st->read == NULL) return 0;
+    if (st->read(st->ctx, REC_INDEX_PATH, buf, sizeof(buf) - 1, &len) != 0) {
         return 0;
     }
 
+    if (len > REC_INDEX_CAP - 1) len = REC_INDEX_CAP - 1;
     buf[len] = 0;
 
-    /* Split lines and collect them in a forward array. */
-    char *lines[256];
-    int count = 0;
-    char *line_start = buf;
-    for (size_t i = 0; i < len && count < (int)(sizeof(lines) / sizeof(lines[0])); i++) {
-        if (buf[i] == '\n') {
-            buf[i] = 0;
-            if (line_start[0] != 0) {  /* Skip empty lines */
-                lines[count++] = line_start;
+    if (max <= 0 || max > 32) return 0;
+
+    size_t offsets[32];
+    memset(offsets, 0, sizeof(offsets));
+    int offset_count = 0;
+
+    /* Scan through buffer collecting line offsets (last max only) */
+    for (size_t i = 0; i < len; ) {
+        size_t line_start = i;
+
+        /* Find next newline */
+        while (i < len && buf[i] != '\n') i++;
+
+        /* Process this line */
+        if (i > line_start) {
+            /* Non-empty line */
+            if (offset_count < max) {
+                offsets[offset_count] = line_start;
+                offset_count++;
+            } else {
+                /* Shift and add */
+                for (int j = 0; j < max - 1; j++) {
+                    offsets[j] = offsets[j + 1];
+                }
+                offsets[max - 1] = line_start;
             }
-            line_start = buf + i + 1;
         }
-    }
-    /* Handle the last line if it doesn't end with \n */
-    if (line_start < buf + len && line_start[0] != 0 && count < (int)(sizeof(lines) / sizeof(lines[0]))) {
-        lines[count++] = line_start;
+
+        /* Move past newline */
+        if (i < len) i++;  /* skip '\n' */
     }
 
-    /* Copy the last 'max' entries in reverse order into ids (newest first) */
-    int start = count > max ? count - max : 0;
+    /* Output in reverse (newest first) */
     int out_count = 0;
-    for (int i = count - 1; i >= start && out_count < max; i--) {
-        str_copy(ids[out_count], 64, lines[i]);
-        out_count++;
+    for (int i = offset_count - 1; i >= 0 && out_count < max; i--) {
+        size_t off = offsets[i];
+        if (off >= len) break;
+
+        /* Find end of line */
+        size_t end = off;
+        while (end < len && buf[end] != '\n') end++;
+
+        /* Extract line */
+        size_t line_len = end - off;
+        if (line_len > 63) line_len = 63;
+
+        if (line_len > 0) {
+            for (size_t k = 0; k < line_len; k++) {
+                ids[out_count][k] = buf[off + k];
+            }
+            ids[out_count][line_len] = 0;
+            out_count++;
+        }
     }
 
     return out_count;
