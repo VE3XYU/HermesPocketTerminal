@@ -1,11 +1,31 @@
 #include "htp_client.h"
 #include "util.h"
 #include "cJSON.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #define HTP_TIMEOUT_MS       15000
 #define HTP_UPLOAD_TIMEOUT_MS 60000   /* 3.8 MB over weak Wi-Fi */
+
+/* Appends printf-formatted text at buf[*pos] within capacity cap, advancing *pos
+ * by exactly the number of bytes written (never past cap - 1, and never leaving
+ * *pos >= cap). Returns 0 on success. Returns -1 if the formatted text would not
+ * fit; on failure *pos is left unchanged and buf's content beyond the previous
+ * *pos is unspecified (snprintf may have written a truncated fragment there, but
+ * it is never read because callers abort the whole request on -1). */
+static int append_fmt(char *buf, size_t cap, size_t *pos, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static int append_fmt(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int ret = vsnprintf(buf + *pos, cap - *pos, fmt, ap);
+    va_end(ap);
+    if (ret < 0 || (size_t)ret >= cap - *pos) return -1;
+    *pos += (size_t)ret;
+    return 0;
+}
 
 void htp_client_init(htp_client_t *c, htp_transport_t *t, const char *token) {
     c->transport = t; c->token = token; c->battery_pct = -1;
@@ -95,9 +115,12 @@ int htp_upload_capture(htp_client_t *c, const htp_upload_params_t *p) {
 int htp_poll_captures(htp_client_t *c, const char *const ids[], int n,
                       htp_capture_status_t out[], int max_out, long long *server_time) {
     char path[2560];   /* 32 ids x 64 chars + separators must fit */
-    int pos = snprintf(path, sizeof path, "/htp/v1/captures?ids=");
+    size_t pos = 0;
+    if (append_fmt(path, sizeof path, &pos, "/htp/v1/captures?ids=") != 0)
+        return HTP_ERR_CLIENT;
     for (int i = 0; i < n; i++)
-        pos += snprintf(path + pos, sizeof path - pos, "%s%s", i ? "," : "", ids[i]);
+        if (append_fmt(path, sizeof path, &pos, "%s%s", i ? "," : "", ids[i]) != 0)
+            return HTP_ERR_CLIENT;
     htp_request_t req = { .method = "GET", .path = path };
     cJSON *j = NULL;
     int err = perform(c, &req, &j);
@@ -166,10 +189,12 @@ int htp_get_dashboard(htp_client_t *c, const char *rev, htp_dashboard_t *out) {
 
 int htp_complete_item(htp_client_t *c, const char *item_id, char rev_out[24]) {
     char body[128];
-    int len = snprintf(body, sizeof body, "{\"item_id\":\"%s\"}", item_id);
+    size_t pos = 0;
+    if (append_fmt(body, sizeof body, &pos, "{\"item_id\":\"%s\"}", item_id) != 0)
+        return HTP_ERR_CLIENT;
     htp_request_t req = { .method = "POST", .path = "/htp/v1/complete",
         .content_type = "application/json",
-        .body = (const uint8_t *)body, .body_len = (size_t)len };
+        .body = (const uint8_t *)body, .body_len = pos };
     cJSON *j = NULL;
     int err = perform(c, &req, &j);
     if (err != HTP_OK) return err;
@@ -205,13 +230,15 @@ int htp_get_notifications(htp_client_t *c, htp_notifications_t *out) {
 
 int htp_ack_notifications(htp_client_t *c, const char *const ids[], int n) {
     char body[1024];
-    int pos = snprintf(body, sizeof body, "{\"ids\":[");
+    size_t pos = 0;
+    if (append_fmt(body, sizeof body, &pos, "{\"ids\":[") != 0) return HTP_ERR_CLIENT;
     for (int i = 0; i < n; i++)
-        pos += snprintf(body + pos, sizeof body - pos, "%s\"%s\"", i ? "," : "", ids[i]);
-    pos += snprintf(body + pos, sizeof body - pos, "]}");
+        if (append_fmt(body, sizeof body, &pos, "%s\"%s\"", i ? "," : "", ids[i]) != 0)
+            return HTP_ERR_CLIENT;
+    if (append_fmt(body, sizeof body, &pos, "]}") != 0) return HTP_ERR_CLIENT;
     htp_request_t req = { .method = "POST", .path = "/htp/v1/notifications/ack",
         .content_type = "application/json",
-        .body = (const uint8_t *)body, .body_len = (size_t)pos };
+        .body = (const uint8_t *)body, .body_len = pos };
     cJSON *j = NULL;
     int err = perform(c, &req, &j);
     if (err != HTP_OK) return err;

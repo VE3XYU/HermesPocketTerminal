@@ -166,6 +166,47 @@ static void test_error_mapping(void) {
     CHECK_EQ_INT(htp_get_dashboard(&cl, "", &d), HTP_ERR_PROTO);
 }
 
+static void fill(char *buf, size_t len, char c) {
+    memset(buf, c, len);
+    buf[len] = 0;
+}
+
+/* Oversized request bodies/paths must never reach the transport: the client
+ * has to detect the overflow itself and fail closed with HTP_ERR_CLIENT
+ * before calling perform(). ft.req_count staying at 0 is the proof that no
+ * request was sent (fake_transport captures every request it receives,
+ * regardless of whether a scripted response is available). */
+
+static void test_ack_rejects_oversized_batch(void) {
+    fresh();
+    char id24[25];
+    fill(id24, 24, 'a');
+    const char *ids[60];
+    for (int i = 0; i < 60; i++) ids[i] = id24;
+    CHECK_EQ_INT(htp_ack_notifications(&cl, ids, 60), HTP_ERR_CLIENT);
+    CHECK_EQ_INT(ft.req_count, 0);
+}
+
+static void test_complete_rejects_oversized_item_id(void) {
+    fresh();
+    char big_id[200];
+    fill(big_id, 199, 'x');
+    char rev[24];
+    CHECK_EQ_INT(htp_complete_item(&cl, big_id, rev), HTP_ERR_CLIENT);
+    CHECK_EQ_INT(ft.req_count, 0);
+}
+
+static void test_poll_rejects_oversized_batch(void) {
+    fresh();
+    char id63[64];
+    fill(id63, 63, 'b');
+    const char *ids[40];
+    for (int i = 0; i < 40; i++) ids[i] = id63;
+    htp_capture_status_t st[4]; long long t;
+    CHECK_EQ_INT(htp_poll_captures(&cl, ids, 40, st, 4, &t), HTP_ERR_CLIENT);
+    CHECK_EQ_INT(ft.req_count, 0);
+}
+
 int main(void) {
     test_upload_request_shape();
     test_upload_omits_recorded_at_when_clockless();
@@ -178,5 +219,8 @@ int main(void) {
     test_complete();
     test_download_reply();
     test_error_mapping();
+    test_ack_rejects_oversized_batch();
+    test_complete_rejects_oversized_item_id();
+    test_poll_rejects_oversized_batch();
     return HARNESS_REPORT();
 }
