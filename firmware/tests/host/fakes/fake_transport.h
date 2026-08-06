@@ -2,7 +2,7 @@
 #define FAKE_TRANSPORT_H
 #include "htp_client.h"
 
-#define FT_MAX 32
+#define FT_MAX 128
 typedef struct {
     /* scripted responses, consumed in order */
     struct { int transport_err; int status; char body[4096]; } resp[FT_MAX];
