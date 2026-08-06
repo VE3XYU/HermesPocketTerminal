@@ -16,3 +16,14 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # secondary channel the default config already routes logs through. This
 # also pulls stdin/stdout onto /dev/usbserjtag before app_main runs.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# C3 root cause (round 4): ESP-IDF FatFS defaults to CONFIG_FATFS_LFN_NONE
+# (8.3 short names only), so fopen() on "config.json.tmp" and even plain
+# "config.json" (4-char extension) fails with FR_INVALID_NAME (EINVAL) on
+# an otherwise perfectly healthy card/filesystem. Every design filename
+# (wifi.json, c-<timestamp>-<hex>.wav sidecars) needs long filenames.
+# LFN_HEAP allocates the LFN work buffer from heap per-operation rather
+# than reserving it on every call's stack (LFN_STACK) or not at all
+# (LFN_NONE); CONFIG_FATFS_MAX_LFN=255 is the (unmodified) default buffer
+# size cap.
+CONFIG_FATFS_LFN_HEAP=y
