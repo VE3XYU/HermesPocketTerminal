@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include "board.h"
 #include "ui_fb.h"
@@ -39,36 +38,44 @@ static int log_rec_entry(const char *name, void *u) {
  * stdout onto it before app_main() is called. That default path uses
  * the "no_driver" simple functions: non-blocking, ROM-FIFO-only RX with
  * no interrupt/ring-buffer backing. This installs the real interrupt-
- * driven driver and switches the VFS onto it, matching the sequence in
- * esp-idf's own console example (examples/system/console/advanced).
+ * driven driver, matching the sequence in esp-idf's own console example
+ * (examples/system/console/advanced).
  *
- * Unlike that example, stdin is left non-blocking (O_NONBLOCK) rather
- * than switched to blocking: read_line() below needs to enforce a
- * timeout, and with the driver active, a blocking fgetc() would block
- * forever inside usb_serial_jtag_read_bytes(..., portMAX_DELAY) with no
- * way to time out. Non-blocking fgetc() returns EOF immediately when no
- * byte is buffered yet, which read_line()'s poll loop treats as "nothing
- * yet" rather than "stream closed".
+ * Output (printf/ESP_LOG, both go through stdout) still goes through the
+ * VFS/stdio path, and usb_serial_jtag_vfs_use_driver() is still required
+ * for it: stdout's write() ends up at s_ctx.tx_func inside
+ * usb_serial_jtag_vfs.c, which this call switches from the raw ROM-FIFO
+ * "no_driver" writer to the driver-backed one. That path is confirmed
+ * working on real hardware (C3: "prompts print fine").
  *
- * RX line-ending conversion is left at ESP_LINE_ENDINGS_LF (no
- * conversion) rather than the example's ESP_LINE_ENDINGS_CR: read_line()
- * (below) does its own line-ending handling -- both '\n' and bare '\r'
- * terminate a line, with '\r' peeking for and swallowing a following
- * '\n' -- so it needs raw, unconverted bytes to work with.
+ * Input is a different story -- see console_getc()/read_line() below.
+ * stdin is intentionally left untouched here (no fcntl, no setvbuf): C3
+ * on real hardware showed every provisioning prompt running to its full
+ * 60s timeout with zero bytes ever registering, even though the operator
+ * was typing/pasting into a live session. Root cause: read_line() used
+ * to read via fgetc(stdin) with O_NONBLOCK set. usb_serial_jtag_read()
+ * (the VFS read function under stdin) returns -1/EWOULDBLOCK on every
+ * empty poll by design (see usb_serial_jtag_vfs.c) -- but newlib's stdio
+ * layer sets the stream's error/EOF indicator on that first -1 return and
+ * does not clear it before the next call. Confirmed by grep: no
+ * clearerr(stdin) existed anywhere in this file, so every fgetc() after
+ * the very first empty poll short-circuited straight to EOF without the
+ * driver ever being touched again -- input dead from the first poll,
+ * exactly matching the field symptom (output fine, input never
+ * registers). Rather than papering over this with clearerr() and staying
+ * exposed to whatever else stdio buffering does over this VFS that can't
+ * be debugged remotely, input now bypasses stdio (and the VFS read path)
+ * entirely: usb_serial_jtag_read_bytes() is called directly.
  */
 static void console_init_usb_serial_jtag(void) {
     fflush(stdout);
     fsync(fileno(stdout));
 
-    usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_LF);
     usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
 
     usb_serial_jtag_driver_config_t jtag_config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&jtag_config));
     usb_serial_jtag_vfs_use_driver();
-
-    fcntl(fileno(stdin), F_SETFL, O_NONBLOCK);
-    setvbuf(stdin, NULL, _IONBF, 0);
 }
 
 /* Provisioning has no e-paper fallback screen (the operator is looking at
@@ -82,25 +89,64 @@ static void provisioning_fatal(const char *msg) {
 }
 
 #define CRLF_PEEK_MS 5
+#define CONSOLE_POLL_MS 20
 
-/* Reads one line from stdin into buf (NUL-terminated; cap includes the
- * NUL). stdin is non-blocking (console_init_usb_serial_jtag()), so this
- * polls fgetc() and checks the deadline only when nothing is available
- * yet -- bytes that do arrive are consumed immediately, back-to-back,
- * with no artificial per-byte delay. Bytes beyond cap-1 are silently
+/* Single-byte pushback slot, standing in for ungetc() now that input
+ * bypasses stdio entirely (see console_init_usb_serial_jtag()'s comment).
+ * Only ever holds at most one byte: read_line()'s CRLF handling pushes
+ * back a byte it peeked and didn't want, and the very next console_getc()
+ * call drains it before touching the driver again. -1 = empty. */
+static int s_pushed_back = -1;
+
+/* pdMS_TO_TICKS() truncates towards zero: at this project's
+ * CONFIG_FREERTOS_HZ=100 (10ms/tick), pdMS_TO_TICKS(5) is 0 -- a
+ * "wait a few ms" request would silently become "don't wait at all".
+ * Round up to at least 1 tick for any nonzero ms so a short timeout still
+ * means a short wait, not a no-op poll. */
+static TickType_t ms_to_ticks_min1(unsigned ms) {
+    TickType_t t = pdMS_TO_TICKS(ms);
+    return (t == 0 && ms > 0) ? 1 : t;
+}
+
+/* Reads one byte straight from the usb_serial_jtag driver (already
+ * installed by console_init_usb_serial_jtag()), bypassing stdio and the
+ * VFS read path entirely. usb_serial_jtag_read_bytes() blocks up to
+ * timeout_ms waiting for a byte and returns 0 (not negative, not EOF) on
+ * a timeout with nothing received -- no error/EOF indicator to latch, so
+ * every call after a timeout tries again exactly as fresh as the first.
+ * A previously pushed-back byte (console_ungetc()) is returned first,
+ * without touching the driver. Returns 0-255, or -1 on timeout. */
+static int console_getc(unsigned timeout_ms) {
+    if (s_pushed_back >= 0) {
+        int c = s_pushed_back;
+        s_pushed_back = -1;
+        return c;
+    }
+    uint8_t ch;
+    int n = usb_serial_jtag_read_bytes(&ch, 1, ms_to_ticks_min1(timeout_ms));
+    return (n > 0) ? (int)ch : -1;
+}
+
+static void console_ungetc(int c) {
+    s_pushed_back = c;
+}
+
+/* Reads one line into buf (NUL-terminated; cap includes the NUL) via
+ * console_getc(). Each poll already blocks up to CONSOLE_POLL_MS inside
+ * the driver (no separate vTaskDelay needed); the deadline is checked
+ * only when a poll comes back empty. Bytes beyond cap-1 are silently
  * dropped (but still consumed, so the stream stays in sync) rather than
  * overflowing the caller's buffer.
  *
  * Line endings: both '\n' and '\r' terminate a line. This matters because
  * miniterm's default Enter key sends a bare '\r' with no '\n' at all --
- * treating only '\n' as a terminator (as an earlier version of this
- * function did) means every prompt would silently time out under
- * miniterm. On '\r', a brief (CRLF_PEEK_MS) non-blocking peek swallows
- * exactly one immediately-following '\n' so a real "\r\n" pair still
- * consumes both bytes and behaves identically to before; a lone '\r'
- * (nothing follows within the peek window) terminates the line on its
- * own. A lone '\n' (Unix-style input) terminates immediately, no peek
- * needed -- this path, and CRLF's net effect, are unchanged from before.
+ * treating only '\n' as a terminator means every prompt times out under
+ * miniterm. On '\r', a brief (CRLF_PEEK_MS, rounded up to one FreeRTOS
+ * tick -- 10ms at this project's 100Hz tick rate, see ms_to_ticks_min1())
+ * peek swallows exactly one immediately-following '\n' so a real "\r\n"
+ * pair still consumes both bytes; a lone '\r' (nothing follows within the
+ * peek window) terminates the line on its own. A lone '\n' (Unix-style
+ * input) terminates immediately, no peek needed.
  *
  * Returns the line length (>= 0) once a line end is seen, or -1 if
  * timeout_ms elapses with no line completed (a partial line already
@@ -109,22 +155,16 @@ static int read_line(char *buf, size_t cap, unsigned timeout_ms) {
     size_t n = 0;
     int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
     while (1) {
-        int c = fgetc(stdin);
-        if (c == EOF) {
+        int c = console_getc(CONSOLE_POLL_MS);
+        if (c < 0) {
             if ((esp_timer_get_time() / 1000) >= deadline_ms) return -1;
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
+            continue;   /* console_getc() already waited up to CONSOLE_POLL_MS */
         }
         if (c == '\n' || c == '\r') {
             buf[n] = 0;
             if (c == '\r') {
-                int64_t peek_deadline_ms = (esp_timer_get_time() / 1000) + CRLF_PEEK_MS;
-                while (1) {
-                    int c2 = fgetc(stdin);
-                    if (c2 == '\n') break;                        /* "\r\n": both consumed */
-                    if (c2 != EOF) { ungetc(c2, stdin); break; }   /* bare '\r': push back, done */
-                    if ((esp_timer_get_time() / 1000) >= peek_deadline_ms) break;  /* bare '\r', nothing followed */
-                }
+                int c2 = console_getc(CRLF_PEEK_MS);
+                if (c2 != '\n' && c2 >= 0) console_ungetc(c2);   /* not LF: not ours, push back */
             }
             return (int)n;
         }
