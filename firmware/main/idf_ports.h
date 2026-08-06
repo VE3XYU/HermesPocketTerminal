@@ -20,4 +20,16 @@
  */
 void idf_ports_init(port_storage_t *st, port_kv_t *kv, port_clock_t *ck, port_rng_t *rng);
 
+/* Diagnostic detail for the most recent st_write() failure. Device-only
+ * side channel, deliberately outside the port_storage_t contract (that
+ * stays a bare 0/-1 -- app_core and the host test suite's fake_storage.c
+ * both depend on that signature, unchanged). Only meaningful right after
+ * a port_storage_t write() call returned -1; step/err are stale (but
+ * harmless to read) otherwise. */
+typedef struct {
+    const char *step;   /* "fopen" | "fwrite" | "fwrite short" | "fclose" | "rename" | "path" */
+    int err;             /* errno at the point of failure */
+} idf_write_fail_t;
+void idf_ports_last_write_fail(idf_write_fail_t *out);
+
 #endif

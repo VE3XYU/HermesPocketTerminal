@@ -72,3 +72,34 @@ int board_sd_mount(void) { return mount(false); }
  * fully unwinds its host/slot state on the way out, this second call is a
  * clean, independent attempt, not a retry on top of stale state. */
 int board_sd_format_and_mount(void) { return mount(true); }
+
+/* Erase-and-reformat path for a card that *is* currently mounted but
+ * refuses writes (mount succeeded -- filesystem structures parse well
+ * enough for that -- but something underneath is corrupt or failing).
+ * Unlike board_sd_format_and_mount(), there's a live mount to tear down
+ * first: esp_vfs_fat_sdcard_unmount() is the correct pairing for how this
+ * file mounts (esp_vfs_fat_sdmmc_mount(), not sdspi) -- it's the
+ * non-deprecated unmount that takes the same base_path + sdmmc_card_t*
+ * esp_vfs_fat_sdmmc_mount() handed back via s_card, as opposed to the
+ * deprecated esp_vfs_fat_sdmmc_unmount() (no arguments, tracks "the last
+ * mounted card" internally). Confirmed in esp-idf's
+ * fatfs/vfs/vfs_fat_sdmmc.c: unmount_card_core() (which this reaches)
+ * calls call_host_deinit() on the card's host before freeing it -- the
+ * same SDMMC host/slot teardown a failed mount unwinds through, so the
+ * mount(true) that follows starts from the same clean state
+ * board_sd_format_and_mount() relies on, not a second mount stacked on
+ * top of a live one. s_card is dropped (set NULL) unconditionally after
+ * the unmount attempt: unmount_card_core() frees the sdmmc_card_t on
+ * every path that gets past its one early-return (an unregistered pdrv,
+ * which can't happen for a card we just successfully mounted), so
+ * holding onto the pointer past this point risks a dangling read even if
+ * the unmount's own return code was an error. */
+int board_sd_unmount_and_format(void) {
+    if (s_card) {
+        esp_err_t err = esp_vfs_fat_sdcard_unmount("/sdcard", s_card);
+        if (err != ESP_OK)
+            ESP_LOGE(TAG, "unmount before reformat failed: %s", esp_err_to_name(err));
+        s_card = NULL;
+    }
+    return mount(true);
+}

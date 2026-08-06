@@ -209,6 +209,45 @@ static void provision_format(void) {
     printf("SD card formatted and mounted.\n");
 }
 
+/* Guards the write-failure format offer below to at most once per boot
+ * (independent of provision_format()'s own mount-failure offer above --
+ * different trigger, different point in the flow). Without this, a card
+ * that reformats but still can't take writes (bad flash, not just a
+ * corrupt filesystem) would loop: format "succeeds", provisioning
+ * restarts, the very next write fails again, offer FORMAT again... */
+static int s_format_offered_for_write_failure = 0;
+
+/* Handles an st->write() failure during provisioning: at most once per
+ * boot, offers to erase+rebuild the filesystem (unmount + format +
+ * remount); a second write failure after that offer has already been
+ * used, or a declined/timed-out prompt, is fatal. Never returns except
+ * after a successful reformat -- the caller must then restart the whole
+ * paste sequence from config.json (the just-written file, if any, is
+ * gone; the card was just wiped). */
+static void handle_write_failure(void) {
+    idf_write_fail_t f;
+    idf_ports_last_write_fail(&f);
+
+    if (s_format_offered_for_write_failure) {
+        provisioning_fatal("Card appears unusable — replace the SD card.");
+        return;   /* unreachable: provisioning_fatal() never returns */
+    }
+    s_format_offered_for_write_failure = 1;
+
+    printf("\nWrite failed (%s, errno %d). Type FORMAT to erase and rebuild the filesystem, or SKIP:\n",
+           f.step, f.err);
+    fflush(stdout);
+    char line[32];
+    int n = read_line(line, sizeof line, PROVISION_TIMEOUT_MS);
+    if (n < 0) provisioning_fatal("write-failure format prompt timed out");
+    if (strcmp(line, "FORMAT") != 0) provisioning_fatal("write-failure format declined");
+
+    printf("Formatting SD card...\n");
+    fflush(stdout);
+    if (board_sd_unmount_and_format() != 0) provisioning_fatal("SD format failed");
+    printf("SD card formatted and mounted. Restarting provisioning from config.json...\n");
+}
+
 static int is_valid_config_json(const char *json, size_t len) {
     app_config_t tmp;
     return app_config_parse(json, len, &tmp) == 0;
@@ -225,18 +264,31 @@ static int is_valid_wifi_json(const char *json, size_t len) {
  * Retries up to 3 attempts on a parse failure; a read timeout/overflow is
  * escalated immediately (not counted against the 3 attempts -- that's a
  * "nobody's there" failure, not a "pasted something wrong" one).
- * Returns 0 on success, -1 once 3 parse attempts are exhausted. */
+ *
+ * *restart is set to 1 when a write failure was recovered by reformatting
+ * (handle_write_failure() -- at most once per boot); the caller must then
+ * restart the whole paste sequence from config.json, since the card was
+ * just wiped. It's 0 on every other outcome, including a genuine 3-attempt
+ * exhaustion (which stays fatal at the call site, not a restart).
+ *
+ * Returns 0 on success, -1 otherwise (check *restart to tell "reformatted,
+ * try again from the top" apart from "genuinely out of attempts"). */
 static int provision_paste_and_write(port_storage_t *st, const char *path, const char *prompt,
                                       char *scratch, size_t scratch_cap,
-                                      int (*is_valid)(const char *json, size_t len)) {
+                                      int (*is_valid)(const char *json, size_t len),
+                                      int *restart) {
+    *restart = 0;
     for (int attempt = 1; attempt <= 3; attempt++) {
         printf("\n%s\n", prompt);
         fflush(stdout);
         int n = read_body_until_eof(scratch, scratch_cap, PROVISION_TIMEOUT_MS);
         if (n < 0) provisioning_fatal("provisioning input timed out or exceeded the size cap");
         if (is_valid(scratch, (size_t)n)) {
-            if (st->write(st->ctx, path, scratch, (size_t)n) != 0)
-                provisioning_fatal("failed to write provisioned file to SD card");
+            if (st->write(st->ctx, path, scratch, (size_t)n) != 0) {
+                handle_write_failure();   /* never returns except after a successful reformat */
+                *restart = 1;
+                return -1;
+            }
             printf("%s written and validated.\n", path);
             return 0;
         }
@@ -322,15 +374,31 @@ void app_main(void) {
                 mounted = 1;
             }
 
-            if (provision_paste_and_write(&st, "/config.json",
-                    "Paste config.json, end with a line containing only EOF:",
-                    buf, sizeof buf, is_valid_config_json) != 0)
-                provisioning_fatal("config.json provisioning failed after 3 attempts");
+            /* Loops back to the top (re-prompting config.json, discarding
+             * any previous paste) only when a write failure got recovered
+             * by reformatting mid-flow -- see provision_paste_and_write()'s
+             * *restart out-param and handle_write_failure(). Every other
+             * exit from either call below is either success (falls through)
+             * or fatal (provisioning_fatal() inside, never returns). */
+            for (;;) {
+                int restart = 0;
 
-            if (provision_paste_and_write(&st, "/wifi.json",
-                    "Paste wifi.json, end with a line containing only EOF:",
-                    buf, sizeof buf, is_valid_wifi_json) != 0)
-                provisioning_fatal("wifi.json provisioning failed after 3 attempts");
+                if (provision_paste_and_write(&st, "/config.json",
+                        "Paste config.json, end with a line containing only EOF:",
+                        buf, sizeof buf, is_valid_config_json, &restart) != 0) {
+                    if (restart) continue;
+                    provisioning_fatal("config.json provisioning failed after 3 attempts");
+                }
+
+                if (provision_paste_and_write(&st, "/wifi.json",
+                        "Paste wifi.json, end with a line containing only EOF:",
+                        buf, sizeof buf, is_valid_wifi_json, &restart) != 0) {
+                    if (restart) continue;
+                    provisioning_fatal("wifi.json provisioning failed after 3 attempts");
+                }
+
+                break;
+            }
 
             printf("\nProvisioning complete.\n\n");
             fflush(stdout);

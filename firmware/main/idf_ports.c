@@ -17,6 +17,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 static const char *TAG = "idf_ports";
 
@@ -32,6 +33,22 @@ static const char *TAG = "idf_ports";
 static int full_path(const char *logical, char *out, size_t cap) {
     int n = snprintf(out, cap, "%s%s", SD_PREFIX, logical);
     return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+/* Diagnostic side channel for st_write() failures -- see idf_ports.h.
+ * Single static instance: main-task-only, single-threaded, and only ever
+ * meaningful for the caller's *immediately preceding* write() call, so
+ * there's nothing to gain from anything fancier than "last one wins". */
+static idf_write_fail_t s_last_write_fail = { "unknown", 0 };
+
+static void note_write_fail(const char *step) {
+    s_last_write_fail.step = step;
+    s_last_write_fail.err = errno;
+    ESP_LOGE(TAG, "write failed: step=%s errno=%d", step, errno);
+}
+
+void idf_ports_last_write_fail(idf_write_fail_t *out) {
+    if (out) *out = s_last_write_fail;
 }
 
 /* RECOVERY CONTRACT for the tmp-file-then-rename write pattern below.
@@ -75,8 +92,12 @@ static int full_path(const char *logical, char *out, size_t cap) {
  */
 static int rename_replacing(const char *tmp, const char *fp) {
     if (rename(tmp, fp) == 0) return 0;
+    /* This first failure is the routine/expected FR_EXIST case (see
+     * above) -- not diagnostic-worthy on its own, only the final one is. */
     remove(fp);
-    return rename(tmp, fp) == 0 ? 0 : -1;
+    if (rename(tmp, fp) == 0) return 0;
+    note_write_fail("rename");
+    return -1;
 }
 
 static int read_whole_file(const char *fp, void *buf, size_t cap, size_t *len) {
@@ -114,26 +135,33 @@ static int st_read(void *ctx, const char *path, void *buf, size_t cap, size_t *l
 
 static int write_whole_file(const char *fp, const void *data, size_t len) {
     FILE *f = fopen(fp, "wb");
-    if (!f) return -1;
+    if (!f) { note_write_fail("fopen"); return -1; }
+
     size_t n = fwrite(data, 1, len, f);
     int wr_err = ferror(f);
-    int close_err = fclose(f);
-    return (wr_err || close_err != 0 || n != len) ? -1 : 0;
+    if (wr_err || n != len) {
+        note_write_fail((n != len && !wr_err) ? "fwrite short" : "fwrite");
+        fclose(f);   /* best-effort; already failing, nothing more to report */
+        return -1;
+    }
+
+    if (fclose(f) != 0) { note_write_fail("fclose"); return -1; }
+    return 0;
 }
 
 static int st_write(void *ctx, const char *path, const void *data, size_t len) {
     (void)ctx;
     char fp[SD_PATH_MAX];
     char tmp[SD_PATH_MAX + 4];
-    if (full_path(path, fp, sizeof fp) != 0) return -1;
-    if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", fp) >= sizeof tmp) return -1;
+    if (full_path(path, fp, sizeof fp) != 0) { note_write_fail("path"); return -1; }
+    if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", fp) >= sizeof tmp) { note_write_fail("path"); return -1; }
 
-    if (write_whole_file(tmp, data, len) != 0) { remove(tmp); return -1; }
+    if (write_whole_file(tmp, data, len) != 0) { remove(tmp); return -1; }   /* step already noted */
 
     /* tmp now holds the one durable copy of this write. From here on,
      * never remove(tmp) on a failure path — only a successful promotion
      * retires it. See the recovery contract above. */
-    if (rename_replacing(tmp, fp) != 0) return -1;   /* tmp intentionally left in place */
+    if (rename_replacing(tmp, fp) != 0) return -1;   /* tmp intentionally left in place; step already noted */
     return 0;
 }
 
