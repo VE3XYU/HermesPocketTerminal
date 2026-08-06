@@ -99,7 +99,9 @@ static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n'; }
 
 #define TEXT_LINE_CHARS 24
 #define TEXT_LINES_PER_PAGE 12
-#define TEXT_LINE_H UI_ROW_H
+#define TEXT_LINE_H 12  /* NOT UI_ROW_H: 12*14=168 would paint into the banner
+                          * strip (y>=UI_H-UI_BANNER_H=168); 12*12=144 keeps the
+                          * last line (row 11) at y=20+132=152..159, clear of it. */
 
 /* Word-wraps `text` into TEXT_LINE_CHARS-wide lines (hard-breaking words
  * longer than a line), drawing only lines within [first_line, last_line)

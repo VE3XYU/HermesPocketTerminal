@@ -57,6 +57,7 @@ int main(void) {
     int pages = widget_text_page(&fb, longtext, 0);
     CHECK(pages >= 7);                /* 2000 chars / (24*12) ≈ 7 pages */
     CHECK(fb_count_black(&fb) > 0);
+    CHECK_EQ_INT(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H), 0);  /* stays clear of the banner strip */
     fb_clear(&fb);
     int pages2 = widget_text_page(&fb, longtext, pages - 1);
     CHECK_EQ_INT(pages, pages2);
