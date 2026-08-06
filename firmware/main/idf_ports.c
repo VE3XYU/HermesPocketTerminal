@@ -51,10 +51,27 @@ static int full_path(const char *logical, char *out, size_t cap) {
  * before any rename was attempted). st_read() then falls back to
  * "<path>.tmp" whenever "<path>" can't be read, and promotes it back to
  * "<path>" so the recovery is permanent (one promotion, not a fallback on
- * every subsequent read). The two files are never both valid
- * simultaneously in steady state: rename_replacing() either fully
- * promotes tmp to fp (tmp gone, fp holds the new data) or, on failure,
- * fp is gone and tmp survives — never the reverse, and never both.
+ * every subsequent read).
+ *
+ * Reachable on-disk states for a given logical path, and what st_read()
+ * does in each:
+ *   - fp only (no write in flight, or a prior write fully promoted):
+ *     read fp directly.
+ *   - fp (old, untouched) + tmp (new, durable) — reachable if a crash or
+ *     failure lands anywhere from write_whole_file()'s success up through
+ *     a failed first rename() inside rename_replacing(), before remove(fp)
+ *     runs: fp is still readable, so st_read() returns the OLD value
+ *     (equivalent to the write never having been attempted) without even
+ *     looking at tmp. The orphaned tmp is harmless: the next st_write() to
+ *     this path reopens and overwrites it in "wb" mode.
+ *   - tmp only, fp gone — reachable once remove(fp) has run but the
+ *     replacement rename() hasn't landed (crash in that window, or the
+ *     retry itself fails): st_read() falls back to tmp, returns the NEW
+ *     value, and promotes tmp to fp so later reads skip the fallback.
+ *   - neither: path was never written (or was explicitly removed); a
+ *     genuine miss.
+ * fp and tmp are never both "new" data — tmp only outlives a successful
+ * promotion when fp still holds the un-replaced old value.
  */
 static int rename_replacing(const char *tmp, const char *fp) {
     if (rename(tmp, fp) == 0) return 0;
