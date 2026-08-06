@@ -23,6 +23,7 @@ add_library(fw_components
   ${FW}/components/app_core/src/capture_flow.c
   ${FW}/components/app_core/src/sync.c
   ${FW}/components/app_core/src/gesture.c
+  ${FW}/components/app_core/src/ui_flow.c
   ${FW}/components/ui/src/fb.c
   ${FW}/components/ui/src/widgets.c
 )
@@ -57,3 +58,4 @@ host_test(test_sync)
 host_test(test_fb)
 host_test(test_widgets)
 host_test(test_gesture)
+host_test(test_ui_flow)
