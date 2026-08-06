@@ -34,10 +34,35 @@ static int full_path(const char *logical, char *out, size_t cap) {
     return (n > 0 && (size_t)n < cap) ? 0 : -1;
 }
 
-static int st_read(void *ctx, const char *path, void *buf, size_t cap, size_t *len) {
-    (void)ctx;
-    char fp[SD_PATH_MAX];
-    if (full_path(path, fp, sizeof fp) != 0) return -1;
+/* RECOVERY CONTRACT for the tmp-file-then-rename write pattern below.
+ *
+ * FatFs's f_rename() (unlike POSIX rename()) refuses to replace an
+ * existing destination — it returns FR_EXIST instead of swapping in the
+ * new file. Sidecar writes (sidecar_save) hit this on every re-save of the
+ * same capture_id, so a bare rename() would break state persistence after
+ * the first write. rename_replacing() works around this by removing the
+ * stale target and retrying once — but that means there is a window
+ * (between the remove() and the retry rename()) where power loss leaves
+ * only "<path>.tmp" on disk, with "<path>" gone.
+ *
+ * We never treat that as data loss: st_write() leaves "<path>.tmp" in
+ * place on any rename failure (it does NOT remove(tmp) — the tmp file is
+ * the one surviving durable copy at that point, written and fclose()'d
+ * before any rename was attempted). st_read() then falls back to
+ * "<path>.tmp" whenever "<path>" can't be read, and promotes it back to
+ * "<path>" so the recovery is permanent (one promotion, not a fallback on
+ * every subsequent read). The two files are never both valid
+ * simultaneously in steady state: rename_replacing() either fully
+ * promotes tmp to fp (tmp gone, fp holds the new data) or, on failure,
+ * fp is gone and tmp survives — never the reverse, and never both.
+ */
+static int rename_replacing(const char *tmp, const char *fp) {
+    if (rename(tmp, fp) == 0) return 0;
+    remove(fp);
+    return rename(tmp, fp) == 0 ? 0 : -1;
+}
+
+static int read_whole_file(const char *fp, void *buf, size_t cap, size_t *len) {
     FILE *f = fopen(fp, "rb");
     if (!f) return -1;
     size_t n = fread(buf, 1, cap, f);
@@ -45,6 +70,28 @@ static int st_read(void *ctx, const char *path, void *buf, size_t cap, size_t *l
     fclose(f);
     if (rd_err) return -1;
     if (len) *len = n;
+    return 0;
+}
+
+static int st_read(void *ctx, const char *path, void *buf, size_t cap, size_t *len) {
+    (void)ctx;
+    char fp[SD_PATH_MAX];
+    if (full_path(path, fp, sizeof fp) != 0) return -1;
+
+    if (read_whole_file(fp, buf, cap, len) == 0) return 0;
+
+    /* "<path>" is missing or unreadable. Per the recovery contract above,
+     * an orphaned "<path>.tmp" may hold the durable copy of the last
+     * write that never got promoted — try it before giving up. */
+    char tmp[SD_PATH_MAX + 4];
+    if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", fp) >= sizeof tmp) return -1;
+    if (read_whole_file(tmp, buf, cap, len) != 0) return -1;   /* genuinely missing */
+
+    ESP_LOGW(TAG, "recovered orphaned tmp file for %s", path);
+    if (rename_replacing(tmp, fp) != 0)
+        ESP_LOGW(TAG, "promotion of %s failed; will retry recovery on next read", path);
+    /* Promotion is best-effort tidying, not required for this read to
+     * succeed — the data is already in buf either way. */
     return 0;
 }
 
@@ -66,17 +113,10 @@ static int st_write(void *ctx, const char *path, const void *data, size_t len) {
 
     if (write_whole_file(tmp, data, len) != 0) { remove(tmp); return -1; }
 
-    if (rename(tmp, fp) != 0) {
-        /* FatFs's f_rename() (unlike POSIX rename()) refuses to replace an
-         * existing destination — it returns FR_EXIST instead of swapping
-         * in the new file. Sidecar writes (sidecar_save) hit this on every
-         * re-save of the same capture_id, so a bare rename() would break
-         * state persistence after the first write. The tmp file already
-         * holds the durable copy at this point, so it's safe to drop the
-         * stale target and retry once. */
-        remove(fp);
-        if (rename(tmp, fp) != 0) { remove(tmp); return -1; }
-    }
+    /* tmp now holds the one durable copy of this write. From here on,
+     * never remove(tmp) on a failure path — only a successful promotion
+     * retires it. See the recovery contract above. */
+    if (rename_replacing(tmp, fp) != 0) return -1;   /* tmp intentionally left in place */
     return 0;
 }
 
