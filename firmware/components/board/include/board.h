@@ -1,5 +1,6 @@
 #ifndef BOARD_H
 #define BOARD_H
+#include <stdint.h>
 /* Board support: power rails, buttons, sleep/wake.
  * Pin map (design §2): Record GPIO 0, Power GPIO 18,
  * rails EPD 6 / audio 42 (active-low), VBAT latch 17 (active-high),
@@ -15,5 +16,13 @@ typedef enum { WAKE_COLD, WAKE_REC_BUTTON, WAKE_PWR_BUTTON, WAKE_TIMER } wake_ca
 wake_cause_t board_wake_cause(void);
 void board_deep_sleep(unsigned seconds);   /* arms EXT1 both-buttons + timer, latches VBAT, never returns */
 void board_power_off(void);                /* releases VBAT latch */
+
+/* SSD1681 e-paper driver (Task 13). fb5000 buffers are already in SSD1681
+ * RAM format (Task 8's ui_fb_t.px): bit set = white, MSB = leftmost,
+ * 25-byte stride, 5000 bytes total. Send raw, no conversion. */
+int  epd_init(void);                       /* rail on, HW init; 0 ok */
+void epd_full(const uint8_t *fb5000);      /* full refresh (~1.5 s, flashes) */
+void epd_partial(const uint8_t *fb5000);   /* partial refresh (fast, may ghost) */
+void epd_sleep(void);                      /* deep-sleep cmd + rail off */
 
 #endif
