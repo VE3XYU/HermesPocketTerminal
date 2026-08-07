@@ -334,6 +334,11 @@ static int power_button_held_at_boot(wake_cause_t wc) {
                                       watching must still reach the stay-awake tail with
                                       the serial port alive. Untuned. */
 #define C4_ARM_POLL_MS    20
+#define C4_ARM_DEBOUNCE_MS 25    /* confirm the press is still held this long after the
+                                    edge before arming the recording; a mechanical bounce
+                                    that reads pressed then releases within this window
+                                    goes back to waiting instead of starting a recording
+                                    that instantly reads "released" and stops at 0 bytes. */
 #define C4_MAX_RECORD_MS  120000   /* hard cap on one recording (task brief) */
 
 /* keep_going/stop_now adapter. board_btn_rec() takes no ctx, and calling it
@@ -343,11 +348,23 @@ static int power_button_held_at_boot(wake_cause_t wc) {
 static int c4_rec_held(void *ctx) { (void)ctx; return board_btn_rec(); }
 
 /* Bounded wait for the record button. Returns 1 if pressed, 0 on timeout.
- * Wall-clock (esp_timer), never iteration-counted. */
+ * Wall-clock (esp_timer), never iteration-counted.
+ *
+ * A raw first-edge return is not enough: audio_record_to() samples
+ * keep_going() immediately, so a mechanical bounce that reads pressed for
+ * one poll and releases before the recording task gets going would produce
+ * a 0-byte/44-byte WAV that looks like a hardware failure rather than a
+ * switch bounce. On every pressed edge, re-check after C4_ARM_DEBOUNCE_MS;
+ * if it is still held, that is a real press. If it bounced back to
+ * released, fall through and keep polling within the same arm window. */
 static int c4_wait_for_rec(unsigned timeout_ms) {
     int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
     while ((esp_timer_get_time() / 1000) < deadline_ms) {
-        if (board_btn_rec()) return 1;
+        if (board_btn_rec()) {
+            board_delay_ms(C4_ARM_DEBOUNCE_MS);
+            if (board_btn_rec()) return 1;   /* still held: real press */
+            continue;                        /* bounce: keep waiting */
+        }
         board_delay_ms(C4_ARM_POLL_MS);
     }
     return 0;
