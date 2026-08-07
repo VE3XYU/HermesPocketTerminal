@@ -10,7 +10,10 @@ b = sys.argv[1]
 args = json.load(open(os.path.join(b, "flasher_args.json")))
 by_offset = sorted(args["flash_files"].items(), key=lambda kv: int(kv[0], 16))
 files = [v for _, v in by_offset]
-cmd = "python -m esptool --chip esp32s3 -b 460800 write-flash " + " ".join(
+# python3, not python: macOS ships no bare "python" (and PEP 394 leaves it
+# optional everywhere else), so the generated command has to name the
+# interpreter that actually exists on the flashing machine.
+cmd = "python3 -m esptool --chip esp32s3 -b 460800 write-flash " + " ".join(
     f"{off} {os.path.basename(path)}" for off, path in by_offset)
 with zipfile.ZipFile(os.path.join(b, "flash-pack.zip"), "w") as z:
     for f in files:
