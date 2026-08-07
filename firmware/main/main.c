@@ -326,6 +326,87 @@ static int power_button_held_at_boot(wake_cause_t wc) {
     return 0;   /* released before the debounce window elapsed */
 }
 
+#define DEV_HEARTBEAT_MS    30000               /* heartbeat cadence while staying awake */
+#define DEV_IDLE_TIMEOUT_MS (30u * 60u * 1000u) /* ~30 min without input -> deep sleep;
+                                                   untuned, dev-iteration convenience */
+#define DEV_PWR_HOLD_MS     2000                /* PWR held this long -> deep sleep;
+                                                   untuned, chosen > boot-transient bounce */
+
+/* End-of-harness behavior: stay awake with USB-Serial-JTAG alive so the
+ * operator can keep iterating (flash, read logs, poke serial), instead of
+ * dropping into deep sleep immediately and killing the port. Deep sleep
+ * happens only on:
+ *   - "sleep" + Enter on the serial console,
+ *   - the Power button held ~2 s (then released -- we wait for the release
+ *     so board_deep_sleep()'s EXT1 any-low wake doesn't fire the instant
+ *     we go down and bounce straight back into a boot),
+ *   - DEV_IDLE_TIMEOUT_MS with no serial byte and no button press.
+ * All timing is wall-clock (esp_timer), never iteration-counted. Never
+ * returns. Wake-cause labeling on the next boot is unchanged: sleep still
+ * goes through board_deep_sleep(0), same as before. */
+static void dev_stay_awake_then_sleep(void) {
+    ESP_LOGI(TAG, "staying awake for development; type 'sleep' + Enter or hold PWR ~2s to deep-sleep now");
+    ESP_LOGI(TAG, "auto deep-sleep after %u min idle", (unsigned)(DEV_IDLE_TIMEOUT_MS / 60000u));
+
+    char line[16];
+    size_t n = 0;
+    int64_t t_last_input = esp_timer_get_time() / 1000;
+    int64_t t_next_heartbeat = t_last_input + DEV_HEARTBEAT_MS;
+    int64_t t_pwr_down_since = -1;   /* -1 = PWR not currently pressed */
+
+    for (;;) {
+        /* console_getc() blocks in the driver up to CONSOLE_POLL_MS, so
+         * this loop wakes ~50x/s when idle -- that's also the PWR-button
+         * sampling rate. */
+        int c = console_getc(CONSOLE_POLL_MS);
+        int64_t now = esp_timer_get_time() / 1000;
+
+        if (c >= 0) {
+            t_last_input = now;
+            if (c == '\n' || c == '\r') {
+                line[n] = 0;
+                n = 0;
+                if (strcmp(line, "sleep") == 0) {
+                    ESP_LOGI(TAG, "sleep command received");
+                    break;
+                }
+                if (line[0]) ESP_LOGI(TAG, "unknown command '%s' (commands: sleep)", line);
+            } else if (n + 1 < sizeof line) {
+                line[n++] = (char)c;
+            } else {
+                n = 0;   /* overlong line: discard, resync at the next line end */
+            }
+        }
+
+        if (board_btn_pwr()) {
+            t_last_input = now;
+            if (t_pwr_down_since < 0) t_pwr_down_since = now;
+            else if (now - t_pwr_down_since >= DEV_PWR_HOLD_MS) {
+                ESP_LOGI(TAG, "PWR held %d ms -- release the button to deep-sleep", DEV_PWR_HOLD_MS);
+                while (board_btn_pwr()) vTaskDelay(pdMS_TO_TICKS(50));
+                vTaskDelay(pdMS_TO_TICKS(100));   /* release bounce margin before arming EXT1 */
+                break;
+            }
+        } else {
+            t_pwr_down_since = -1;
+        }
+
+        if (now >= t_next_heartbeat) {
+            ESP_LOGI(TAG, "awake (dev hold), up %lld min; 'sleep' + Enter or hold PWR ~2s to deep-sleep",
+                     (long long)(now / 60000));
+            t_next_heartbeat = now + DEV_HEARTBEAT_MS;
+        }
+
+        if (now - t_last_input >= (int64_t)DEV_IDLE_TIMEOUT_MS) {
+            ESP_LOGI(TAG, "idle %u min, auto deep-sleeping", (unsigned)(DEV_IDLE_TIMEOUT_MS / 60000u));
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "entering deep sleep (wake: REC or PWR button)");
+    board_deep_sleep(0);
+}
+
 void app_main(void) {
     board_early_init();
     console_init_usb_serial_jtag();
@@ -435,21 +516,27 @@ void app_main(void) {
     ESP_LOGI(TAG, "nvs roundtrip: %s", kv_ok ? v : "FAIL");
 
     static ui_fb_t fb;
-    if (epd_init() != 0) { ESP_LOGE(TAG, "epd_init failed"); board_deep_sleep(0); }
-    fb_clear(&fb);
-    fb_text(&fb, 10, 15, "Config OK", 2, 1);
-    char line[40];
-    snprintf(line, sizeof line, "sync=%ds", cfg.sync_interval_s);
-    fb_text(&fb, 10, 55, line, 1, 1);
-    snprintf(line, sizeof line, "wifi nets=%d", have_wifi ? wp.count : 0);
-    fb_text(&fb, 10, 75, line, 1, 1);
-    snprintf(line, sizeof line, "sd free=%lldK", free_bytes / 1024);
-    fb_text(&fb, 10, 95, line, 1, 1);
-    fb_text(&fb, 10, 115, kv_ok ? "nvs=ok" : "nvs=FAIL", 1, 1);
-    fb_rect(&fb, 5, 5, 190, 190, 1);
-    epd_full(fb.px);
-    epd_sleep();
+    if (epd_init() != 0) {
+        /* Stay awake even on a display failure: the serial port (and its
+         * diagnostic log lines above) is exactly what the operator needs
+         * to keep while debugging the panel. */
+        ESP_LOGE(TAG, "epd_init failed");
+    } else {
+        fb_clear(&fb);
+        fb_text(&fb, 10, 15, "Config OK", 2, 1);
+        char line[40];
+        snprintf(line, sizeof line, "sync=%ds", cfg.sync_interval_s);
+        fb_text(&fb, 10, 55, line, 1, 1);
+        snprintf(line, sizeof line, "wifi nets=%d", have_wifi ? wp.count : 0);
+        fb_text(&fb, 10, 75, line, 1, 1);
+        snprintf(line, sizeof line, "sd free=%lldK", free_bytes / 1024);
+        fb_text(&fb, 10, 95, line, 1, 1);
+        fb_text(&fb, 10, 115, kv_ok ? "nvs=ok" : "nvs=FAIL", 1, 1);
+        fb_rect(&fb, 5, 5, 190, 190, 1);
+        epd_full(fb.px);
+        epd_sleep();
+    }
 
-    ESP_LOGI(TAG, "C3 done, sleeping");
-    board_deep_sleep(0);
+    ESP_LOGI(TAG, "C3 done");
+    dev_stay_awake_then_sleep();   /* never returns */
 }
