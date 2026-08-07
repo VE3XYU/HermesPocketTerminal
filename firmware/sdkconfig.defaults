@@ -6,7 +6,14 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Task 17: sessions (capture + sync) run on the main task. Worst-case call
+# chain measured against the sources: sync_cycle (~1 KB after its batch
+# buffers went static) -> capture_retry_pending (ids[32][64] + sidecar_t,
+# ~3.4 KB) -> htp_upload_capture/perform (~0.8 KB) -> idf_transport
+# (buffers static, ~0.5 KB) -> esp_http_client/esp-tls/lwIP (~4-6 KB) plus
+# ESP_LOG/newlib margin. ~12 KB estimated peak; 20 KB leaves 8 KB headroom
+# (the tail logs uxTaskGetStackHighWaterMark for real numbers at C6).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=20480
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y

@@ -1,37 +1,108 @@
+/* HTP terminal firmware — wake dispatch + full capture session (Task 17).
+ *
+ * app_main() dispatches on the wake cause (design §5.1):
+ *   REC button  -> capture_session()      hold-to-talk, upload, reply, sync
+ *   PWR button  -> ui_session_stub()      sync-only until Task 18
+ *   timer/cold  -> sync_session_stub()    mount, config, Wi-Fi, sync_cycle
+ *
+ * Task 14's serial-provisioning boot path survives inside the sync/UI
+ * sessions: SD mount failure, an unparseable /config.json, or the Power
+ * button held through boot (with the YES escape) all still drop into the
+ * console provisioning flow before anything else runs.
+ *
+ * Capture fast path (design §5.2): everything before audio_record_to() is
+ * capture-critical only. The audio rail is gated on first so its settle
+ * overlaps the SD mount; the Wi-Fi join kickoff and the recording glyph
+ * are pushed to a short-lived background task so the first I2S read isn't
+ * delayed by esp_wifi bring-up (~100 ms) or an e-paper refresh (a partial
+ * blocks 300-500 ms, a first full ~2 s -- either would blow the 250 ms
+ * record-start target and the DMA ring only covers ~256 ms).
+ */
 #include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "board.h"
 #include "tick_ms.h"
 #include "ui_fb.h"
+#include "ui_widgets.h"
+#include "ui_flow.h"
 #include "ports.h"
 #include "idf_ports.h"
 #include "idf_wifi.h"
 #include "idf_transport.h"
 #include "app_config.h"
 #include "htp_client.h"
+#include "htp_ids.h"
+#include "capture_flow.h"
+#include "sidecar.h"
+#include "rec_index.h"
+#include "sync.h"
+#include "gesture.h"
+#include "util.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 
 static const char *TAG = "htp";
 
-static int log_rec_entry(const char *name, void *u) {
-    int *count = u;
-    ESP_LOGI(TAG, "  /rec/%s", name);
-    (*count)++;
-    return 0;   /* keep enumerating */
-}
+/* ============================================================
+ * Development-linger switch.
+ *
+ * 1 (development, the default): after a session completes, the device
+ * stays awake with the USB-Serial-JTAG console alive -- heartbeat,
+ * 'sleep' + Enter, PWR held ~2 s, or DEV_IDLE_TIMEOUT_MS of idleness
+ * drop it into the real deep sleep, with the sync timer armed, so the
+ * full sleep/wake cycle stays verifiable (C6).
+ *
+ * 0 (release, Task 19 flips this): every session ends directly in
+ * board_deep_sleep(next_sync_interval()), no console hold.
+ * ============================================================ */
+#define HTP_DEV_LINGER 1
+
+/* ============================================================
+ * Session state. One main task runs everything sequentially, and the
+ * large objects are static (not stack) per the project ruling that big
+ * buffers live in BSS -- the stack budget in sdkconfig.defaults is sized
+ * for call frames, not for multi-KB models.
+ * ============================================================ */
+static port_storage_t s_st;
+static port_kv_t      s_kv;
+static port_clock_t   s_ck;
+static port_rng_t     s_rng;
+static app_config_t   s_cfg;
+static wifi_profiles_t s_wp;
+static int s_have_cfg, s_have_wifi, s_wifi_ok;
+static htp_transport_t s_tr;
+static htp_client_t    s_cl;
+static ui_fb_t   s_fb;
+static ui_flow_t s_uif;
+static int s_epd_up;       /* epd_init() has run and the panel is awake */
+static int s_base_drawn;   /* a full refresh established a partial base */
+static char s_json[2048];  /* config/wifi read + provisioning paste scratch */
+static sidecar_t s_sc, s_sc_next;
+
+#define REPLY_LOGICAL "/reply.tmp.wav"
+#define REPLY_FS      "/sdcard" REPLY_LOGICAL
+
+#define CAPTURE_WIFI_WAIT_MS 8000    /* post-recording wait; a stale fast join can
+                                        roughly double this via the scan fallback */
+#define SYNC_WIFI_TIMEOUT_MS 20000   /* sync sessions aren't latency-critical */
+#define MAX_RECORD_MS        120000  /* hard cap on one recording (design §5.2) */
+#define MIN_WAV_BYTES        8000    /* < 250 ms of 16 kHz mono: discard */
+#define FOLLOW_UP_WINDOW_MS  30000   /* hold-to-talk window after a reply */
 
 /* ============================================================
  * Task 14 serial provisioning (C3 hardware reality: the operator's SD
  * card reads RAW on Windows and their card-reader route is unreliable).
- * Entered from app_main() only on one of three triggers -- SD mount
- * failure, a missing/invalid /config.json, or the Power button held at
- * boot -- never on the "card mounts fine, config parses" happy path.
+ * Entered from the sync/UI sessions only on one of three triggers -- SD
+ * mount failure, a missing/invalid /config.json, or the Power button held
+ * at boot -- never on the "card mounts fine, config parses" happy path.
  * ============================================================ */
 
 #define PROVISION_TIMEOUT_MS 60000
@@ -101,11 +172,6 @@ static void provisioning_fatal(const char *msg) {
  * back a byte it peeked and didn't want, and the very next console_getc()
  * call drains it before touching the driver again. -1 = empty. */
 static int s_pushed_back = -1;
-
-/* ms_to_ticks_min1() (pdMS_TO_TICKS() with a one-tick floor, so a "wait a
- * few ms" request can't truncate to "don't wait at all" at
- * CONFIG_FREERTOS_HZ=100) now lives in board/tick_ms.h -- the device side
- * has several consumers of it and one definition beats four copies. */
 
 /* Reads one byte straight from the usb_serial_jtag driver (already
  * installed by console_init_usb_serial_jtag()), bypassing stdio and the
@@ -325,229 +391,563 @@ static int power_button_held_at_boot(wake_cause_t wc) {
     return 0;   /* released before the debounce window elapsed */
 }
 
-/* ============================================================
- * Checkpoint C4 (Task 15): ES8311 record to SD, play back from SD.
- * Runs after the C3 checks and the screen draw (those stay put as the
- * regression proof) and before the development stay-awake tail.
- * ============================================================ */
+/* Task 14's provisioning driver, verbatim behavior: the YES escape is
+ * offered only when Power-held is the *sole* trigger (card mounts, config
+ * parses); otherwise the format/paste flow is mandatory. May never return
+ * (provisioning_fatal). On return the card is mounted and any requested
+ * provisioning finished. */
+static void maybe_provision(int mounted, int config_ok, int pwr_held) {
+    ESP_LOGW(TAG, "entering serial provisioning (mounted=%d config_ok=%d pwr_held=%d)",
+             mounted, config_ok, pwr_held);
+    printf("\n=== HTP serial provisioning ===\n");
 
-/* One recording, two consumers: C4 records it and plays it back, C5 uploads
- * it to the bridge. The storage port takes logical paths ("/rec/...") and
- * the audio driver takes real VFS paths, so both spellings are derived from
- * one constant instead of being written out twice. */
-#define C4_WAV_LOGICAL    "/rec/c4-test.wav"          /* board_sd_mount() creates /rec */
-#define C4_WAV_PATH       "/sdcard" C4_WAV_LOGICAL
-#define C4_ARM_TIMEOUT_MS 60000    /* wait this long for the operator's first REC press.
-                                      Bounded on purpose: a plain boot with nobody
-                                      watching must still reach the stay-awake tail with
-                                      the serial port alive. Untuned. */
-#define C4_ARM_POLL_MS    20
-#define C4_ARM_DEBOUNCE_MS 25    /* confirm the press is still held this long after the
-                                    edge before arming the recording; a mechanical bounce
-                                    that reads pressed then releases within this window
-                                    goes back to waiting instead of starting a recording
-                                    that instantly reads "released" and stops at 0 bytes. */
-#define C4_MAX_RECORD_MS  120000   /* hard cap on one recording (task brief) */
+    int proceed = 1;
+    if (mounted && config_ok && pwr_held) {
+        printf("\nRe-provision requested. Type YES to continue, anything else boots normally:\n");
+        fflush(stdout);
+        char line[8];
+        int n = read_line(line, sizeof line, PROVISION_TIMEOUT_MS);
+        proceed = (n >= 0 && strcmp(line, "YES") == 0);
+        if (!proceed) { printf("Booting normally.\n\n"); fflush(stdout); }
+    }
+    if (!proceed) return;
 
-/* keep_going/stop_now adapter. board_btn_rec() takes no ctx, and calling it
- * through an (int (*)(void *)) cast is undefined behaviour (and trips
- * -Wcast-function-type), so wrap it rather than cast it. Pressed == 1 ==
- * "keep recording", which is exactly the semantics audio_record_to() wants. */
-static int c4_rec_held(void *ctx) { (void)ctx; return board_btn_rec(); }
+    if (!mounted)
+        provision_format();   /* fatal on decline/timeout/failure; SD is mounted on return */
 
-/* Call right after board_btn_rec() read pressed: waits out the bounce
- * window and re-samples. 1 = the button is genuinely held. */
-static int c4_rec_confirmed(void) {
-    board_delay_ms(C4_ARM_DEBOUNCE_MS);
-    return board_btn_rec();
+    /* Loops back to the top (re-prompting config.json, discarding any
+     * previous paste) only when a write failure got recovered by
+     * reformatting mid-flow -- see provision_paste_and_write()'s *restart
+     * out-param and handle_write_failure(). Every other exit from either
+     * call below is either success (falls through) or fatal
+     * (provisioning_fatal() inside, never returns). */
+    for (;;) {
+        int restart = 0;
+
+        if (provision_paste_and_write(&s_st, "/config.json",
+                "Paste config.json, end with a line containing only EOF:",
+                s_json, sizeof s_json, is_valid_config_json, &restart) != 0) {
+            if (restart) continue;
+            provisioning_fatal("config.json provisioning failed after 3 attempts");
+        }
+
+        if (provision_paste_and_write(&s_st, "/wifi.json",
+                "Paste wifi.json, end with a line containing only EOF:",
+                s_json, sizeof s_json, is_valid_wifi_json, &restart) != 0) {
+            if (restart) continue;
+            provisioning_fatal("wifi.json provisioning failed after 3 attempts");
+        }
+
+        break;
+    }
+
+    printf("\nProvisioning complete.\n\n");
+    fflush(stdout);
 }
 
-/* Bounded wait for the record button. Returns 1 if pressed, 0 on timeout.
- * Wall-clock (esp_timer), never iteration-counted.
- *
- * A raw first-edge return is not enough: audio_record_to() samples
- * keep_going() immediately, so a mechanical bounce that reads pressed for
- * one poll and releases before the recording task gets going would produce
- * a 0-byte/44-byte WAV that looks like a hardware failure rather than a
- * switch bounce. On every pressed edge, re-check after C4_ARM_DEBOUNCE_MS;
- * if it is still held, that is a real press. If it bounced back to
- * released, fall through and keep polling within the same arm window. */
-static int c4_wait_for_rec(unsigned timeout_ms) {
-    int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
-    while ((esp_timer_get_time() / 1000) < deadline_ms) {
-        if (board_btn_rec()) {
-            if (c4_rec_confirmed()) return 1;   /* still held: real press */
-            continue;                           /* bounce: keep waiting */
-        }
-        board_delay_ms(C4_ARM_POLL_MS);
+/* ============================================================
+ * Screens. One shared framebuffer, one refresh-discipline gate: the
+ * first draw after epd_init() is always a FULL refresh (it also seeds
+ * the controller's previous-image RAM, without which a partial diffs
+ * against garbage), everything after that is partial unless the caller
+ * asks otherwise.
+ * ============================================================ */
+
+static int screen_ready(void) {
+    if (!s_epd_up) {
+        if (epd_init() != 0) return -1;
+        s_epd_up = 1;
+        s_base_drawn = 0;
     }
     return 0;
 }
 
-/* Never fatal: every failure path logs, tears the audio stack back down
- * (rail off) and returns, so the caller still reaches the stay-awake tail.
- *
- * One-shot by design. C5 uploads this same recording, so once the file
- * exists there is nothing left to prove here -- and leaving the section
- * armed would make every subsequent boot sit through C4_ARM_TIMEOUT_MS of
- * dead time before the network test starts. Two ways to re-arm:
- *   - delete /rec/c4-test.wav from the card, or
- *   - hold REC down through boot (no card reader needed): the existing file
- *     is recorded over. The gate is sampled here, several seconds into the
- *     boot, so the button has to be *held*, not merely pressed at power-on.
- */
-static void c4_audio_check(port_storage_t *st) {
-    if (st->exists(st->ctx, C4_WAV_LOGICAL)) {
-        if (!(board_btn_rec() && c4_rec_confirmed())) {
-            ESP_LOGI(TAG, "C4 skipped: %s already exists "
-                          "(delete it, or hold REC through boot, to re-record)", C4_WAV_LOGICAL);
-            return;
+static void present(int want_full) {
+    if (!s_base_drawn || want_full) {
+        epd_full(s_fb.px);
+        s_base_drawn = 1;
+    } else {
+        epd_partial(s_fb.px);
+    }
+}
+
+static void status_line_fill(ui_status_t *stt) {
+    memset(stt, 0, sizeof *stt);
+    stt->battery_pct = board_battery_pct();
+    stt->wifi_ok = s_wifi_ok;
+    /* pending_uploads and the clock stay blank until Task 18's UI pass */
+}
+
+/* Word-wraps msg into the shared framebuffer at `cols` chars/line. */
+static void draw_wrapped(const char *msg, int x, int y0, int dy, int scale,
+                         int cols, int max_lines) {
+    char line[32];
+    if (cols > (int)sizeof line - 1) cols = (int)sizeof line - 1;
+    int y = y0, lines = 0;
+    const char *p = msg;
+    while (*p && lines < max_lines) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        int take = (int)strlen(p);
+        if (take > cols) {
+            int k = cols;
+            while (k > 0 && p[k] != ' ') k--;   /* break at the last space that fits */
+            take = (k > 0) ? k : cols;          /* overlong word: hard split */
         }
-        ESP_LOGI(TAG, "C4 re-armed: REC held at boot, recording over %s", C4_WAV_LOGICAL);
+        memcpy(line, p, (size_t)take);
+        line[take] = 0;
+        fb_text(&s_fb, x, y, line, scale, 1);
+        p += take;
+        y += dy;
+        lines++;
     }
+}
 
-    ESP_LOGI(TAG, "C4 audio test");
-    if (audio_init() != 0) {
-        ESP_LOGE(TAG, "audio_init failed; skipping C4");
-        return;
-    }
-    ESP_LOGI(TAG, "C4: hold REC and speak; release to stop (waiting up to %u s for the press)",
-             (unsigned)(C4_ARM_TIMEOUT_MS / 1000));
-    if (!c4_wait_for_rec(C4_ARM_TIMEOUT_MS)) {
-        ESP_LOGW(TAG, "C4 skipped: no REC press within %u s -- reboot to run it again",
-                 (unsigned)(C4_ARM_TIMEOUT_MS / 1000));
-        audio_deinit();
-        return;
-    }
+/* Status line + big scale-2 message (12 cols/line), partial refresh. */
+static void screen_status(const char *msg) {
+    ESP_LOGI(TAG, "status: %s", msg);
+    if (screen_ready() != 0) return;
+    ui_status_t stt;
+    status_line_fill(&stt);
+    fb_clear(&s_fb);
+    widget_status_line(&s_fb, &stt);
+    draw_wrapped(msg, 4, 48, 20, 2, 12, 6);
+    present(0);
+}
 
-    ESP_LOGI(TAG, "recording to %s (release REC to stop, %u s cap)",
-             C4_WAV_PATH, (unsigned)(C4_MAX_RECORD_MS / 1000));
-    long n = audio_record_to(C4_WAV_PATH, c4_rec_held, NULL, C4_MAX_RECORD_MS);
-    if (n < 0) {
-        ESP_LOGE(TAG, "recording failed");
-        audio_deinit();
-        return;
-    }
-    /* 16 kHz x 16-bit x mono = 32000 bytes/s, so bytes/32 is milliseconds. */
-    ESP_LOGI(TAG, "recorded %ld bytes (~%ld ms of 16 kHz mono)", n, n / 32);
+/* capture_ctx_t.on_status adapter */
+static void screen_status_cb(void *ui_ctx, const char *line) {
+    (void)ui_ctx;
+    screen_status(line);
+}
 
-    board_delay_ms(500);
-    ESP_LOGI(TAG, "playback...");
-    if (audio_play_wav(C4_WAV_PATH, NULL, NULL) != 0) ESP_LOGE(TAG, "playback failed");
-    audio_beep();
-    audio_deinit();
-    ESP_LOGI(TAG, "C4 done");
+/* Big status word + the opening of the transcript below it. */
+static void screen_status_transcript(const char *status, const char *transcript) {
+    ESP_LOGI(TAG, "status: %s transcript=%.80s", status, transcript);
+    if (screen_ready() != 0) return;
+    ui_status_t stt;
+    status_line_fill(&stt);
+    fb_clear(&s_fb);
+    widget_status_line(&s_fb, &stt);
+    fb_text(&s_fb, 4, 22, status, 2, 1);
+    draw_wrapped(transcript[0] ? transcript : "(no transcript)", 2, 48, 12, 1, 24, 12);
+    present(0);
+}
+
+/* Terminal screen for a session that cannot continue: full refresh, then
+ * the panel is put to sleep immediately (the image persists without
+ * power) so the common teardown has nothing left to do. */
+static void screen_fatal(const char *msg) {
+    ESP_LOGE(TAG, "fatal: %s", msg);
+    if (screen_ready() != 0) return;
+    ui_status_t stt;
+    status_line_fill(&stt);
+    fb_clear(&s_fb);
+    widget_status_line(&s_fb, &stt);
+    draw_wrapped(msg, 4, 48, 20, 2, 12, 6);
+    present(1);
+    epd_sleep();
+    s_epd_up = 0;
+    s_base_drawn = 0;
 }
 
 /* ============================================================
- * Checkpoint C5 (Task 16): Wi-Fi join, real HTTP transport, battery ADC.
- * Runs the host-proven htp_client against a bridge over the real network,
- * between the C4 audio section and the development stay-awake tail.
+ * Config / boot bookkeeping
  * ============================================================ */
 
-#define C5_WIFI_TIMEOUT_MS 20000   /* generous: covers a scan (~3 s) plus DHCP on a
-                                      slow AP. Untuned; C6 gives it a real budget. */
-#define C5_CAPTURE_ID      "c-c5-0001"
-#define C5_REPLY_LOGICAL   "/reply.tmp.wav"
-#define C5_REPLY_PATH      "/sdcard" C5_REPLY_LOGICAL
-
-static const char *state_name(htp_capture_state_t s) {
-    static const char *names[] = { "received", "transcribing", "processing",
-                                   "done", "reply_ready", "failed", "unknown" };
-    int i = (int)s;   /* cast: the enum's underlying type may be unsigned */
-    return (i >= 0 && i <= (int)HTP_ST_UNKNOWN) ? names[i] : "?";
+static int load_config(void) {
+    size_t len;
+    if (s_st.read(s_st.ctx, "/config.json", s_json, sizeof s_json, &len) != 0 ||
+        app_config_parse(s_json, len, &s_cfg) != 0) {
+        s_have_cfg = 0;
+        ESP_LOGE(TAG, "config.json missing or invalid");
+        return -1;
+    }
+    s_have_cfg = 1;
+    ESP_LOGI(TAG, "bridge=%s token=%.4s...(%d) sync=%d",
+             s_cfg.bridge_url, s_cfg.token, (int)strlen(s_cfg.token), s_cfg.sync_interval_s);
+    return 0;
 }
 
-/* Never fatal, same discipline as c4_audio_check(): every leg logs its
- * result and the function returns so the operator still gets the stay-awake
- * tail (and a live serial port) even when the network is the thing that is
- * broken. The big response structs are static, not stack: htp_dashboard_t
- * alone is ~3.5 KB and this runs on the main task. */
-static void c5_network_check(port_storage_t *st, port_kv_t *kv, const app_config_t *cfg,
-                             const wifi_profiles_t *wp, int have_wifi) {
-    ESP_LOGI(TAG, "C5 network test");
-    if (!have_wifi) {
-        ESP_LOGE(TAG, "C5 skipped: no usable /wifi.json");
+static int load_wifi(void) {
+    size_t len;
+    if (s_st.read(s_st.ctx, "/wifi.json", s_json, sizeof s_json, &len) != 0 ||
+        wifi_profiles_parse(s_json, len, &s_wp) != 0) {
+        s_have_wifi = 0;
+        ESP_LOGE(TAG, "wifi.json missing or invalid");
+        return -1;
+    }
+    s_have_wifi = 1;
+    ESP_LOGI(TAG, "wifi profiles: %d (first: %s)", s_wp.count, s_wp.nets[0].ssid);
+    return 0;
+}
+
+/* Monotone boot counter in NVS; feeds htp_make_capture_id's clockless
+ * fallback ("c-b<bootcount>-<mono_ms>-xxxx"). */
+static uint32_t boot_count_bump(void) {
+    char v[16];
+    unsigned long n = 0;
+    if (s_kv.get(s_kv.ctx, "bootcnt", v, sizeof v) == 0) n = strtoul(v, NULL, 10);
+    n++;
+    snprintf(v, sizeof v, "%lu", n);
+    s_kv.set(s_kv.ctx, "bootcnt", v);
+    return (uint32_t)n;
+}
+
+/* kv "sync_s" (written by sync_cycle from the dashboard), else the card
+ * config, else the design default of 600 s. Clamped so a bad value can
+ * never arm a zero/absurd timer. */
+static unsigned next_sync_interval(void) {
+    char v[16];
+    if (s_kv.get(s_kv.ctx, "sync_s", v, sizeof v) == 0) {
+        int s = atoi(v);
+        if (s >= 60 && s <= 86400) return (unsigned)s;
+    }
+    if (s_have_cfg && s_cfg.sync_interval_s >= 60 && s_cfg.sync_interval_s <= 86400)
+        return (unsigned)s_cfg.sync_interval_s;
+    return 600;
+}
+
+/* ============================================================
+ * Capture background helper: the Wi-Fi join kickoff and the recording
+ * glyph both cost real time (esp_wifi bring-up ~100 ms; the glyph's
+ * e-paper refresh 300 ms-2 s), so they run on a short-lived task while
+ * the main task gets audio_record_to() streaming as early as possible.
+ * The main task joins (semaphore) right after the recording stops and
+ * only then touches the framebuffer or idf_wifi again, so both stay
+ * effectively single-threaded.
+ * ============================================================ */
+
+#define CAP_BG_STACK 6144
+#define CAP_BG_JOIN_TIMEOUT_MS 15000   /* first full refresh ~2 s; wide margin */
+
+static SemaphoreHandle_t s_bg_sem;
+static volatile int s_bg_wifi_started;
+
+static int rec_held(void *ctx) { (void)ctx; return board_btn_rec(); }
+
+static void draw_rec_glyph(void) {
+    if (screen_ready() != 0) return;
+    fb_clear(&s_fb);
+    fb_fill(&s_fb, 92, 72, 16, 16, 1);      /* small centered dot */
+    fb_text(&s_fb, 76, 104, "REC", 2, 1);
+    present(0);
+}
+
+static void capture_bg_work(int start_wifi) {
+    if (start_wifi && s_have_wifi &&
+        idf_wifi_start_connect_async(&s_wp, &s_kv) == 0)
+        s_bg_wifi_started = 1;
+    draw_rec_glyph();
+}
+
+static void capture_bg_task(void *arg) {
+    capture_bg_work((int)(intptr_t)arg);
+    xSemaphoreGive(s_bg_sem);
+    vTaskDelete(NULL);
+}
+
+static void capture_bg_start(int start_wifi) {
+    if (start_wifi) s_bg_wifi_started = 0;
+    if (!s_bg_sem) s_bg_sem = xSemaphoreCreateBinary();
+    if (s_bg_sem &&
+        xTaskCreate(capture_bg_task, "cap_bg", CAP_BG_STACK,
+                    (void *)(intptr_t)start_wifi, 1, NULL) == pdPASS)
         return;
+    /* No task available: do the work inline (the brief's original order). */
+    ESP_LOGW(TAG, "capture background task unavailable; running inline");
+    capture_bg_work(start_wifi);
+    if (s_bg_sem) xSemaphoreGive(s_bg_sem);
+}
+
+static void capture_bg_join(void) {
+    if (s_bg_sem) xSemaphoreTake(s_bg_sem, ms_to_ticks_min1(CAP_BG_JOIN_TIMEOUT_MS));
+}
+
+/* Records one capture: id, WAV to SD, sidecar + rec index (the durable
+ * step), with the glyph (and optionally the Wi-Fi kickoff) overlapped.
+ * Returns 0 = captured (sc filled, durable on card), 1 = too short
+ * (discarded), -1 = recording/SD failure (WAV removed). */
+static int record_capture(sidecar_t *sc, const char *conversation_id,
+                          int start_wifi, long *bytes_out) {
+    uint8_t r2[2];
+    s_rng.fill(s_rng.ctx, r2, 2);
+    long long now = s_ck.epoch_s(s_ck.ctx);   /* system clock, else PCF85063, else 0 */
+    char id[64];
+    htp_make_capture_id(id, now, boot_count_bump(), s_ck.mono_ms(s_ck.ctx), r2);
+
+    char wavl[96];
+    sidecar_wav_path(wavl, id);
+    char wavfs[IDF_SD_PATH_MAX];
+    if (idf_ports_sd_path(wavl, wavfs, sizeof wavfs) != 0) return -1;
+
+    capture_bg_start(start_wifi);
+    /* C6 timing line: this is the moment recording begins; the wake-to-
+     * record budget (design §5.2 250 ms target, checkpoint line 400 ms)
+     * is measured against it. */
+    ESP_LOGI(TAG, "record start at %lld ms since boot, id=%s",
+             (long long)(esp_timer_get_time() / 1000), id);
+    long bytes = audio_record_to(wavfs, rec_held, NULL, MAX_RECORD_MS);
+    capture_bg_join();
+
+    if (bytes_out) *bytes_out = bytes;
+    if (bytes < 0) {
+        s_st.remove(s_st.ctx, wavl);
+        return -1;
+    }
+    if (bytes < MIN_WAV_BYTES) {
+        ESP_LOGW(TAG, "recording too short (%ld bytes), discarded", bytes);
+        s_st.remove(s_st.ctx, wavl);
+        return 1;
     }
 
-    int wr = idf_wifi_connect(wp, kv, C5_WIFI_TIMEOUT_MS);
-    ESP_LOGI(TAG, "wifi join r=%d", wr);
-    if (wr != 0) {
-        ESP_LOGE(TAG, "C5 skipped: no network");
-        return;
+    sidecar_init(sc, id);
+    sc->recorded_at = now;
+    if (conversation_id && conversation_id[0])
+        str_copy(sc->conversation_id, sizeof sc->conversation_id, conversation_id);
+    sidecar_save(&s_st, sc);
+    rec_index_append(&s_st, id);
+    return 0;
+}
+
+/* ============================================================
+ * Sync (design §5.4: after every session). Rendering reuses the
+ * host-tested ui_flow dashboard renderer, which draws the list first and
+ * the banner strip last -- the banner covering the list's bottom rows
+ * (including Task 9's cursor-invert overdraw) is load-bearing.
+ * ============================================================ */
+
+static int render_dashboard_cb(void *ui_ctx, const htp_dashboard_t *d) {
+    (void)ui_ctx;
+    if (screen_ready() != 0) return -1;
+    s_uif.dash = *d;
+    status_line_fill(&s_uif.status);
+    ui_flow_render(&s_uif, &s_fb);
+    present(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
+    return 0;
+}
+
+static int render_notifications_cb(void *ui_ctx, const htp_notifications_t *n) {
+    (void)ui_ctx;
+    if (screen_ready() != 0) return -1;
+    s_uif.banner[0] = 0;
+    if (n->count > 0) {
+        int pick = 0;
+        for (int i = 0; i < n->count; i++)
+            if (n->items[i].urgent) { pick = i; break; }
+        str_copy(s_uif.banner, sizeof s_uif.banner, n->items[pick].text);
+    }
+    status_line_fill(&s_uif.status);
+    ui_flow_render(&s_uif, &s_fb);
+    present(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
+    return 0;
+}
+
+/* Urgent-notification chime: audio may not be up in a sync-only session,
+ * so bring it up lazily (idempotent); the rail is torn down in the common
+ * teardown either way. */
+static void chime_cb(void *ui_ctx) {
+    (void)ui_ctx;
+    if (audio_init() == 0) audio_beep();
+}
+
+static void set_rtc_cb(void *rtc_ctx, long long epoch) {
+    (void)rtc_ctx;
+    board_rtc_set(epoch);
+}
+
+static void run_sync(void) {
+    static int uif_inited;
+    if (!uif_inited) {
+        ui_flow_init(&s_uif, &s_cl, &s_st, &s_kv);
+        uif_inited = 1;
     }
 
-    static htp_transport_t tr;
-    static htp_client_t cl;
-    idf_transport_init(&tr, cfg->bridge_url);
-    htp_client_init(&cl, &tr, cfg->token);
-    cl.battery_pct = board_battery_pct();
-    ESP_LOGI(TAG, "battery=%d%% (X-Battery header)", cl.battery_pct);
+    static capture_ctx_t ccx;
+    memset(&ccx, 0, sizeof ccx);
+    ccx.client = &s_cl;
+    ccx.storage = &s_st;
+    ccx.clock = &s_ck;
+    ccx.poll_interval_ms = 1000;
+    ccx.poll_window_ms = 60000;
+    ccx.reply_path = REPLY_LOGICAL;
 
-    static htp_dashboard_t d;
-    memset(&d, 0, sizeof d);
-    int r = htp_get_dashboard(&cl, "", &d);
-    ESP_LOGI(TAG, "dashboard r=%d rev=%s items=%d sync=%d", r, d.rev, d.item_count, d.sync_interval);
+    static sync_ctx_t scx;
+    memset(&scx, 0, sizeof scx);
+    scx.client = &s_cl;
+    scx.storage = &s_st;
+    scx.kv = &s_kv;
+    scx.clock = &s_ck;
+    scx.capture = &ccx;
+    scx.render_dashboard = render_dashboard_cb;
+    scx.render_notifications = render_notifications_cb;
+    scx.chime = chime_cb;
+    scx.set_rtc = set_rtc_cb;
 
-    /* Upload the C4 recording if it is there -- the capture ID is fixed, so
-     * re-running C5 is an idempotent re-upload of the same capture. */
-    if (!st->exists(st->ctx, C4_WAV_LOGICAL)) {
-        ESP_LOGW(TAG, "no %s on the card; skipping the upload/poll/reply legs", C4_WAV_LOGICAL);
-    } else {
-        htp_upload_params_t p = { .capture_id = C5_CAPTURE_ID, .wav_path = C4_WAV_LOGICAL,
-                                  .recorded_at = 0 };
-        ESP_LOGI(TAG, "upload r=%d", htp_upload_capture(&cl, &p));
+    sync_report_t rep;
+    int r = sync_cycle(&scx, &rep);
+    ESP_LOGI(TAG, "sync r=%d uploads=%d notifs=%d acked=%d dash_changed=%d next=%ds",
+             r, rep.uploads_retried, rep.notifs_fetched, rep.notifs_acked,
+             rep.dashboard_changed, rep.sync_interval_s);
+}
 
-        const char *ids[1] = { C5_CAPTURE_ID };
-        static htp_capture_status_t stt[1];
-        memset(stt, 0, sizeof stt);
-        long long t = 0;
-        int n = htp_poll_captures(&cl, ids, 1, stt, 1, &t);
-        if (n > 0)
-            ESP_LOGI(TAG, "poll n=%d state=%d (%s) transcript=%s",
-                     n, stt[0].state, state_name(stt[0].state), stt[0].transcript);
-        else
-            ESP_LOGE(TAG, "poll n=%d (no capture rows)", n);   /* n < 0 is an HTP_ERR_* code */
+/* ============================================================
+ * Capture session (design §5.2)
+ * ============================================================ */
 
-        int dr = htp_download_reply(&cl, C5_CAPTURE_ID, C5_REPLY_LOGICAL);
-        ESP_LOGI(TAG, "reply dl r=%d", dr);
-        if (dr == HTP_OK) {
-            if (audio_init() != 0) {
-                ESP_LOGE(TAG, "audio_init failed; not playing the reply");
-            } else {
-                ESP_LOGI(TAG, "playing %s", C5_REPLY_PATH);
-                if (audio_play_wav(C5_REPLY_PATH, NULL, NULL) != 0)
-                    ESP_LOGE(TAG, "reply playback failed");
-                audio_deinit();
-            }
+static void show_outcome(capture_outcome_t out) {
+    switch (out) {
+    case CAPTURE_DONE:        screen_status_transcript("Noted", s_sc.transcript); break;
+    case CAPTURE_FAILED:      screen_status("Failed - saved on card"); break;
+    case CAPTURE_OFFLINE:     screen_status("Saved, will upload later"); break;
+    case CAPTURE_TIMEOUT:     screen_status("Still working - check later"); break;
+    case CAPTURE_AUTH_ERROR:  screen_status("Auth error - check token"); break;
+    case CAPTURE_REPLY_READY: break;   /* handled by play_reply_and_follow_up */
+    }
+}
+
+/* Plays the downloaded reply (REC press stops it), deletes the temp file,
+ * then holds a 30 s hold-to-talk window; GEST_REC_HOLD_START records a
+ * follow-up into the same conversation (sc.conversation_id carried into
+ * the new sidecar before capture_run) and loops while replies keep
+ * coming. */
+static void play_reply_and_follow_up(capture_ctx_t *cx) {
+    for (;;) {
+        ESP_LOGI(TAG, "playing reply %s", REPLY_FS);
+        if (audio_play_wav(REPLY_FS, rec_held, NULL) != 0)
+            ESP_LOGE(TAG, "reply playback failed");
+        s_st.remove(s_st.ctx, REPLY_LOGICAL);
+
+        gesture_fsm_t g;
+        gesture_init(&g);
+        unsigned t0 = s_ck.mono_ms(s_ck.ctx);
+        int follow = 0;
+        while (s_ck.mono_ms(s_ck.ctx) - t0 < FOLLOW_UP_WINDOW_MS) {
+            gesture_t ev = gesture_feed(&g, board_btn_rec(), board_btn_pwr(),
+                                        s_ck.mono_ms(s_ck.ctx));
+            if (ev == GEST_REC_HOLD_START) { follow = 1; break; }
+            board_delay_ms(20);
         }
-    }
+        if (!follow) {
+            ESP_LOGI(TAG, "follow-up window closed");
+            break;
+        }
 
-    ESP_LOGI(TAG, "battery=%d%%", board_battery_pct());
-    idf_wifi_stop();   /* radio off before the stay-awake tail */
-    ESP_LOGI(TAG, "C5 done");
+        long bytes = 0;
+        int rr = record_capture(&s_sc_next, s_sc.conversation_id, 0, &bytes);
+        if (rr != 0) {
+            screen_status(rr > 0 ? "Too short" : "SD full");
+            break;
+        }
+        ESP_LOGI(TAG, "follow-up recorded %ld bytes (~%ld ms)", bytes, bytes / 32);
+        s_sc = s_sc_next;   /* the follow-up is now the current capture */
+
+        capture_outcome_t out = capture_run(cx, &s_sc);
+        if (out == CAPTURE_REPLY_READY) continue;
+        show_outcome(out);
+        break;
+    }
 }
+
+static void capture_session(void) {
+    /* Rail first: its settle overlaps the SD mount (audio_init() only
+     * sleeps whatever part of the settle window hasn't already passed). */
+    board_rail_audio(1);
+
+    /* 1. capture-critical init only: SD, config, audio. */
+    if (board_sd_mount() != 0) { screen_fatal("SD card error"); return; }
+    if (load_config() != 0)    { screen_fatal("Config error"); return; }
+    if (audio_init() != 0)     { screen_fatal("Audio error"); return; }
+    load_wifi();   /* soft-fail: capture works offline, upload waits for a sync */
+
+    /* 2. record, with the Wi-Fi kickoff + glyph overlapped. */
+    long bytes = 0;
+    int rr = record_capture(&s_sc, NULL, 1, &bytes);
+    if (rr < 0) { screen_fatal("SD full"); return; }
+    if (rr > 0) { screen_status("Too short"); return; }
+    ESP_LOGI(TAG, "recorded %ld bytes (~%ld ms of 16 kHz mono)", bytes, bytes / 32);
+
+    /* 3. network path. The recording is already durable on the card, so
+     * every failure from here lands on "Saved, will upload later" and the
+     * next sync retries it -- no retry loops in the session itself. */
+    if (!s_bg_wifi_started || idf_wifi_wait_connected(CAPTURE_WIFI_WAIT_MS) != 0) {
+        screen_status("Saved, will upload later");
+        return;
+    }
+    s_wifi_ok = 1;
+    idf_transport_init(&s_tr, s_cfg.bridge_url);
+    htp_client_init(&s_cl, &s_tr, s_cfg.token);
+    s_cl.battery_pct = board_battery_pct();
+    ESP_LOGI(TAG, "battery=%d%% (X-Battery header)", s_cl.battery_pct);
+
+    capture_ctx_t cx = {
+        .client = &s_cl, .storage = &s_st, .clock = &s_ck,
+        .on_status = screen_status_cb, .ui_ctx = NULL,
+        .poll_interval_ms = 1000, .poll_window_ms = 60000,
+        .reply_path = REPLY_LOGICAL,
+    };
+    capture_outcome_t out = capture_run(&cx, &s_sc);
+    if (out == CAPTURE_REPLY_READY)
+        play_reply_and_follow_up(&cx);
+    else
+        show_outcome(out);
+
+    run_sync();   /* design §5.4: sync after every session */
+}
+
+/* ============================================================
+ * Sync / UI sessions (UI becomes real in Task 18)
+ * ============================================================ */
+
+static void session_sync_common(wake_cause_t wc) {
+    int mounted = (board_sd_mount() == 0);
+    int pwr_held = power_button_held_at_boot(wc);
+    int config_ok = mounted && load_config() == 0;
+
+    if (!mounted || !config_ok || pwr_held) {
+        maybe_provision(mounted, config_ok, pwr_held);   /* may never return */
+        if (load_config() != 0) { screen_fatal("Config error"); return; }
+    }
+    if (load_wifi() != 0) { screen_fatal("WiFi config error"); return; }
+
+    if (idf_wifi_connect(&s_wp, &s_kv, SYNC_WIFI_TIMEOUT_MS) != 0) {
+        screen_status("No network");
+        return;   /* the timer wake retries on its own */
+    }
+    s_wifi_ok = 1;
+    idf_transport_init(&s_tr, s_cfg.bridge_url);
+    htp_client_init(&s_cl, &s_tr, s_cfg.token);
+    s_cl.battery_pct = board_battery_pct();
+    ESP_LOGI(TAG, "battery=%d%% (X-Battery header)", s_cl.battery_pct);
+    run_sync();
+}
+
+static void sync_session_stub(wake_cause_t wc) { session_sync_common(wc); }
+static void ui_session_stub(wake_cause_t wc)   { session_sync_common(wc); }
+
+/* ============================================================
+ * Development stay-awake tail (see HTP_DEV_LINGER above).
+ * ============================================================ */
+
+#if HTP_DEV_LINGER
 
 #define DEV_HEARTBEAT_MS    30000               /* heartbeat cadence while staying awake */
-#define DEV_IDLE_TIMEOUT_MS (30u * 60u * 1000u) /* ~30 min without input -> deep sleep;
-                                                   untuned, dev-iteration convenience */
-#define DEV_PWR_HOLD_MS     2000                /* PWR held this long -> deep sleep;
-                                                   untuned, chosen > boot-transient bounce */
+#define DEV_IDLE_TIMEOUT_MS (10u * 60u * 1000u) /* ~10 min without input -> deep sleep */
+#define DEV_PWR_HOLD_MS     2000                /* PWR held this long -> deep sleep */
 
-/* End-of-harness behavior: stay awake with USB-Serial-JTAG alive so the
- * operator can keep iterating (flash, read logs, poke serial), instead of
- * dropping into deep sleep immediately and killing the port. Deep sleep
- * happens only on:
+/* End-of-session behavior for development builds: stay awake with
+ * USB-Serial-JTAG alive so the operator can keep iterating (flash, read
+ * logs, poke serial), instead of dropping into deep sleep immediately and
+ * killing the port. Deep sleep happens only on:
  *   - "sleep" + Enter on the serial console,
  *   - the Power button held ~2 s (then released -- we wait for the release
  *     so board_deep_sleep()'s EXT1 any-low wake doesn't fire the instant
  *     we go down and bounce straight back into a boot),
  *   - DEV_IDLE_TIMEOUT_MS with no serial byte and no button press.
  * All timing is wall-clock (esp_timer), never iteration-counted. Never
- * returns. Wake-cause labeling on the next boot is unchanged: sleep still
- * goes through board_deep_sleep(0), same as before. */
-static void dev_stay_awake_then_sleep(void) {
+ * returns. The eventual deep sleep arms the same sync-interval timer the
+ * release build would, so timer wakes stay exercisable. */
+static void dev_stay_awake_then_sleep(unsigned sleep_s) {
     ESP_LOGI(TAG, "staying awake for development; type 'sleep' + Enter or hold PWR ~2s to deep-sleep now");
     ESP_LOGI(TAG, "auto deep-sleep after %u min idle", (unsigned)(DEV_IDLE_TIMEOUT_MS / 60000u));
 
@@ -606,145 +1006,47 @@ static void dev_stay_awake_then_sleep(void) {
         }
     }
 
-    ESP_LOGI(TAG, "entering deep sleep (wake: REC or PWR button)");
-    board_deep_sleep(0);
+    ESP_LOGI(TAG, "entering deep sleep for %u s (wake: REC/PWR button or timer)", sleep_s);
+    board_deep_sleep(sleep_s);
 }
 
+#endif /* HTP_DEV_LINGER */
+
+/* ============================================================
+ * Entry
+ * ============================================================ */
+
 void app_main(void) {
+    int64_t t_entry_ms = esp_timer_get_time() / 1000;
     board_early_init();
     console_init_usb_serial_jtag();
+    idf_ports_init(&s_st, &s_kv, &s_ck, &s_rng);   /* pointer wiring only, no hardware */
 
     wake_cause_t wc = board_wake_cause();
-    const char *cause[] = { "cold", "rec-button", "pwr-button", "timer" };
-    ESP_LOGI(TAG, "HTP terminal bring-up C1, wake=%s", cause[wc]);
+    static const char *cause[] = { "cold", "rec-button", "pwr-button", "timer" };
+    ESP_LOGI(TAG, "HTP terminal, wake=%s (app_main entry at %lld ms since boot)",
+             cause[wc], (long long)t_entry_ms);
 
-    ESP_LOGI(TAG, "C3 SD/NVS/config test");
+    if (wc == WAKE_REC_BUTTON)      capture_session();   /* fast path first */
+    else if (wc == WAKE_PWR_BUTTON) ui_session_stub(wc);
+    else                            sync_session_stub(wc);   /* timer + cold */
 
-    port_storage_t st; port_kv_t kv; port_clock_t ck; port_rng_t rng;
-    idf_ports_init(&st, &kv, &ck, &rng);
-
-    int mounted = (board_sd_mount() == 0);
-    int pwr_held = power_button_held_at_boot(wc);
-
-    char buf[2048]; size_t len;
-    app_config_t cfg;
-    int config_ok = mounted &&
-                     st.read(st.ctx, "/config.json", buf, sizeof buf, &len) == 0 &&
-                     app_config_parse(buf, len, &cfg) == 0;
-
-    if (!mounted || !config_ok || pwr_held) {
-        ESP_LOGW(TAG, "entering serial provisioning (mounted=%d config_ok=%d pwr_held=%d)",
-                 mounted, config_ok, pwr_held);
-        printf("\n=== HTP serial provisioning ===\n");
-
-        /* Escape hatch: only offered when Power-held is the *sole* reason
-         * we're here (card mounts, config already parses) -- if the card
-         * genuinely needs fixing, "boot normally" isn't a safe option
-         * regardless of what's typed here, so we skip straight past this
-         * prompt into the mandatory format/paste flow below. */
-        int proceed = 1;
-        if (mounted && config_ok && pwr_held) {
-            printf("\nRe-provision requested. Type YES to continue, anything else boots normally:\n");
-            fflush(stdout);
-            char line[8];
-            int n = read_line(line, sizeof line, PROVISION_TIMEOUT_MS);
-            proceed = (n >= 0 && strcmp(line, "YES") == 0);
-            if (!proceed) { printf("Booting normally.\n\n"); fflush(stdout); }
-        }
-
-        if (proceed) {
-            if (!mounted) {
-                provision_format();   /* fatal on decline/timeout/failure; SD is mounted on return */
-                mounted = 1;
-            }
-
-            /* Loops back to the top (re-prompting config.json, discarding
-             * any previous paste) only when a write failure got recovered
-             * by reformatting mid-flow -- see provision_paste_and_write()'s
-             * *restart out-param and handle_write_failure(). Every other
-             * exit from either call below is either success (falls through)
-             * or fatal (provisioning_fatal() inside, never returns). */
-            for (;;) {
-                int restart = 0;
-
-                if (provision_paste_and_write(&st, "/config.json",
-                        "Paste config.json, end with a line containing only EOF:",
-                        buf, sizeof buf, is_valid_config_json, &restart) != 0) {
-                    if (restart) continue;
-                    provisioning_fatal("config.json provisioning failed after 3 attempts");
-                }
-
-                if (provision_paste_and_write(&st, "/wifi.json",
-                        "Paste wifi.json, end with a line containing only EOF:",
-                        buf, sizeof buf, is_valid_wifi_json, &restart) != 0) {
-                    if (restart) continue;
-                    provisioning_fatal("wifi.json provisioning failed after 3 attempts");
-                }
-
-                break;
-            }
-
-            printf("\nProvisioning complete.\n\n");
-            fflush(stdout);
-        }
-    }
-
-    /* ---- existing C3 checks (unchanged) ---- */
-    if (st.read(st.ctx, "/config.json", buf, sizeof buf, &len) != 0 ||
-        app_config_parse(buf, len, &cfg) != 0) {
-        ESP_LOGE(TAG, "config.json missing or invalid"); board_deep_sleep(0);
-    }
-    ESP_LOGI(TAG, "bridge=%s token=%.4s...(%d) sync=%d",
-             cfg.bridge_url, cfg.token, (int)strlen(cfg.token), cfg.sync_interval_s);
-
-    wifi_profiles_t wp;
-    int have_wifi = (st.read(st.ctx, "/wifi.json", buf, sizeof buf, &len) == 0 &&
-                      wifi_profiles_parse(buf, len, &wp) == 0);
-    if (have_wifi)
-        ESP_LOGI(TAG, "wifi profiles: %d (first: %s)", wp.count, wp.nets[0].ssid);
-    else
-        ESP_LOGE(TAG, "wifi.json missing or invalid");
-
-    long long free_bytes = st.free_bytes(st.ctx);
-    ESP_LOGI(TAG, "sd free: %lld bytes", free_bytes);
-
-    int rec_files = 0;
-    ESP_LOGI(TAG, "/rec contents:");
-    st.list(st.ctx, "/rec", log_rec_entry, &rec_files);
-    ESP_LOGI(TAG, "/rec entries: %d", rec_files);
-
-    kv.set(kv.ctx, "c3", "ok");
-    char v[8];
-    int kv_ok = (kv.get(kv.ctx, "c3", v, sizeof v) == 0) && !strcmp(v, "ok");
-    ESP_LOGI(TAG, "nvs roundtrip: %s", kv_ok ? v : "FAIL");
-
-    static ui_fb_t fb;
-    if (epd_init() != 0) {
-        /* Stay awake even on a display failure: the serial port (and its
-         * diagnostic log lines above) is exactly what the operator needs
-         * to keep while debugging the panel. */
-        ESP_LOGE(TAG, "epd_init failed");
-    } else {
-        fb_clear(&fb);
-        fb_text(&fb, 10, 15, "Config OK", 2, 1);
-        char line[40];
-        snprintf(line, sizeof line, "sync=%ds", cfg.sync_interval_s);
-        fb_text(&fb, 10, 55, line, 1, 1);
-        snprintf(line, sizeof line, "wifi nets=%d", have_wifi ? wp.count : 0);
-        fb_text(&fb, 10, 75, line, 1, 1);
-        snprintf(line, sizeof line, "sd free=%lldK", free_bytes / 1024);
-        fb_text(&fb, 10, 95, line, 1, 1);
-        fb_text(&fb, 10, 115, kv_ok ? "nvs=ok" : "nvs=FAIL", 1, 1);
-        fb_rect(&fb, 5, 5, 190, 190, 1);
-        epd_full(fb.px);
+    /* Common teardown: radio off, codec + rail off, panel asleep. All of
+     * these are safe no-ops when the session never brought them up. */
+    idf_wifi_stop();
+    audio_deinit();
+    if (s_epd_up) {
         epd_sleep();
+        s_epd_up = 0;
     }
+    ESP_LOGI(TAG, "session done; main task min free stack %u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
-    ESP_LOGI(TAG, "C3 done");
-
-    c4_audio_check(&st);           /* audio bring-up; always returns */
-
-    c5_network_check(&st, &kv, &cfg, &wp, have_wifi);   /* network bring-up; always returns */
-
-    dev_stay_awake_then_sleep();   /* never returns */
+    unsigned sleep_s = next_sync_interval();
+#if HTP_DEV_LINGER
+    dev_stay_awake_then_sleep(sleep_s);   /* never returns */
+#else
+    ESP_LOGI(TAG, "entering deep sleep for %u s (wake: REC/PWR button or timer)", sleep_s);
+    board_deep_sleep(sleep_s);
+#endif
 }
