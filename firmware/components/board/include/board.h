@@ -56,4 +56,13 @@ void audio_deinit(void); /* PA off, codec closed, rail off */
  * until Task 19 calibrates it against real hardware (design §11.3). */
 int board_battery_pct(void);
 
+/* PCF85063 RTC (Task 17) @ I2C 0x51 on the shared codec bus. (The plan
+ * called the part a PCF8563; the board's reference firmware drives a
+ * PCF85063 register map at the same address -- see rtc_pcf85063.c.)
+ * get: UTC epoch seconds, or 0 when the chip has no valid time (OS flag /
+ * never set). set: writes the chip and mirrors the same epoch into the
+ * system clock via settimeofday(); ignores obviously bogus epochs. */
+long long board_rtc_get(void);
+void      board_rtc_set(long long epoch);
+
 #endif

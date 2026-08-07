@@ -9,9 +9,10 @@
  *   succeeded. write() is tmp-file-then-rename; every app_core caller only
  *   ever sees logical paths, never "/sdcard" directly.
  * kv: backed by the NVS namespace "htp".
- * clock: epoch_s() reads time(), returning 0 (clockless) until Task 17
- *   wires the RTC via settimeofday(); mono_ms() is esp_timer, always live;
- *   sleep_ms() is vTaskDelay.
+ * clock: epoch_s() prefers the system clock and falls back to the external
+ *   PCF85063 (board_rtc_get()), caching a valid RTC reading back into the
+ *   system clock via settimeofday(); returns 0 while neither has a valid
+ *   time. mono_ms() is esp_timer, always live; sleep_ms() is vTaskDelay.
  * rng: esp_fill_random.
  *
  * All four ctx pointers are unused (NULL) — state lives in ESP-IDF globals

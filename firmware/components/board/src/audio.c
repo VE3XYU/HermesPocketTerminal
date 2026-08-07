@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "board.h"
+#include "board_priv.h"
 #include "tick_ms.h"
 #include "wav.h"
 
@@ -148,18 +149,12 @@ static int codec_open_at(uint32_t rate)
 
 static int i2c_up(uint8_t *addr7_out)
 {
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port          = AUDIO_I2C_PORT,
-        .sda_io_num        = PIN_I2C_SDA,
-        .scl_io_num        = PIN_I2C_SCL,
-        .clk_source        = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags             = { .enable_internal_pullup = true },
-    };
-    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_i2c);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(err));
-        s_i2c = NULL;
+    /* Shared with the PCF85063 RTC (Task 17): the bus is created once by
+     * board_i2c_bus() and never deleted -- see board_priv.h. This file
+     * only borrows a handle to hang the codec device off. */
+    s_i2c = board_i2c_bus();
+    if (s_i2c == NULL) {
+        ESP_LOGE(TAG, "shared I2C bus unavailable");
         return -1;
     }
     if (i2c_master_probe(s_i2c, ES8311_ADDR7_CE_LOW, I2C_PROBE_TIMEOUT_MS) == ESP_OK) {
@@ -223,7 +218,12 @@ int audio_init(void)
     if (s_dev) return 0;   /* idempotent: already up */
 
     board_rail_audio(1);
-    board_delay_ms(AUDIO_RAIL_SETTLE_MS);
+    /* Only sleep whatever part of the settle window hasn't already
+     * elapsed: the capture fast path gates the rail on before the SD
+     * mount, so most (often all) of the settle overlaps the mount. */
+    int since = board_rail_audio_on_ms();
+    if (since >= 0 && since < AUDIO_RAIL_SETTLE_MS)
+        board_delay_ms((unsigned)(AUDIO_RAIL_SETTLE_MS - since));
 
     uint8_t addr7 = 0;
     if (i2c_up(&addr7) != 0) goto fail;
@@ -290,7 +290,9 @@ void audio_deinit(void)
     if (s_ctrl_if)  { audio_codec_delete_ctrl_if(s_ctrl_if);   s_ctrl_if = NULL; }
     if (s_tx) { i2s_del_channel(s_tx); s_tx = NULL; }
     if (s_rx) { i2s_del_channel(s_rx); s_rx = NULL; }
-    if (s_i2c) { i2c_del_master_bus(s_i2c); s_i2c = NULL; }
+    /* The I2C bus is shared with the RTC and owned by board_i2c_bus();
+     * never delete it here, just drop our borrowed handle. */
+    s_i2c = NULL;
     board_rail_audio(0);
 }
 

@@ -2,6 +2,7 @@
  * ESP-IDF (Task 1's app_core/ports.h interfaces). See idf_ports.h for the
  * per-port contract summary. */
 #include "idf_ports.h"
+#include "board.h"       /* board_rtc_get(): external RTC feeds epoch_s */
 #include "tick_ms.h"
 #include "esp_vfs_fat.h"
 #include "esp_timer.h"
@@ -16,6 +17,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -262,15 +264,27 @@ static int kv_set(void *ctx, const char *key, const char *val) {
 
 /* ------------------------------------------------------------------- clock */
 
-/* Guards against an unset RTC reporting a bogus "epoch": anything at or
- * before ~2020-09-13 is treated as "no time available" (Task 17 wires the
- * RTC via settimeofday(); until then this always returns 0). */
+/* Guards against an unset clock reporting a bogus "epoch": anything at or
+ * before ~2020-09-13 is treated as "no time available". */
 #define EPOCH_VALID_THRESHOLD 1600000000
 
+/* Task 17: real time comes from the PCF85063 (board_rtc_get()). The system
+ * clock is preferred when it already holds a valid time -- it survives deep
+ * sleep on the S3 and is refreshed by board_rtc_set() on server drift
+ * correction -- so the external RTC costs one I2C read per cold boot, after
+ * which the value is cached into the system clock via settimeofday(). */
 static long long ck_epoch_s(void *ctx) {
     (void)ctx;
     time_t now = time(NULL);
-    return now > EPOCH_VALID_THRESHOLD ? (long long)now : 0;
+    if (now > EPOCH_VALID_THRESHOLD) return (long long)now;
+    long long rtc = board_rtc_get();
+    if (rtc > EPOCH_VALID_THRESHOLD) {
+        struct timeval tv = { .tv_sec = (time_t)rtc, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "system clock set from the external RTC: %lld", rtc);
+        return rtc;
+    }
+    return 0;
 }
 
 static unsigned ck_mono_ms(void *ctx) {

@@ -1,7 +1,9 @@
 #include "board.h"
+#include "board_priv.h"   /* board_rail_audio_on_ms() prototype */
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 
 #define PIN_EPD_PWR   6    /* active low  */
 #define PIN_AUDIO_PWR 42   /* active low  */
@@ -41,7 +43,30 @@ void board_early_init(void) {
 }
 
 void board_rail_epd(int on)   { gpio_set_level(PIN_EPD_PWR, !on); }
-void board_rail_audio(int on) { gpio_set_level(PIN_AUDIO_PWR, !on); }
+
+/* Rail-on timestamp for board_rail_audio_on_ms() (board_priv.h): lets
+ * audio_init() and the shared-I2C-bus accessor subtract settle time that
+ * already elapsed instead of always sleeping the full window. The pad is
+ * INPUT_OUTPUT (see board_early_init), so the current gate state can be
+ * read back to make repeated "on" calls keep the original timestamp. */
+static int64_t s_audio_rail_on_us = -1;
+
+void board_rail_audio(int on) {
+    if (on) {
+        if (gpio_get_level(PIN_AUDIO_PWR) != 0 || s_audio_rail_on_us < 0)
+            s_audio_rail_on_us = esp_timer_get_time();
+    } else {
+        s_audio_rail_on_us = -1;
+    }
+    gpio_set_level(PIN_AUDIO_PWR, !on);
+}
+
+int board_rail_audio_on_ms(void) {
+    if (s_audio_rail_on_us < 0) return -1;
+    int64_t ms = (esp_timer_get_time() - s_audio_rail_on_us) / 1000;
+    return ms > 0x7fffffff ? 0x7fffffff : (int)ms;
+}
+
 int  board_rail_epd_level(void) { return gpio_get_level(PIN_EPD_PWR); }
 
 wake_cause_t board_wake_cause(void) {
