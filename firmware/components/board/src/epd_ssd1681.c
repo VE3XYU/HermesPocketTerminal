@@ -9,6 +9,7 @@
  * uploaded, so no LUT table ships in this file.
  */
 #include "board.h"
+#include "tick_ms.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
@@ -51,16 +52,13 @@ static spi_device_handle_t s_spi;
  * harness sent the panel deep-sleep command and cut its rail mid-refresh.
  * That aborted every refresh since the original C2 run (whose inter-
  * partial 800 ms harness delays were the only real wall time the panel
- * ever got). Same pdMS_TO_TICKS truncation main.c's ms_to_ticks_min1()
+ * ever got). Same pdMS_TO_TICKS truncation tick_ms.h's ms_to_ticks_min1()
  * guards against, caught there but missed here. */
 static int64_t uptime_ms(void) { return esp_timer_get_time() / 1000; }
 
 /* Sleep at least one real tick between BUSY polls (pdMS_TO_TICKS()
  * truncates toward zero; never let it become a zero-tick no-op again). */
-static void poll_delay(void) {
-    TickType_t t = pdMS_TO_TICKS(EPD_BUSY_POLL_MS);
-    vTaskDelay(t > 0 ? t : 1);
-}
+static void poll_delay(void) { board_delay_ms(EPD_BUSY_POLL_MS); }
 
 /* BUSY is HIGH while the controller is busy, LOW when idle (confirmed
  * against reference/pala_note's read_busy(), which loops while HIGH). */

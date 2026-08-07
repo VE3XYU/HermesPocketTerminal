@@ -2,6 +2,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "board.h"
+#include "tick_ms.h"
 #include "ui_fb.h"
 #include "ports.h"
 #include "idf_ports.h"
@@ -98,15 +99,10 @@ static void provisioning_fatal(const char *msg) {
  * call drains it before touching the driver again. -1 = empty. */
 static int s_pushed_back = -1;
 
-/* pdMS_TO_TICKS() truncates towards zero: at this project's
- * CONFIG_FREERTOS_HZ=100 (10ms/tick), pdMS_TO_TICKS(5) is 0 -- a
- * "wait a few ms" request would silently become "don't wait at all".
- * Round up to at least 1 tick for any nonzero ms so a short timeout still
- * means a short wait, not a no-op poll. */
-static TickType_t ms_to_ticks_min1(unsigned ms) {
-    TickType_t t = pdMS_TO_TICKS(ms);
-    return (t == 0 && ms > 0) ? 1 : t;
-}
+/* ms_to_ticks_min1() (pdMS_TO_TICKS() with a one-tick floor, so a "wait a
+ * few ms" request can't truncate to "don't wait at all" at
+ * CONFIG_FREERTOS_HZ=100) now lives in board/tick_ms.h -- the device side
+ * has several consumers of it and one definition beats four copies. */
 
 /* Reads one byte straight from the usb_serial_jtag driver (already
  * installed by console_init_usb_serial_jtag()), bypassing stdio and the

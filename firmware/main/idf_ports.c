@@ -2,6 +2,7 @@
  * ESP-IDF (Task 1's app_core/ports.h interfaces). See idf_ports.h for the
  * per-port contract summary. */
 #include "idf_ports.h"
+#include "tick_ms.h"
 #include "esp_vfs_fat.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -276,9 +277,15 @@ static unsigned ck_mono_ms(void *ctx) {
     return (unsigned)(esp_timer_get_time() / 1000);
 }
 
+/* board_delay_ms(), not vTaskDelay(pdMS_TO_TICKS(ms)): the latter truncates
+ * towards zero, so at CONFIG_FREERTOS_HZ=100 every request from 1-9 ms
+ * became vTaskDelay(0) -- a bare yield. app_core's retry/backoff paths call
+ * sleep_ms() with exactly those small values, and a sleep that doesn't
+ * sleep turns a paced retry loop into a spin. Same truncation class as the
+ * SSD1681 BUSY poll that blocked checkpoint C2; see tick_ms.h. */
 static void ck_sleep_ms(void *ctx, unsigned ms) {
     (void)ctx;
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    board_delay_ms(ms);
 }
 
 /* --------------------------------------------------------------------- rng */
