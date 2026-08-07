@@ -49,4 +49,11 @@ int  audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx);
 void audio_beep(void);   /* short 1 kHz chime, generated, no asset */
 void audio_deinit(void); /* PA off, codec closed, rail off */
 
+/* Battery percent (Task 16). ADC1 channel 3 = GPIO 4, oneshot, 8 samples
+ * averaged through a nominal 2:1 divider and a 3300-4200 mV line, clamped
+ * to 0..100. Returns -1 when the ADC itself is unavailable, which is also
+ * htp_client's "omit the X-Battery header" value. The curve is nominal
+ * until Task 19 calibrates it against real hardware (design §11.3). */
+int board_battery_pct(void);
+
 #endif

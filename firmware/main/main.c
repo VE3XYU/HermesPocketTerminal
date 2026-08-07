@@ -6,7 +6,10 @@
 #include "ui_fb.h"
 #include "ports.h"
 #include "idf_ports.h"
+#include "idf_wifi.h"
+#include "idf_transport.h"
 #include "app_config.h"
+#include "htp_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -328,7 +331,12 @@ static int power_button_held_at_boot(wake_cause_t wc) {
  * regression proof) and before the development stay-awake tail.
  * ============================================================ */
 
-#define C4_WAV_PATH       "/sdcard/rec/c4-test.wav"   /* board_sd_mount() creates /rec */
+/* One recording, two consumers: C4 records it and plays it back, C5 uploads
+ * it to the bridge. The storage port takes logical paths ("/rec/...") and
+ * the audio driver takes real VFS paths, so both spellings are derived from
+ * one constant instead of being written out twice. */
+#define C4_WAV_LOGICAL    "/rec/c4-test.wav"          /* board_sd_mount() creates /rec */
+#define C4_WAV_PATH       "/sdcard" C4_WAV_LOGICAL
 #define C4_ARM_TIMEOUT_MS 60000    /* wait this long for the operator's first REC press.
                                       Bounded on purpose: a plain boot with nobody
                                       watching must still reach the stay-awake tail with
@@ -347,6 +355,13 @@ static int power_button_held_at_boot(wake_cause_t wc) {
  * "keep recording", which is exactly the semantics audio_record_to() wants. */
 static int c4_rec_held(void *ctx) { (void)ctx; return board_btn_rec(); }
 
+/* Call right after board_btn_rec() read pressed: waits out the bounce
+ * window and re-samples. 1 = the button is genuinely held. */
+static int c4_rec_confirmed(void) {
+    board_delay_ms(C4_ARM_DEBOUNCE_MS);
+    return board_btn_rec();
+}
+
 /* Bounded wait for the record button. Returns 1 if pressed, 0 on timeout.
  * Wall-clock (esp_timer), never iteration-counted.
  *
@@ -361,9 +376,8 @@ static int c4_wait_for_rec(unsigned timeout_ms) {
     int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
     while ((esp_timer_get_time() / 1000) < deadline_ms) {
         if (board_btn_rec()) {
-            board_delay_ms(C4_ARM_DEBOUNCE_MS);
-            if (board_btn_rec()) return 1;   /* still held: real press */
-            continue;                        /* bounce: keep waiting */
+            if (c4_rec_confirmed()) return 1;   /* still held: real press */
+            continue;                           /* bounce: keep waiting */
         }
         board_delay_ms(C4_ARM_POLL_MS);
     }
@@ -372,8 +386,26 @@ static int c4_wait_for_rec(unsigned timeout_ms) {
 
 /* Never fatal: every failure path logs, tears the audio stack back down
  * (rail off) and returns, so the caller still reaches the stay-awake tail.
- * Rebooting re-arms the whole test. */
-static void c4_audio_check(void) {
+ *
+ * One-shot by design. C5 uploads this same recording, so once the file
+ * exists there is nothing left to prove here -- and leaving the section
+ * armed would make every subsequent boot sit through C4_ARM_TIMEOUT_MS of
+ * dead time before the network test starts. Two ways to re-arm:
+ *   - delete /rec/c4-test.wav from the card, or
+ *   - hold REC down through boot (no card reader needed): the existing file
+ *     is recorded over. The gate is sampled here, several seconds into the
+ *     boot, so the button has to be *held*, not merely pressed at power-on.
+ */
+static void c4_audio_check(port_storage_t *st) {
+    if (st->exists(st->ctx, C4_WAV_LOGICAL)) {
+        if (!(board_btn_rec() && c4_rec_confirmed())) {
+            ESP_LOGI(TAG, "C4 skipped: %s already exists "
+                          "(delete it, or hold REC through boot, to re-record)", C4_WAV_LOGICAL);
+            return;
+        }
+        ESP_LOGI(TAG, "C4 re-armed: REC held at boot, recording over %s", C4_WAV_LOGICAL);
+    }
+
     ESP_LOGI(TAG, "C4 audio test");
     if (audio_init() != 0) {
         ESP_LOGE(TAG, "audio_init failed; skipping C4");
@@ -405,6 +437,96 @@ static void c4_audio_check(void) {
     audio_beep();
     audio_deinit();
     ESP_LOGI(TAG, "C4 done");
+}
+
+/* ============================================================
+ * Checkpoint C5 (Task 16): Wi-Fi join, real HTTP transport, battery ADC.
+ * Runs the host-proven htp_client against a bridge over the real network,
+ * between the C4 audio section and the development stay-awake tail.
+ * ============================================================ */
+
+#define C5_WIFI_TIMEOUT_MS 20000   /* generous: covers a scan (~3 s) plus DHCP on a
+                                      slow AP. Untuned; C6 gives it a real budget. */
+#define C5_CAPTURE_ID      "c-c5-0001"
+#define C5_REPLY_LOGICAL   "/reply.tmp.wav"
+#define C5_REPLY_PATH      "/sdcard" C5_REPLY_LOGICAL
+
+static const char *state_name(htp_capture_state_t s) {
+    static const char *names[] = { "received", "transcribing", "processing",
+                                   "done", "reply_ready", "failed", "unknown" };
+    int i = (int)s;   /* cast: the enum's underlying type may be unsigned */
+    return (i >= 0 && i <= (int)HTP_ST_UNKNOWN) ? names[i] : "?";
+}
+
+/* Never fatal, same discipline as c4_audio_check(): every leg logs its
+ * result and the function returns so the operator still gets the stay-awake
+ * tail (and a live serial port) even when the network is the thing that is
+ * broken. The big response structs are static, not stack: htp_dashboard_t
+ * alone is ~3.5 KB and this runs on the main task. */
+static void c5_network_check(port_storage_t *st, port_kv_t *kv, const app_config_t *cfg,
+                             const wifi_profiles_t *wp, int have_wifi) {
+    ESP_LOGI(TAG, "C5 network test");
+    if (!have_wifi) {
+        ESP_LOGE(TAG, "C5 skipped: no usable /wifi.json");
+        return;
+    }
+
+    int wr = idf_wifi_connect(wp, kv, C5_WIFI_TIMEOUT_MS);
+    ESP_LOGI(TAG, "wifi join r=%d", wr);
+    if (wr != 0) {
+        ESP_LOGE(TAG, "C5 skipped: no network");
+        return;
+    }
+
+    static htp_transport_t tr;
+    static htp_client_t cl;
+    idf_transport_init(&tr, cfg->bridge_url);
+    htp_client_init(&cl, &tr, cfg->token);
+    cl.battery_pct = board_battery_pct();
+    ESP_LOGI(TAG, "battery=%d%% (X-Battery header)", cl.battery_pct);
+
+    static htp_dashboard_t d;
+    memset(&d, 0, sizeof d);
+    int r = htp_get_dashboard(&cl, "", &d);
+    ESP_LOGI(TAG, "dashboard r=%d rev=%s items=%d sync=%d", r, d.rev, d.item_count, d.sync_interval);
+
+    /* Upload the C4 recording if it is there -- the capture ID is fixed, so
+     * re-running C5 is an idempotent re-upload of the same capture. */
+    if (!st->exists(st->ctx, C4_WAV_LOGICAL)) {
+        ESP_LOGW(TAG, "no %s on the card; skipping the upload/poll/reply legs", C4_WAV_LOGICAL);
+    } else {
+        htp_upload_params_t p = { .capture_id = C5_CAPTURE_ID, .wav_path = C4_WAV_LOGICAL,
+                                  .recorded_at = 0 };
+        ESP_LOGI(TAG, "upload r=%d", htp_upload_capture(&cl, &p));
+
+        const char *ids[1] = { C5_CAPTURE_ID };
+        static htp_capture_status_t stt[1];
+        memset(stt, 0, sizeof stt);
+        long long t = 0;
+        int n = htp_poll_captures(&cl, ids, 1, stt, 1, &t);
+        if (n > 0)
+            ESP_LOGI(TAG, "poll n=%d state=%d (%s) transcript=%s",
+                     n, stt[0].state, state_name(stt[0].state), stt[0].transcript);
+        else
+            ESP_LOGE(TAG, "poll n=%d (no capture rows)", n);   /* n < 0 is an HTP_ERR_* code */
+
+        int dr = htp_download_reply(&cl, C5_CAPTURE_ID, C5_REPLY_LOGICAL);
+        ESP_LOGI(TAG, "reply dl r=%d", dr);
+        if (dr == HTP_OK) {
+            if (audio_init() != 0) {
+                ESP_LOGE(TAG, "audio_init failed; not playing the reply");
+            } else {
+                ESP_LOGI(TAG, "playing %s", C5_REPLY_PATH);
+                if (audio_play_wav(C5_REPLY_PATH, NULL, NULL) != 0)
+                    ESP_LOGE(TAG, "reply playback failed");
+                audio_deinit();
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "battery=%d%%", board_battery_pct());
+    idf_wifi_stop();   /* radio off before the stay-awake tail */
+    ESP_LOGI(TAG, "C5 done");
 }
 
 #define DEV_HEARTBEAT_MS    30000               /* heartbeat cadence while staying awake */
@@ -620,7 +742,9 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "C3 done");
 
-    c4_audio_check();              /* audio bring-up; always returns */
+    c4_audio_check(&st);           /* audio bring-up; always returns */
+
+    c5_network_check(&st, &kv, &cfg, &wp, have_wifi);   /* network bring-up; always returns */
 
     dev_stay_awake_then_sleep();   /* never returns */
 }

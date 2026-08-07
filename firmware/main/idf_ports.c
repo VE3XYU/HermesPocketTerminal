@@ -25,13 +25,14 @@ static const char *TAG = "idf_ports";
 /* ---------------------------------------------------------------- storage */
 
 #define SD_PREFIX "/sdcard"
-#define SD_PATH_MAX 160
+#define SD_PATH_MAX IDF_SD_PATH_MAX
 
 /* Logical "/x" -> "/sdcard/x". Every app_core call site passes an
  * absolute logical path (ports.h's contract), so plain concatenation is
  * enough; truncation is treated as a hard failure rather than silently
- * operating on a mangled path. */
-static int full_path(const char *logical, char *out, size_t cap) {
+ * operating on a mangled path. Exported (idf_ports.h) so idf_transport.c's
+ * streaming file access uses the same rule rather than a second copy. */
+int idf_ports_sd_path(const char *logical, char *out, size_t cap) {
     int n = snprintf(out, cap, "%s%s", SD_PREFIX, logical);
     return (n > 0 && (size_t)n < cap) ? 0 : -1;
 }
@@ -115,7 +116,7 @@ static int read_whole_file(const char *fp, void *buf, size_t cap, size_t *len) {
 static int st_read(void *ctx, const char *path, void *buf, size_t cap, size_t *len) {
     (void)ctx;
     char fp[SD_PATH_MAX];
-    if (full_path(path, fp, sizeof fp) != 0) return -1;
+    if (idf_ports_sd_path(path, fp, sizeof fp) != 0) return -1;
 
     if (read_whole_file(fp, buf, cap, len) == 0) return 0;
 
@@ -154,7 +155,7 @@ static int st_write(void *ctx, const char *path, const void *data, size_t len) {
     (void)ctx;
     char fp[SD_PATH_MAX];
     char tmp[SD_PATH_MAX + 4];
-    if (full_path(path, fp, sizeof fp) != 0) { note_write_fail("path"); return -1; }
+    if (idf_ports_sd_path(path, fp, sizeof fp) != 0) { note_write_fail("path"); return -1; }
     if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", fp) >= sizeof tmp) { note_write_fail("path"); return -1; }
 
     if (write_whole_file(tmp, data, len) != 0) { remove(tmp); return -1; }   /* step already noted */
@@ -169,7 +170,7 @@ static int st_write(void *ctx, const char *path, const void *data, size_t len) {
 static int st_append(void *ctx, const char *path, const void *data, size_t len) {
     (void)ctx;
     char fp[SD_PATH_MAX];
-    if (full_path(path, fp, sizeof fp) != 0) return -1;
+    if (idf_ports_sd_path(path, fp, sizeof fp) != 0) return -1;
     FILE *f = fopen(fp, "ab");
     if (!f) return -1;
     size_t n = fwrite(data, 1, len, f);
@@ -181,14 +182,14 @@ static int st_append(void *ctx, const char *path, const void *data, size_t len) 
 static int st_remove(void *ctx, const char *path) {
     (void)ctx;
     char fp[SD_PATH_MAX];
-    if (full_path(path, fp, sizeof fp) != 0) return -1;
+    if (idf_ports_sd_path(path, fp, sizeof fp) != 0) return -1;
     return remove(fp) == 0 ? 0 : -1;
 }
 
 static int st_exists(void *ctx, const char *path) {
     (void)ctx;
     char fp[SD_PATH_MAX];
-    if (full_path(path, fp, sizeof fp) != 0) return 0;
+    if (idf_ports_sd_path(path, fp, sizeof fp) != 0) return 0;
     struct stat s;
     return stat(fp, &s) == 0;
 }
@@ -203,7 +204,7 @@ static long long st_free_bytes(void *ctx) {
 static int st_list(void *ctx, const char *dir, int (*cb)(const char *name, void *u), void *u) {
     (void)ctx;
     char fp[SD_PATH_MAX];
-    if (full_path(dir, fp, sizeof fp) != 0) return -1;
+    if (idf_ports_sd_path(dir, fp, sizeof fp) != 0) return -1;
     DIR *d = opendir(fp);
     if (!d) return -1;
     struct dirent *e;

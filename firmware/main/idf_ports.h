@@ -20,6 +20,19 @@
  */
 void idf_ports_init(port_storage_t *st, port_kv_t *kv, port_clock_t *ck, port_rng_t *rng);
 
+/* The logical-path -> "/sdcard/..." mapping the storage port applies,
+ * exported so the one file that cannot go through the port shares the same
+ * convention instead of hard-coding a second copy of the prefix.
+ *
+ * That file is idf_transport.c: it streams multi-megabyte uploads and reply
+ * downloads in 4 KB chunks, and port_storage_t is a whole-file interface
+ * (read/write/append take a single buffer) with no seek or handle. Rather
+ * than widen the port -- which app_core and the host fakes both implement --
+ * the transport does its own stdio and borrows only the path rule.
+ * Returns 0, or -1 when the result would not fit in cap. */
+#define IDF_SD_PATH_MAX 160
+int idf_ports_sd_path(const char *logical, char *out, size_t cap);
+
 /* Diagnostic detail for the most recent st_write() failure. Device-only
  * side channel, deliberately outside the port_storage_t contract (that
  * stays a bare 0/-1 -- app_core and the host test suite's fake_storage.c
