@@ -87,6 +87,14 @@ static int recv_to_file(esp_http_client_handle_t cl, const char *sink_logical) {
         int rd = esp_http_client_read(cl, s_chunk, CHUNK_CAP);
         if (rd < 0) { ESP_LOGE(TAG, "download read failed at %ld bytes", total); break; }
         if (rd == 0) {
+            /* esp_http_client_read() also returns 0 when the peer closes
+             * mid-body (a FIN surfaces the same as end-of-body from here) --
+             * is_complete_data_received() is the only way to tell a whole
+             * reply from a torn one before promoting the .part file. */
+            if (!esp_http_client_is_complete_data_received(cl)) {
+                ESP_LOGE(TAG, "download closed before %ld-byte body finished", total);
+                break;
+            }
             if (fclose(f) != 0) { ESP_LOGE(TAG, "close %s failed", part_path); f = NULL; break; }
             if (rename_replacing(part_path, final_path) != 0) {
                 ESP_LOGE(TAG, "cannot promote %s", part_path);
@@ -114,10 +122,20 @@ static size_t recv_to_buffer(esp_http_client_handle_t cl, int *err) {
     while (total < RESP_CAP - 1) {
         int rd = esp_http_client_read(cl, s_resp + total, (int)(RESP_CAP - 1 - total));
         if (rd < 0) { *err = 1; break; }
-        if (rd == 0) break;
+        if (rd == 0) {
+            /* Same FIN-looks-like-EOF ambiguity as recv_to_file(): a torn
+             * body must come back as a transport error (retryable), never
+             * as a shorter-but-valid body (which reads as a protocol error
+             * and is never retried). */
+            if (!esp_http_client_is_complete_data_received(cl)) *err = 1;
+            break;
+        }
         total += (size_t)rd;
     }
-    if (total >= RESP_CAP - 1)
+    /* Only warn about real capacity truncation: is_complete_data_received()
+     * tells apart a body that exactly fills RESP_CAP-1 bytes (complete, no
+     * warning needed) from one that kept going past it (actually cut off). */
+    if (!*err && total >= RESP_CAP - 1 && !esp_http_client_is_complete_data_received(cl))
         ESP_LOGW(TAG, "response exceeded %d bytes and was truncated", RESP_CAP - 1);
     s_resp[total] = 0;
     return total;
@@ -226,6 +244,13 @@ static int tr_perform(void *ctx, const htp_request_t *req, htp_response_t *resp)
 
 void idf_transport_init(htp_transport_t *out, const char *base_url) {
     snprintf(s_base, sizeof s_base, "%s", base_url ? base_url : "");
+    /* A card bridge_url with a trailing slash (e.g. "http://host:8787/")
+     * would otherwise double up with req->path's leading slash and hit
+     * "//htp/v1/...". Strip at most one; multiple slashes aren't worth
+     * handling. */
+    size_t base_len = strlen(s_base);
+    if (base_len > 0 && s_base[base_len - 1] == '/')
+        s_base[base_len - 1] = '\0';
     out->perform = tr_perform;
     out->ctx = NULL;
 }
