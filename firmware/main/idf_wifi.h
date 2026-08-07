@@ -27,13 +27,20 @@ int idf_wifi_connect(const wifi_profiles_t *p, port_kv_t *kv, unsigned timeout_m
 
 int idf_wifi_start_connect_async(const wifi_profiles_t *p, port_kv_t *kv);
     /* Begins the join without blocking (Task 17 overlaps it with recording);
-     * pair with idf_wifi_wait_connected(). 0 = join started, -1 = could not
-     * even start one (no profiles, driver init failure, nothing in range). */
+     * pair with idf_wifi_wait_connected(). With a fast-join cache hit the
+     * association itself is started; otherwise a NON-blocking scan is kicked
+     * off and idf_wifi_wait_connected() finishes the scan join. 0 = join or
+     * scan started, -1 = could not even start one (no profiles, driver init
+     * failure). "Nothing in range" now surfaces from wait_connected(). */
 
 int idf_wifi_wait_connected(unsigned timeout_ms);
-    /* Waits for an IP. 0 ok, -1 on timeout/association failure. On success
-     * the BSSID, channel and SSID of the AP that answered are written back
-     * to kv for the next boot's fast join. */
+    /* Waits for an IP, then re-verifies the association is still up before
+     * reporting success (a join that got an IP and immediately dropped is a
+     * failure, not a success). 0 ok, -1 on timeout/association failure. On
+     * success the BSSID, channel and SSID of the AP that answered are
+     * written back to kv for the next boot's fast join. Worst case, a stale
+     * fast join costs timeout_ms, then the scan fallback adds a scan
+     * (~2-3 s, capped at 6 s) plus a second timeout_ms wait. */
 
 void idf_wifi_stop(void);
     /* Disconnects and stops the radio. The driver stays initialized, so a

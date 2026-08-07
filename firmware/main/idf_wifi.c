@@ -24,11 +24,13 @@ static const char *TAG = "idf_wifi";
  * rather than joined blind. */
 #define FJ_SSID_KEY "fj_ssid"
 
-#define BIT_STARTED  BIT0
-#define BIT_GOT_IP   BIT1
-#define BIT_FAILED   BIT2
+#define BIT_STARTED   BIT0
+#define BIT_GOT_IP    BIT1
+#define BIT_FAILED    BIT2
+#define BIT_SCAN_DONE BIT3
 
 #define WIFI_START_TIMEOUT_MS 3000
+#define SCAN_WAIT_MS          6000   /* an active all-channel scan is ~2-3 s */
 #define SCAN_MAX_AP 24
 
 static EventGroupHandle_t s_events;
@@ -42,8 +44,11 @@ static port_kv_t *s_kv;
 static wifi_profiles_t s_profiles;
 
 static int s_inited;        /* netif + event loop + esp_wifi_init() done */
+static int s_wifi_inited;   /* esp_wifi_init() specifically (partial-init retry guard) */
+static int s_handlers;      /* event handlers registered */
 static int s_started;       /* esp_wifi_start() done and STA_START seen */
 static int s_fast_join;     /* the join in flight is the cached-BSSID path */
+static int s_scan_pending;  /* an async scan was started; wait_connected() finishes it */
 static int s_dhcpc_stopped; /* we stopped the DHCP client for a static-IP profile */
 
 /* Scan scratch. Static, not stack: wifi_ap_record_t is ~80 bytes and the
@@ -58,39 +63,61 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         xEventGroupSetBits(s_events, BIT_STARTED);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
+        xEventGroupSetBits(s_events, BIT_SCAN_DONE);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *e = data;
         ESP_LOGW(TAG, "disconnected (reason %d)", e ? e->reason : -1);
+        /* A disconnect invalidates any GOT_IP that came before it: without
+         * clearing the bit, a join that briefly got an IP and then dropped
+         * would still read as "connected" to wait_outcome() (Task 16 review
+         * carry). The main task double-checks the live link state too. */
+        xEventGroupClearBits(s_events, BIT_GOT_IP);
         xEventGroupSetBits(s_events, BIT_FAILED);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupClearBits(s_events, BIT_FAILED);
         xEventGroupSetBits(s_events, BIT_GOT_IP);
     }
 }
 
+/* Every create step below is guarded by its own flag/handle so a retry
+ * after a partial failure reuses what already exists instead of leaking
+ * the event group or double-creating the netif (Task 16 review carry --
+ * sessions may now retry Wi-Fi bring-up within one power cycle). */
 static int ensure_init(void) {
     if (s_inited) return 0;
 
-    s_events = xEventGroupCreate();
-    if (!s_events) return -1;
+    if (!s_events) {
+        s_events = xEventGroupCreate();
+        if (!s_events) return -1;
+    }
 
-    if (esp_netif_init() != ESP_OK) return -1;
+    if (esp_netif_init() != ESP_OK) return -1;   /* idempotent in ESP-IDF */
     /* Already created by an earlier component is fine, anything else is not. */
     esp_err_t e = esp_event_loop_create_default();
     if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "event loop: %s", esp_err_to_name(e));
         return -1;
     }
-    s_netif = esp_netif_create_default_wifi_sta();
-    if (!s_netif) return -1;
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    if ((e = esp_wifi_init(&cfg)) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(e));
-        return -1;
+    if (!s_netif) {
+        s_netif = esp_netif_create_default_wifi_sta();
+        if (!s_netif) return -1;
     }
-    if (esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL) != ESP_OK ||
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL) != ESP_OK)
-        return -1;
+
+    if (!s_wifi_inited) {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        if ((e = esp_wifi_init(&cfg)) != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(e));
+            return -1;
+        }
+        s_wifi_inited = 1;
+    }
+    if (!s_handlers) {
+        if (esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL) != ESP_OK ||
+            esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL) != ESP_OK)
+            return -1;
+        s_handlers = 1;
+    }
 
     /* Credentials live on the SD card, not in NVS: keeping the driver's
      * copy in RAM avoids a second, stale source of truth. */
@@ -197,17 +224,38 @@ static int connect_to_profile(int idx, const uint8_t *bssid, uint8_t channel) {
     return 0;
 }
 
-static int join_by_scan(void) {
+/* Kicks off an active all-channel scan WITHOUT blocking (the capture fast
+ * path starts this before recording; a blocking scan would sit for ~2-3 s
+ * between wake and the first I2S read). The results are collected by
+ * wait_scan_and_connect() once the caller is ready to wait. */
+static int start_scan_async(void) {
     esp_wifi_disconnect();   /* a scan is refused while a join is in flight */
 
     wifi_scan_config_t sc = {0};   /* active scan, all channels, any SSID */
-    esp_err_t e = esp_wifi_scan_start(&sc, true);
+    xEventGroupClearBits(s_events, BIT_SCAN_DONE);
+    esp_err_t e = esp_wifi_scan_start(&sc, false);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "scan: %s", esp_err_to_name(e));
         return -1;
     }
+    s_scan_pending = 1;
+    return 0;
+}
+
+/* Second half of the scan join: wait for SCAN_DONE, pick a profile,
+ * connect. Only called from the main task. */
+static int wait_scan_and_connect(void) {
+    EventBits_t b = xEventGroupWaitBits(s_events, BIT_SCAN_DONE, pdFALSE, pdFALSE,
+                                        ms_to_ticks_min1(SCAN_WAIT_MS));
+    s_scan_pending = 0;
+    if (!(b & BIT_SCAN_DONE)) {
+        ESP_LOGE(TAG, "scan did not complete within %d ms", SCAN_WAIT_MS);
+        return -1;
+    }
+
     uint16_t n = SCAN_MAX_AP;
-    if ((e = esp_wifi_scan_get_ap_records(&n, s_recs)) != ESP_OK) {
+    esp_err_t e = esp_wifi_scan_get_ap_records(&n, s_recs);
+    if (e != ESP_OK) {
         ESP_LOGE(TAG, "scan records: %s", esp_err_to_name(e));
         esp_wifi_clear_ap_list();
         return -1;
@@ -233,11 +281,20 @@ static int join_by_scan(void) {
     return connect_to_profile(idx, NULL, 0);
 }
 
-/* Waits for the outcome of the join currently in flight. 0 = got an IP. */
+/* Waits for the outcome of the join currently in flight. 0 = got an IP
+ * AND the association is still up right now: the event bits alone can
+ * report a join that got an IP and then dropped (see wifi_event()), so a
+ * live esp_wifi_sta_get_ap_info() probe is the final word. */
 static int wait_outcome(unsigned timeout_ms) {
     EventBits_t b = xEventGroupWaitBits(s_events, BIT_GOT_IP | BIT_FAILED,
                                         pdFALSE, pdFALSE, ms_to_ticks_min1(timeout_ms));
-    return (b & BIT_GOT_IP) ? 0 : -1;
+    if (!(b & BIT_GOT_IP)) return -1;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        ESP_LOGW(TAG, "got an IP but the link is already down again");
+        return -1;
+    }
+    return 0;
 }
 
 /* Main-task side of IP_EVENT_STA_GOT_IP: refresh the fast-join cache (an
@@ -262,6 +319,7 @@ int idf_wifi_start_connect_async(const wifi_profiles_t *p, port_kv_t *kv) {
     if (!p || p->count <= 0 || !kv) return -1;
     s_profiles = *p;
     s_kv = kv;
+    s_scan_pending = 0;   /* forget any scan a previous, abandoned start left behind */
 
     /* Before ensure_init(): this is what brings NVS up (the kv port
      * initializes it lazily) and esp_wifi_init() needs it there already. */
@@ -282,20 +340,31 @@ int idf_wifi_start_connect_async(const wifi_profiles_t *p, port_kv_t *kv) {
         ESP_LOGW(TAG, "fast join could not be started; scanning");
     }
     s_fast_join = 0;
-    return join_by_scan();
+    return start_scan_async();
 }
 
 int idf_wifi_wait_connected(unsigned timeout_ms) {
     if (!s_inited) return -1;
 
+    if (s_scan_pending) {
+        /* The async start left a scan in flight; finish the scan join
+         * before waiting on the association outcome. */
+        if (wait_scan_and_connect() != 0) { ESP_LOGE(TAG, "no network"); return -1; }
+    }
+
     if (wait_outcome(timeout_ms) == 0) { on_connected(); return 0; }
 
     if (s_fast_join) {
         /* design §5.5: a stale cached BSSID (AP moved channel, roamed, or
-         * is simply out of range) costs one failed attempt, not the boot. */
+         * is simply out of range) costs one failed attempt, not the boot.
+         * Worst case this path adds a scan (~2-3 s) plus a second outcome
+         * wait on top of the first timeout_ms -- callers budget for it. */
         ESP_LOGW(TAG, "fast join failed; falling back to a full scan");
         s_fast_join = 0;
-        if (join_by_scan() != 0) return -1;
+        if (start_scan_async() != 0 || wait_scan_and_connect() != 0) {
+            ESP_LOGE(TAG, "no network");
+            return -1;
+        }
         if (wait_outcome(timeout_ms) == 0) { on_connected(); return 0; }
     }
     ESP_LOGE(TAG, "no network");
@@ -314,5 +383,6 @@ void idf_wifi_stop(void) {
         esp_wifi_stop();
         s_started = 0;
     }
-    xEventGroupClearBits(s_events, BIT_STARTED | BIT_GOT_IP | BIT_FAILED);
+    s_scan_pending = 0;
+    xEventGroupClearBits(s_events, BIT_STARTED | BIT_GOT_IP | BIT_FAILED | BIT_SCAN_DONE);
 }
