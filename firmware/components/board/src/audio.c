@@ -106,6 +106,19 @@ static const audio_codec_data_if_t *s_data_if;
 static esp_codec_dev_handle_t       s_dev;
 static uint32_t                     s_rate;   /* rate the device is open at; 0 = closed */
 
+/* Staging buffers: static, not malloc/free -- the project's plan forbids
+ * heap use outside cJSON/transport. Sized off the main task's stack (8 kB)
+ * being too small for them, same as when they were heap-allocated. Safe as
+ * shared file-scope storage because record and playback are documented as
+ * mutually exclusive (board.h: "only one of them runs at a time"), so the
+ * record pair and the playback pair are each touched by exactly one call
+ * at a time, never concurrently. */
+static int16_t s_rec_stereo[REC_STEREO_BYTES / sizeof(int16_t)];
+static int16_t s_rec_mono[REC_MONO_BYTES / sizeof(int16_t)];
+static uint8_t s_play_fbuf[PLAY_CHUNK_BYTES];
+static int16_t s_play_out[PLAY_CHUNK_BYTES];   /* mono->stereo doubles it: PLAY_CHUNK_BYTES
+                                                   elements x 2 B = PLAY_CHUNK_BYTES*2 bytes */
+
 /* Opens (or re-opens) the codec at `rate`. Gain and volume are applied
  * after the open because esp_codec_dev rejects them in the closed state,
  * and a re-open resets them. */
@@ -302,15 +315,6 @@ long audio_record_to(const char *path, int (*keep_going)(void *), void *ctx, uns
         return -1;
     }
 
-    /* Heap, not stack: the main task's stack is 8 kB and these are 12 kB. */
-    int16_t *stereo = malloc(REC_STEREO_BYTES);
-    int16_t *mono   = malloc(REC_MONO_BYTES);
-    if (stereo == NULL || mono == NULL) {
-        ESP_LOGE(TAG, "record: out of memory");
-        free(stereo); free(mono); fclose(f);
-        return -1;
-    }
-
     const int frames_per_chunk = REC_STEREO_BYTES / 4;   /* 2 ch x 16 bit */
     uint32_t total = 0;
     int64_t start_us = esp_timer_get_time();
@@ -322,15 +326,15 @@ long audio_record_to(const char *path, int (*keep_going)(void *), void *ctx, uns
             ESP_LOGW(TAG, "record: max_ms (%u) reached, stopping", max_ms);
             break;
         }
-        int r = esp_codec_dev_read(s_dev, stereo, REC_STEREO_BYTES);
+        int r = esp_codec_dev_read(s_dev, s_rec_stereo, REC_STEREO_BYTES);
         if (r != ESP_CODEC_DEV_OK) {
             ESP_LOGE(TAG, "record: codec read failed (%d)", r);
             failed = 1;
             break;
         }
-        for (int i = 0; i < frames_per_chunk; i++) mono[i] = stereo[2 * i];   /* left slot = mic */
+        for (int i = 0; i < frames_per_chunk; i++) s_rec_mono[i] = s_rec_stereo[2 * i];   /* left slot = mic */
         size_t want = (size_t)frames_per_chunk * 2;
-        if (fwrite(mono, 1, want, f) != want) {
+        if (fwrite(s_rec_mono, 1, want, f) != want) {
             ESP_LOGE(TAG, "record: short write at %u bytes (errno %d)", (unsigned)total, errno);
             failed = 1;
             break;
@@ -338,8 +342,6 @@ long audio_record_to(const char *path, int (*keep_going)(void *), void *ctx, uns
         total += (uint32_t)want;
     }
 
-    free(stereo);
-    free(mono);
     if (failed) { fclose(f); return -1; }
 
     wav_write_header(hdr, AUDIO_RATE_HZ, 16, 1, total);
@@ -391,14 +393,6 @@ int audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx)
         return -1;
     }
 
-    uint8_t *fbuf = malloc(PLAY_CHUNK_BYTES);
-    int16_t *out  = malloc(PLAY_CHUNK_BYTES * 2);   /* mono -> stereo doubles it */
-    if (fbuf == NULL || out == NULL) {
-        ESP_LOGE(TAG, "play: out of memory");
-        free(fbuf); free(out); fclose(f);
-        return -1;
-    }
-
     /* data_bytes == 0 means the writer never patched the length (a streamed
      * WAV); fall back to "until EOF" rather than playing nothing. */
     uint32_t remaining = inf.data_bytes ? inf.data_bytes : UINT32_MAX;
@@ -408,7 +402,7 @@ int audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx)
     while (remaining > 0) {
         if (stop_now && stop_now(ctx)) { ESP_LOGI(TAG, "play: stopped by caller"); break; }
         size_t want = remaining < PLAY_CHUNK_BYTES ? remaining : PLAY_CHUNK_BYTES;
-        size_t n = fread(fbuf, 1, want, f);
+        size_t n = fread(s_play_fbuf, 1, want, f);
         if (n == 0) break;                       /* EOF */
         remaining -= (uint32_t)n;
         n -= n % frame_bytes;                    /* whole frames only */
@@ -417,13 +411,13 @@ int audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx)
         void *p;
         int   len;
         if (inf.channels == 1) {
-            const int16_t *m = (const int16_t *)fbuf;
+            const int16_t *m = (const int16_t *)s_play_fbuf;
             size_t frames = n / 2;
-            for (size_t i = 0; i < frames; i++) { out[2 * i] = m[i]; out[2 * i + 1] = m[i]; }
-            p   = out;
+            for (size_t i = 0; i < frames; i++) { s_play_out[2 * i] = m[i]; s_play_out[2 * i + 1] = m[i]; }
+            p   = s_play_out;
             len = (int)(frames * 4);
         } else {
-            p   = fbuf;
+            p   = s_play_fbuf;
             len = (int)n;
         }
         int r = esp_codec_dev_write(s_dev, p, len);
@@ -434,8 +428,6 @@ int audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx)
         }
     }
 
-    free(fbuf);
-    free(out);
     fclose(f);
     /* esp_codec_dev_write() returns once the data is queued, so the last
      * few hundred ms are still in the DMA ring. Let them play out before
