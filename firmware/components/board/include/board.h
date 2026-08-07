@@ -32,4 +32,21 @@ int board_sd_mount(void);                  /* mounts FAT at /sdcard, creates /sd
 int board_sd_format_and_mount(void);       /* erase+format (only call after board_sd_mount() failed), then mount; 0 ok */
 int board_sd_unmount_and_format(void);     /* unmount (if currently mounted) + erase+format + mount; for a mounted card that refuses writes; 0 ok */
 
+/* ES8311 audio (Task 15). Pins: I2C SDA 47 / SCL 48 (codec control),
+ * I2S MCLK 14 / BCLK 15 / WS 38 / DOUT 45 / DIN 16, PA enable GPIO 46.
+ * Capture and playback share one full-duplex I2S port and one codec, so
+ * only one of them runs at a time. */
+int  audio_init(void);   /* rail on, I2C + I2S + esp_codec_dev up, 16 kHz ready; 0 ok.
+                            Idempotent; cleans up after itself on failure. */
+/* Record 16 kHz/16-bit/mono WAV to path until keep_going() returns 0 or max_ms
+ * elapses. Streams to SD as it goes; patches the header on stop.
+ * keep_going() is sampled once per ~128 ms capture chunk.
+ * Returns data bytes written, or -1 (SD write failure -> explicit error). */
+long audio_record_to(const char *path, int (*keep_going)(void *), void *ctx, unsigned max_ms);
+/* Plays a WAV from SD; sample rate/channels come from ITS header (16 k uploads,
+ * 24 k replies both work). stop_now() polled between chunks. 0 ok. */
+int  audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx);
+void audio_beep(void);   /* short 1 kHz chime, generated, no asset */
+void audio_deinit(void); /* PA off, codec closed, rail off */
+
 #endif

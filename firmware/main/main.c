@@ -322,6 +322,74 @@ static int power_button_held_at_boot(wake_cause_t wc) {
     return 0;   /* released before the debounce window elapsed */
 }
 
+/* ============================================================
+ * Checkpoint C4 (Task 15): ES8311 record to SD, play back from SD.
+ * Runs after the C3 checks and the screen draw (those stay put as the
+ * regression proof) and before the development stay-awake tail.
+ * ============================================================ */
+
+#define C4_WAV_PATH       "/sdcard/rec/c4-test.wav"   /* board_sd_mount() creates /rec */
+#define C4_ARM_TIMEOUT_MS 60000    /* wait this long for the operator's first REC press.
+                                      Bounded on purpose: a plain boot with nobody
+                                      watching must still reach the stay-awake tail with
+                                      the serial port alive. Untuned. */
+#define C4_ARM_POLL_MS    20
+#define C4_MAX_RECORD_MS  120000   /* hard cap on one recording (task brief) */
+
+/* keep_going/stop_now adapter. board_btn_rec() takes no ctx, and calling it
+ * through an (int (*)(void *)) cast is undefined behaviour (and trips
+ * -Wcast-function-type), so wrap it rather than cast it. Pressed == 1 ==
+ * "keep recording", which is exactly the semantics audio_record_to() wants. */
+static int c4_rec_held(void *ctx) { (void)ctx; return board_btn_rec(); }
+
+/* Bounded wait for the record button. Returns 1 if pressed, 0 on timeout.
+ * Wall-clock (esp_timer), never iteration-counted. */
+static int c4_wait_for_rec(unsigned timeout_ms) {
+    int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
+    while ((esp_timer_get_time() / 1000) < deadline_ms) {
+        if (board_btn_rec()) return 1;
+        board_delay_ms(C4_ARM_POLL_MS);
+    }
+    return 0;
+}
+
+/* Never fatal: every failure path logs, tears the audio stack back down
+ * (rail off) and returns, so the caller still reaches the stay-awake tail.
+ * Rebooting re-arms the whole test. */
+static void c4_audio_check(void) {
+    ESP_LOGI(TAG, "C4 audio test");
+    if (audio_init() != 0) {
+        ESP_LOGE(TAG, "audio_init failed; skipping C4");
+        return;
+    }
+    ESP_LOGI(TAG, "C4: hold REC and speak; release to stop (waiting up to %u s for the press)",
+             (unsigned)(C4_ARM_TIMEOUT_MS / 1000));
+    if (!c4_wait_for_rec(C4_ARM_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "C4 skipped: no REC press within %u s -- reboot to run it again",
+                 (unsigned)(C4_ARM_TIMEOUT_MS / 1000));
+        audio_deinit();
+        return;
+    }
+
+    ESP_LOGI(TAG, "recording to %s (release REC to stop, %u s cap)",
+             C4_WAV_PATH, (unsigned)(C4_MAX_RECORD_MS / 1000));
+    long n = audio_record_to(C4_WAV_PATH, c4_rec_held, NULL, C4_MAX_RECORD_MS);
+    if (n < 0) {
+        ESP_LOGE(TAG, "recording failed");
+        audio_deinit();
+        return;
+    }
+    /* 16 kHz x 16-bit x mono = 32000 bytes/s, so bytes/32 is milliseconds. */
+    ESP_LOGI(TAG, "recorded %ld bytes (~%ld ms of 16 kHz mono)", n, n / 32);
+
+    board_delay_ms(500);
+    ESP_LOGI(TAG, "playback...");
+    if (audio_play_wav(C4_WAV_PATH, NULL, NULL) != 0) ESP_LOGE(TAG, "playback failed");
+    audio_beep();
+    audio_deinit();
+    ESP_LOGI(TAG, "C4 done");
+}
+
 #define DEV_HEARTBEAT_MS    30000               /* heartbeat cadence while staying awake */
 #define DEV_IDLE_TIMEOUT_MS (30u * 60u * 1000u) /* ~30 min without input -> deep sleep;
                                                    untuned, dev-iteration convenience */
@@ -534,5 +602,8 @@ void app_main(void) {
     }
 
     ESP_LOGI(TAG, "C3 done");
+
+    c4_audio_check();              /* audio bring-up; always returns */
+
     dev_stay_awake_then_sleep();   /* never returns */
 }
