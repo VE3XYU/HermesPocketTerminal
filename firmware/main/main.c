@@ -84,6 +84,7 @@ static ui_fb_t   s_fb;
 static ui_flow_t s_uif;
 static int s_epd_up;       /* epd_init() has run and the panel is awake */
 static int s_base_drawn;   /* a full refresh established a partial base */
+static int s_panel_lost;   /* a hung background task may still own fb + EPD SPI */
 static char s_json[2048];  /* config/wifi read + provisioning paste scratch */
 static sidecar_t s_sc, s_sc_next;
 
@@ -454,6 +455,12 @@ static void maybe_provision(int mounted, int config_ok, int pwr_held) {
  * ============================================================ */
 
 static int screen_ready(void) {
+    /* Single gate for the whole display path: every screen and render
+     * function funnels through here, so once a background task has missed
+     * its join -- it may still own the framebuffer and the EPD SPI bus --
+     * one flag stops all of them for the rest of the session (see
+     * capture_bg_join). */
+    if (s_panel_lost) return -1;
     if (!s_epd_up) {
         if (epd_init() != 0) return -1;
         s_epd_up = 1;
@@ -650,6 +657,10 @@ static void capture_bg_task(void *arg) {
 static void capture_bg_start(int start_wifi) {
     if (start_wifi) s_bg_wifi_started = 0;
     if (!s_bg_sem) s_bg_sem = xSemaphoreCreateBinary();
+    /* Drain a give left behind by a task that finished after its join timed
+     * out: without this, the next join returns immediately on the corpse's
+     * signal while a fresh background task is still drawing. */
+    if (s_bg_sem) xSemaphoreTake(s_bg_sem, 0);
     if (s_bg_sem &&
         xTaskCreate(capture_bg_task, "cap_bg", CAP_BG_STACK,
                     (void *)(intptr_t)start_wifi, 1, NULL) == pdPASS)
@@ -661,7 +672,20 @@ static void capture_bg_start(int start_wifi) {
 }
 
 static void capture_bg_join(void) {
-    if (s_bg_sem) xSemaphoreTake(s_bg_sem, ms_to_ticks_min1(CAP_BG_JOIN_TIMEOUT_MS));
+    if (!s_bg_sem) return;
+    if (xSemaphoreTake(s_bg_sem, ms_to_ticks_min1(CAP_BG_JOIN_TIMEOUT_MS)) == pdTRUE)
+        return;
+    /* The task is still running and still owns the framebuffer and the EPD
+     * SPI bus. The single-threaded-display invariant is broken for the rest
+     * of this session, so the display is written off entirely: screen_ready()
+     * now fails for every screen and render callback, and the teardown skips
+     * epd_sleep() -- pushing more SPI traffic at a controller that is mid-
+     * transaction is exactly the wrong move. The next boot's panel reset
+     * recovers it, and the e-paper keeps whatever image it last latched. */
+    s_panel_lost = 1;
+    ESP_LOGE(TAG, "capture background task did not finish within %d ms; "
+                  "display disabled for the rest of this session",
+             CAP_BG_JOIN_TIMEOUT_MS);
 }
 
 /* Records one capture: id, WAV to SD, sidecar + rec index (the durable
@@ -727,18 +751,40 @@ static int render_dashboard_cb(void *ui_ctx, const htp_dashboard_t *d) {
     return 0;
 }
 
+/* Called on every successful notifications fetch, before the dashboard step
+ * and (on a capture wake) right after the outcome screen was drawn. The
+ * dashboard model is deliberately empty whenever the server answers
+ * "unchanged" -- the panel's retained image is the content cache -- so a
+ * clear-and-reflow here would blank real content to draw nothing. */
 static int render_notifications_cb(void *ui_ctx, const htp_notifications_t *n) {
     (void)ui_ctx;
-    if (screen_ready() != 0) return -1;
-    s_uif.banner[0] = 0;
-    if (n->count > 0) {
-        int pick = 0;
-        for (int i = 0; i < n->count; i++)
-            if (n->items[i].urgent) { pick = i; break; }
-        str_copy(s_uif.banner, sizeof s_uif.banner, n->items[pick].text);
+    /* Nothing to show: leave the panel exactly as it is. sync.c's ack gate
+     * is count > 0, so returning success acks nothing. */
+    if (n->count == 0) {
+        s_uif.banner[0] = 0;
+        return 0;
     }
-    status_line_fill(&s_uif.status);
-    ui_flow_render(&s_uif, &s_fb);
+    if (screen_ready() != 0) return -1;
+
+    int pick = 0;
+    for (int i = 0; i < n->count; i++)
+        if (n->items[i].urgent) { pick = i; break; }
+    str_copy(s_uif.banner, sizeof s_uif.banner, n->items[pick].text);
+
+    if (s_base_drawn) {
+        /* The framebuffer already holds this session's screen (the capture
+         * outcome, or a dashboard drawn earlier): stamp the banner strip over
+         * it instead of clearing. Same pixels a full ui_flow_render would put
+         * there -- widget_banner is the last thing it draws -- minus the wipe. */
+        widget_banner(&s_fb, s_uif.banner);
+    } else {
+        /* First draw of the session: the framebuffer is blank and the panel's
+         * previous-image RAM was lost to epd_init(), so there is nothing to
+         * stamp onto and the full flow render is the only complete screen we
+         * can produce. */
+        status_line_fill(&s_uif.status);
+        ui_flow_render(&s_uif, &s_fb);
+    }
     present(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
     return 0;
 }
@@ -1035,7 +1081,7 @@ void app_main(void) {
      * these are safe no-ops when the session never brought them up. */
     idf_wifi_stop();
     audio_deinit();
-    if (s_epd_up) {
+    if (s_epd_up && !s_panel_lost) {
         epd_sleep();
         s_epd_up = 0;
     }
