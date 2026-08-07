@@ -119,11 +119,29 @@ static void dataN(const uint8_t *buf, size_t len) {
     spi_send(buf, len);
 }
 
-static void reset_pulse(void) {
-    gpio_set_level(PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
+/* Hardware reset. This is the ONLY way to bring the SSD1681 back out of the
+ * controller's own Deep Sleep Mode 1 (entered by epd_sleep()'s 0x10/0x01) --
+ * a short low pulse is enough to satisfy the datasheet's minimum pulse
+ * width, but leaves too little settle time either side: BUSY can read back
+ * a stale/floating LOW immediately after RST goes high (the controller
+ * hasn't started driving it again yet), so a busy_wait() called too early
+ * sails through thinking the controller is idle when it's still mid-wake.
+ * That let epd_init() "succeed" (register-write commands don't need the
+ * analog domain and ack fine) while the panel was still actually asleep;
+ * the failure only showed up later as a permanently-stuck BUSY on the next
+ * real display-update trigger. Timing below (50 ms high settle / 20 ms low
+ * hold / 50 ms high settle) matches what reference/pala_note's
+ * epaper_driver_bsp.cpp uses for this same panel -- consulted for the
+ * intervals only, this implementation is our own. */
+static bool reset_pulse(void) {
     gpio_set_level(PIN_RST, 1);
-    busy_wait();
+    vTaskDelay(pdMS_TO_TICKS(50));   /* settle high first, in case RST was left low/floating */
+    gpio_set_level(PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));   /* hold low */
+    gpio_set_level(PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));   /* let the controller actually start driving BUSY again
+                                        before we trust a read of it */
+    return busy_wait();
 }
 
 /* Resets the RAM address counters to (0,0) and streams a full window's
@@ -138,7 +156,7 @@ static void frame_write(const uint8_t *fb) {
 
 int epd_init(void) {
     board_rail_epd(1);
-    vTaskDelay(pdMS_TO_TICKS(10));   /* rail settle margin, not datasheet-mandated */
+    vTaskDelay(pdMS_TO_TICKS(100));  /* rail settle margin for a cold panel; not datasheet-mandated */
 
     gpio_config_t dc_rst = {
         .mode = GPIO_MODE_OUTPUT,
@@ -177,15 +195,25 @@ int epd_init(void) {
         return -1;
     }
 
-    reset_pulse();
-    cmd(0x12); busy_wait();                    /* SWRESET */
+    if (!reset_pulse()) {
+        ESP_LOGE(TAG, "epd_init: BUSY never cleared after hardware reset");
+        return -1;
+    }
+    cmd(0x12);                                  /* SWRESET */
+    if (!busy_wait()) {
+        ESP_LOGE(TAG, "epd_init: BUSY timeout after SWRESET (0x12)");
+        return -1;
+    }
     cmd(0x01); data3(0xC7, 0x00, 0x00);         /* driver output: 200 lines */
     cmd(0x11); data1(0x03);                     /* data entry: x+ y+ */
     cmd(0x44); data2(0x00, 0x18);                /* x window: 0..24 (25 bytes) */
     cmd(0x45); data4(0x00, 0x00, 0xC7, 0x00);    /* y window: 0..199 */
     cmd(0x3C); data1(0x05);                      /* border waveform */
     cmd(0x18); data1(0x80);                      /* temp sensor: internal */
-    if (!busy_wait()) return -1;
+    if (!busy_wait()) {
+        ESP_LOGE(TAG, "epd_init: BUSY timeout after temp-sensor cmd (0x18)");
+        return -1;
+    }
 
     return 0;
 }
