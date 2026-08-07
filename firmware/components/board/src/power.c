@@ -17,12 +17,24 @@ void board_early_init(void) {
     gpio_config_t out = { .mode = GPIO_MODE_INPUT_OUTPUT,
         .pin_bit_mask = (1ULL << PIN_EPD_PWR) | (1ULL << PIN_AUDIO_PWR) | (1ULL << PIN_VBAT_HOLD) };
     gpio_config(&out);
-    gpio_hold_dis(PIN_VBAT_HOLD);
-    gpio_hold_dis(PIN_EPD_PWR);                /* release the hold armed before sleeping */
-    gpio_hold_dis(PIN_AUDIO_PWR);
+
+    /* Levels first, holds released second. A pad that is held ignores both
+     * the mode from gpio_config() above and these writes -- they land in
+     * the output register and only reach the pad when the hold is dropped.
+     * Releasing first would instead expose whatever the output register
+     * happens to hold coming out of a deep-sleep reset (all zeros), which
+     * for these active-low gates means "both rails momentarily ON" and for
+     * the active-high VBAT latch means "let go of the power latch". */
     gpio_set_level(PIN_VBAT_HOLD, 1);          /* keep the board alive */
     gpio_set_level(PIN_EPD_PWR, 1);            /* rails off until needed */
     gpio_set_level(PIN_AUDIO_PWR, 1);
+    gpio_deep_sleep_hold_dis();                /* clears the digital-pad autohold latch that
+                                                  board_deep_sleep() armed; it lives in the RTC
+                                                  domain and survives the wake reset */
+    gpio_hold_dis(PIN_VBAT_HOLD);              /* release the holds armed before sleeping */
+    gpio_hold_dis(PIN_EPD_PWR);
+    gpio_hold_dis(PIN_AUDIO_PWR);
+
     gpio_config_t in = { .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
         .pin_bit_mask = (1ULL << PIN_BTN_REC) | (1ULL << PIN_BTN_PWR) };
     gpio_config(&in);
@@ -51,6 +63,19 @@ void board_deep_sleep(unsigned seconds) {
     gpio_hold_en(PIN_EPD_PWR);                 /* ... else sleep_gpio isolation lets it float */
     gpio_set_level(PIN_AUDIO_PWR, 1);
     gpio_hold_en(PIN_AUDIO_PWR);
+    /* GPIO 17 and 6 are RTC pins (RTC IO covers GPIO 0-21 on the S3), so
+     * gpio_hold_en() routes them to rtc_gpio_hold_en() and the RTC domain
+     * keeps them latched on its own. GPIO 42 is NOT: it is a digital-only
+     * pad, and on the ESP32-S3 a digital pad's individual hold bit is
+     * ignored during deep sleep unless the global autohold is also armed
+     * (see esp-idf driver/gpio.h on gpio_hold_en: "on ESP32/S2/C3/S3/C2
+     * this function cannot be used to hold the state of a digital GPIO
+     * during Deep-sleep ... please call gpio_deep_sleep_hold_en"). Without
+     * this line the audio rail gate floats through sleep, which on an
+     * active-low gate can mean the analog rail powers back up and drains
+     * the battery for the whole sleep window. Only pads whose own hold bit
+     * is set are affected, i.e. exactly the three above. */
+    gpio_deep_sleep_hold_en();
     esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_REC) | (1ULL << PIN_BTN_PWR),
                                  ESP_EXT1_WAKEUP_ANY_LOW);
     if (seconds) esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
