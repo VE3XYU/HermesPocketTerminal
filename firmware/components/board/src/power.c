@@ -10,7 +10,11 @@
 #define PIN_BTN_PWR   18
 
 void board_early_init(void) {
-    gpio_config_t out = { .mode = GPIO_MODE_OUTPUT,
+    /* INPUT_OUTPUT (not plain OUTPUT): same push-pull drive, but the input
+     * buffer stays enabled so board_rail_epd_level() reads the real pad
+     * level back for display diagnostics (a disabled input buffer makes
+     * gpio_get_level() on an output pin always return 0). */
+    gpio_config_t out = { .mode = GPIO_MODE_INPUT_OUTPUT,
         .pin_bit_mask = (1ULL << PIN_EPD_PWR) | (1ULL << PIN_AUDIO_PWR) | (1ULL << PIN_VBAT_HOLD) };
     gpio_config(&out);
     gpio_hold_dis(PIN_VBAT_HOLD);
@@ -26,6 +30,7 @@ void board_early_init(void) {
 
 void board_rail_epd(int on)   { gpio_set_level(PIN_EPD_PWR, !on); }
 void board_rail_audio(int on) { gpio_set_level(PIN_AUDIO_PWR, !on); }
+int  board_rail_epd_level(void) { return gpio_get_level(PIN_EPD_PWR); }
 
 wake_cause_t board_wake_cause(void) {
     switch (esp_sleep_get_wakeup_cause()) {

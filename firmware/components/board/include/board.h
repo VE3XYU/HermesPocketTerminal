@@ -10,6 +10,8 @@
 void board_early_init(void);       /* rail GPIO config + VBAT latch high; call first */
 void board_rail_epd(int on);       /* active-low gate handled inside */
 void board_rail_audio(int on);
+int  board_rail_epd_level(void);   /* raw EPD rail gate pad readback: 0 = rail on
+                                      (active-low); for display diagnostics */
 int  board_btn_rec(void);          /* 1 = pressed (level low) */
 int  board_btn_pwr(void);
 typedef enum { WAKE_COLD, WAKE_REC_BUTTON, WAKE_PWR_BUTTON, WAKE_TIMER } wake_cause_t;

@@ -12,6 +12,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdbool.h>
@@ -27,25 +28,51 @@
 
 #define EPD_FRAME_BYTES 5000   /* 25 bytes/row * 200 rows; matches ui_fb_t */
 
-#define EPD_BUSY_POLL_MS         5
+#define EPD_BUSY_POLL_MS         10    /* exactly one RTOS tick at this project's
+                                          CONFIG_FREERTOS_HZ=100; see poll_delay() */
 #define EPD_BUSY_TIMEOUT_MS      3000
 #define EPD_BUSY_ASSERT_MS       50     /* time BUSY may take to rise after a trigger */
 #define EPD_BUSY_TRIGGER_TIMEOUT_MS 5000 /* full-refresh headroom once BUSY is asserted */
+#define EPD_SWRESET_GRACE_MS     10     /* let BUSY rise after SWRESET before polling it;
+                                           untuned (order-of-datasheet SWRESET duration),
+                                           guards the same pre-rise race busy_wait_after_
+                                           trigger() closes for update triggers */
 
 static const char *TAG = "epd";
 static spi_device_handle_t s_spi;
 
+/* Wall-clock milliseconds since boot. Every busy-wait timeout below is
+ * measured against this, never by counting poll iterations. The previous
+ * implementation summed a nominal EPD_BUSY_POLL_MS per loop pass -- but
+ * with EPD_BUSY_POLL_MS=5 and CONFIG_FREERTOS_HZ=100 (10 ms/tick),
+ * vTaskDelay(pdMS_TO_TICKS(5)) is vTaskDelay(0): a yield, not a delay.
+ * So the "5 s" post-trigger timeout really expired after ~1000
+ * back-to-back polls -- a few MILLISECONDS of wall time -- after which the
+ * harness sent the panel deep-sleep command and cut its rail mid-refresh.
+ * That aborted every refresh since the original C2 run (whose inter-
+ * partial 800 ms harness delays were the only real wall time the panel
+ * ever got). Same pdMS_TO_TICKS truncation main.c's ms_to_ticks_min1()
+ * guards against, caught there but missed here. */
+static int64_t uptime_ms(void) { return esp_timer_get_time() / 1000; }
+
+/* Sleep at least one real tick between BUSY polls (pdMS_TO_TICKS()
+ * truncates toward zero; never let it become a zero-tick no-op again). */
+static void poll_delay(void) {
+    TickType_t t = pdMS_TO_TICKS(EPD_BUSY_POLL_MS);
+    vTaskDelay(t > 0 ? t : 1);
+}
+
 /* BUSY is HIGH while the controller is busy, LOW when idle (confirmed
  * against reference/pala_note's read_busy(), which loops while HIGH). */
 static bool busy_wait(void) {
-    int waited = 0;
+    int64_t start = uptime_ms();
     while (gpio_get_level(PIN_BUSY) == 1) {
-        vTaskDelay(pdMS_TO_TICKS(EPD_BUSY_POLL_MS));
-        waited += EPD_BUSY_POLL_MS;
-        if (waited >= EPD_BUSY_TIMEOUT_MS) {
-            ESP_LOGE(TAG, "BUSY timeout");
+        if (uptime_ms() - start >= EPD_BUSY_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "BUSY timeout (still high %lld ms after wait began)",
+                     (long long)(uptime_ms() - start));
             return false;
         }
+        poll_delay();
     }
     return true;
 }
@@ -61,24 +88,25 @@ static bool busy_wait(void) {
  * than failing outright -- a real controller could plausibly finish inside
  * one poll tick and we'd rather not false-fail on a fast partial. */
 static bool busy_wait_after_trigger(void) {
-    int waited = 0;
+    int64_t start = uptime_ms();
+    ESP_LOGI(TAG, "BUSY=%d just after trigger", gpio_get_level(PIN_BUSY));
     while (gpio_get_level(PIN_BUSY) == 0) {
-        vTaskDelay(pdMS_TO_TICKS(EPD_BUSY_POLL_MS));
-        waited += EPD_BUSY_POLL_MS;
-        if (waited >= EPD_BUSY_ASSERT_MS) {
+        if (uptime_ms() - start >= EPD_BUSY_ASSERT_MS) {
             ESP_LOGW(TAG, "BUSY did not assert within %d ms of trigger", EPD_BUSY_ASSERT_MS);
             break;
         }
+        poll_delay();
     }
-    waited = 0;
     while (gpio_get_level(PIN_BUSY) == 1) {
-        vTaskDelay(pdMS_TO_TICKS(EPD_BUSY_POLL_MS));
-        waited += EPD_BUSY_POLL_MS;
-        if (waited >= EPD_BUSY_TRIGGER_TIMEOUT_MS) {
-            ESP_LOGE(TAG, "BUSY timeout after trigger");
+        if (uptime_ms() - start >= EPD_BUSY_ASSERT_MS + EPD_BUSY_TRIGGER_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "BUSY timeout after trigger (still high %lld ms after trigger)",
+                     (long long)(uptime_ms() - start));
             return false;
         }
+        poll_delay();
     }
+    ESP_LOGI(TAG, "refresh done: BUSY cleared %lld ms after trigger",
+             (long long)(uptime_ms() - start));
     return true;
 }
 
@@ -134,6 +162,8 @@ static void dataN(const uint8_t *buf, size_t len) {
  * epaper_driver_bsp.cpp uses for this same panel -- consulted for the
  * intervals only, this implementation is our own. */
 static bool reset_pulse(void) {
+    ESP_LOGI(TAG, "BUSY=%d RST=%d before reset pulse",
+             gpio_get_level(PIN_BUSY), gpio_get_level(PIN_RST));
     gpio_set_level(PIN_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(50));   /* settle high first, in case RST was left low/floating */
     gpio_set_level(PIN_RST, 0);
@@ -141,6 +171,7 @@ static bool reset_pulse(void) {
     gpio_set_level(PIN_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(50));   /* let the controller actually start driving BUSY again
                                         before we trust a read of it */
+    ESP_LOGI(TAG, "BUSY=%d after reset pulse", gpio_get_level(PIN_BUSY));
     return busy_wait();
 }
 
@@ -155,11 +186,14 @@ static void frame_write(const uint8_t *fb) {
 }
 
 int epd_init(void) {
+    ESP_LOGI(TAG, "init: rail gate=%d (0=on, active-low) at entry", board_rail_epd_level());
     board_rail_epd(1);
     vTaskDelay(pdMS_TO_TICKS(100));  /* rail settle margin for a cold panel; not datasheet-mandated */
 
+    /* INPUT_OUTPUT (not plain OUTPUT) so the diagnostic logs below read the
+     * real pad level back, not the always-0 a disabled input buffer gives. */
     gpio_config_t dc_rst = {
-        .mode = GPIO_MODE_OUTPUT,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pin_bit_mask = (1ULL << PIN_DC) | (1ULL << PIN_RST),
     };
     gpio_config(&dc_rst);
@@ -168,6 +202,8 @@ int epd_init(void) {
         .pin_bit_mask = (1ULL << PIN_BUSY),
     };
     gpio_config(&busy_in);
+    ESP_LOGI(TAG, "init: rail gate=%d RST=%d BUSY=%d after rail-on settle",
+             board_rail_epd_level(), gpio_get_level(PIN_RST), gpio_get_level(PIN_BUSY));
 
     spi_bus_config_t buscfg = {
         .mosi_io_num = PIN_MOSI,
@@ -200,6 +236,11 @@ int epd_init(void) {
         return -1;
     }
     cmd(0x12);                                  /* SWRESET */
+    vTaskDelay(pdMS_TO_TICKS(EPD_SWRESET_GRACE_MS));  /* BUSY needs a moment to rise; polling
+                                                         "is it clear yet" too early passes on
+                                                         the pre-rise LOW (same race as after a
+                                                         trigger) and the next command lands
+                                                         mid-reset */
     if (!busy_wait()) {
         ESP_LOGE(TAG, "epd_init: BUSY timeout after SWRESET (0x12)");
         return -1;
@@ -214,6 +255,7 @@ int epd_init(void) {
         ESP_LOGE(TAG, "epd_init: BUSY timeout after temp-sensor cmd (0x18)");
         return -1;
     }
+    ESP_LOGI(TAG, "init: done, BUSY=%d", gpio_get_level(PIN_BUSY));
 
     return 0;
 }
@@ -229,6 +271,7 @@ void epd_full(const uint8_t *fb5000) {
     cmd(0x26); dataN(fb5000, EPD_FRAME_BYTES);
 
     cmd(0x22); data1(0xF7);                      /* OTP full-update sequence */
+    ESP_LOGI(TAG, "full: BUSY=%d before trigger", gpio_get_level(PIN_BUSY));
     cmd(0x20);
     busy_wait_after_trigger();
 }
@@ -236,11 +279,16 @@ void epd_full(const uint8_t *fb5000) {
 void epd_partial(const uint8_t *fb5000) {
     frame_write(fb5000);
     cmd(0x22); data1(0xFF);                      /* OTP mode-2 (ping-pong) partial */
+    ESP_LOGI(TAG, "partial: BUSY=%d before trigger", gpio_get_level(PIN_BUSY));
     cmd(0x20);
     busy_wait_after_trigger();
 }
 
 void epd_sleep(void) {
+    /* BUSY should be low here; a high reading means a caller is about to
+     * put the panel to sleep and cut its rail mid-refresh -- the exact
+     * failure the wall-clock busy waits above exist to prevent. */
+    ESP_LOGI(TAG, "sleep: BUSY=%d at entry", gpio_get_level(PIN_BUSY));
     cmd(0x10); data1(0x01);                      /* deep sleep mode 1 */
     vTaskDelay(pdMS_TO_TICKS(10));                /* let the command latch before power cut */
     board_rail_epd(0);
