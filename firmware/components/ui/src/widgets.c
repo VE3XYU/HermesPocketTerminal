@@ -2,105 +2,113 @@
 #include <string.h>
 #include <stdio.h>
 
-/* NOTE: body text goes through fb_text16 (Spleen 8x16, printable ASCII
- * U+0020..U+007E; anything outside maps to '?'). The "dim row" leading
- * marker described in the design ("a leading middle dot") is therefore
- * rendered with the ASCII period below rather than the non-ASCII
- * character, since the font has no glyph for it. widgets.c must never
- * include the font headers itself (Task 8 carried-forward constraint) --
- * all text goes through the fb layer.
+/* NOTE: all text is proportional (Liberation Sans ramp via fb_text_prop;
+ * printable ASCII U+0020..U+007E, anything outside renders '?'). Fitting
+ * is measured per pixel -- fb_ellipsize_prop / fb_text_fit_prop -- never
+ * per character count. The "dim row" leading marker described in the
+ * design ("a leading middle dot") is rendered with the ASCII period,
+ * since the font carries no glyph for the non-ASCII character. widgets.c
+ * must never include the font headers itself (Task 8 carried-forward
+ * constraint) -- all text goes through the fb layer.
  */
 
 /* The vertical budget must partition the panel exactly (see ui_widgets.h):
  * the list's last row (and its cursor inversion) ends at the banner's top
- * edge, so neither can ever paint over the other -- for both row heights. */
-_Static_assert(UI_STATUS_H + (UI_LIST_ROWS + 1) * UI_ROW_H + UI_BANNER_H == UI_H,
+ * edge, so neither can ever paint over the other -- for both row grids. */
+_Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST_ROWS * UI_ROW_H + UI_BANNER_H == UI_H,
                "status + title + rows + banner must partition the 200 px height");
-_Static_assert(UI_STATUS_H + UI_ROW_H + UI_LIST2_ROWS * UI_ROW2_H + UI_BANNER_H == UI_H,
+_Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST2_ROWS * UI_ROW2_H + UI_BANNER_H == UI_H,
                "the two-line row grid must partition the same 200 px height");
-/* Both body lines of a two-line row fit inside the row. */
-_Static_assert(3 + UI_TEXT_LINE_H + UI_BODY_H <= UI_ROW2_H,
-               "two body lines must fit inside a two-line row");
+/* Every baseline keeps its font's full ascent/descent band inside its
+ * row or strip. */
+_Static_assert(UI_STATUS_BASE >= UI_FONT_BODY_ASC &&
+               UI_STATUS_BASE + UI_FONT_BODY_DESC <= UI_STATUS_H - 1,
+               "status text must clear the divider row");
+_Static_assert(UI_TITLE_BASE >= UI_FONT_EMPH_ASC &&
+               UI_TITLE_BASE + UI_FONT_EMPH_DESC <= UI_TITLE_H,
+               "title ink stays inside the title row");
+_Static_assert(UI_ROW_BASE >= UI_FONT_BODY_ASC &&
+               UI_ROW_BASE + UI_FONT_BODY_DESC <= UI_ROW_H,
+               "body ink stays inside a one-line row");
+_Static_assert(UI_ROW2_BASE1 >= UI_FONT_BODY_ASC &&
+               UI_ROW2_BASE2 + UI_FONT_BODY_DESC <= UI_ROW2_H &&
+               UI_ROW2_BASE2 - UI_ROW2_BASE1 == UI_TEXT_LINE_H,
+               "two body lines at the text pitch stay inside a two-line row");
+_Static_assert(UI_BANNER_BASE >= UI_FONT_EMPH_ASC &&
+               UI_BANNER_BASE + UI_FONT_EMPH_DESC <= UI_BANNER_H,
+               "banner ink stays inside the banner strip");
 /* Text pages stay clear of the banner strip by construction. */
-_Static_assert(UI_STATUS_H + 4 + (UI_TEXT_PAGE_LINES - 1) * UI_TEXT_LINE_H + UI_BODY_H
-                   <= UI_H - UI_BANNER_H,
+_Static_assert(UI_TEXT_FIRST_BASE - UI_FONT_BODY_ASC >= UI_STATUS_H &&
+               UI_TEXT_FIRST_BASE + (UI_TEXT_PAGE_LINES - 1) * UI_TEXT_LINE_H
+                   + UI_FONT_BODY_DESC <= UI_H - UI_BANNER_H,
                "a full text page must fit above the banner strip");
-
-void ui_ellipsize(char *dst, size_t cap, const char *src, int max_chars) {
-    if (cap == 0) return;
-    if (max_chars < 0) max_chars = 0;
-    size_t maxc = (size_t)max_chars;
-    if (maxc > cap - 1) maxc = cap - 1;
-
-    size_t len = strlen(src);
-    if (len <= maxc) {
-        memcpy(dst, src, len);
-        dst[len] = '\0';
-        return;
-    }
-
-    size_t keep = (maxc >= 3) ? maxc - 3 : 0;
-    size_t dots = maxc - keep;
-    if (dots > 3) dots = 3;
-    memcpy(dst, src, keep);
-    memcpy(dst + keep, "...", dots);
-    dst[keep + dots] = '\0';
-}
 
 void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
     char buf[24];
 
-    /* Clock first (right-aligned): it always fits alone. */
-    int limit = UI_W - 2;
+    /* Clock first (right-aligned by measured width): it always fits alone. */
+    int limit = UI_W - UI_MARGIN_X;
     if (st->clock_hhmm[0]) {
-        int w = fb_text16_width(st->clock_hhmm);
-        int cx = UI_W - 2 - w;
-        fb_text16(f, cx, 2, st->clock_hhmm, 1);
-        limit = cx - 4;
+        int w = fb_text_width_prop(st->clock_hhmm, UI_FONT_BODY);
+        int cx = UI_W - UI_MARGIN_X - w;
+        fb_text_prop(f, cx, UI_STATUS_BASE, st->clock_hhmm, UI_FONT_BODY, 1);
+        limit = cx - UI_STATUS_GAP;
     }
 
     /* Left cluster in priority order -- battery, pending uploads, wifi.
-     * Each item is drawn only when it fits entirely before `limit`:
-     * lower-priority items drop whole, nothing is ever clipped mid-glyph,
-     * and once an item is dropped, nothing after it may draw either --
-     * otherwise a lower-priority item can fit in the gap a higher-priority
-     * one left behind, inverting the hierarchy. (At the 8 px body advance
-     * every realistic strip -- "100%" + "^<int max>" + "W" + clock -- now
-     * fits outright, so the drop path is a guard, not an expectation.) */
-    int x = 2;
+     * Each item is drawn only when its measured width fits entirely
+     * before `limit`: lower-priority items drop whole, nothing is ever
+     * clipped mid-glyph, and once an item is dropped, nothing after it
+     * may draw either -- otherwise a lower-priority item can fit in the
+     * gap a higher-priority one left behind, inverting the hierarchy.
+     * (Every realistic strip -- "100%" + "^<int max>" + "W" + clock --
+     * fits outright at the body size, so the drop path is a guard, not
+     * an expectation; the host test derives both facts.) */
+    int x = UI_MARGIN_X;
     int stop = 0;
     if (!stop && st->battery_pct != -1) {
         snprintf(buf, sizeof buf, "%d%%", st->battery_pct);
-        int w = fb_text16_width(buf);
-        if (x + w <= limit) { fb_text16(f, x, 2, buf, 1); x += w + 4; }
+        int w = fb_text_width_prop(buf, UI_FONT_BODY);
+        if (x + w <= limit) { fb_text_prop(f, x, UI_STATUS_BASE, buf, UI_FONT_BODY, 1); x += w + UI_STATUS_GAP; }
         else stop = 1;
     }
     if (!stop && st->pending_uploads > 0) {
         snprintf(buf, sizeof buf, "^%d", st->pending_uploads);
-        int w = fb_text16_width(buf);
-        if (x + w <= limit) { fb_text16(f, x, 2, buf, 1); x += w + 4; }
+        int w = fb_text_width_prop(buf, UI_FONT_BODY);
+        if (x + w <= limit) { fb_text_prop(f, x, UI_STATUS_BASE, buf, UI_FONT_BODY, 1); x += w + UI_STATUS_GAP; }
         else stop = 1;
     }
     if (!stop && st->wifi_ok) {
-        int w = fb_text16_width("W");
-        if (x + w <= limit) fb_text16(f, x, 2, "W", 1);
+        int w = fb_text_width_prop("W", UI_FONT_BODY);
+        if (x + w <= limit) fb_text_prop(f, x, UI_STATUS_BASE, "W", UI_FONT_BODY, 1);
     }
 
     fb_hline(f, 0, UI_STATUS_H - 1, UI_W, 1);
 }
 
+/* One body line of a list row: ellipsized to the pixel budget, struck
+ * through when done (the strike is what the completion gesture promises;
+ * two rows thick so it survives partial-refresh ghosting). */
+static void row_line(ui_fb_t *f, int x, int baseline, const char *text,
+                     int max_w, int done) {
+    char line[sizeof ((ui_row_t *)0)->text];
+    fb_ellipsize_prop(line, sizeof line, text, UI_FONT_BODY, max_w);
+    if (!line[0]) return;
+    fb_text_prop(f, x, baseline, line, UI_FONT_BODY, 1);
+    if (done)
+        fb_fill(f, x, baseline - 5, fb_text_width_prop(line, UI_FONT_BODY), 2, 1);
+}
+
 void widget_list(ui_fb_t *f, const ui_list_t *l) {
-    char title[UI_LINE_CHARS + 1];
-    ui_ellipsize(title, sizeof title, l->title, UI_LINE_CHARS);
-    int title_y = UI_STATUS_H + 3;
-    fb_text16(f, 2, title_y, title, 1);
-    fb_text16(f, 3, title_y, title, 1); /* bold: redraw offset by 1px */
+    char title[sizeof l->title];
+    fb_ellipsize_prop(title, sizeof title, l->title, UI_FONT_EMPH, UI_TEXT_W);
+    fb_text_prop(f, UI_MARGIN_X, UI_STATUS_H + UI_TITLE_BASE, title,
+                 UI_FONT_EMPH, 1);
 
     /* One-line rows (dashboard) or two-line rows (recordings previews):
      * same scroll-window arithmetic, parametrized by the row grid. */
     int rows_max = l->two_line ? UI_LIST2_ROWS : UI_LIST_ROWS;
     int row_h    = l->two_line ? UI_ROW2_H    : UI_ROW_H;
-    int nlines   = l->two_line ? 2 : 1;
 
     int max_start = l->row_count - rows_max;
     int start = l->cursor - rows_max + 1;
@@ -114,42 +122,42 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
     for (int k = 0; k < visible; k++) {
         int idx = start + k;
         const ui_row_t *row = &l->rows[idx];
-        int y = UI_STATUS_H + UI_ROW_H + row_h * k;
+        int y = UI_STATUS_H + UI_TITLE_H + row_h * k;
 
-        /* UI_LINE_CHARS chars per body line (so 2x for a two-line row);
-         * a dim marker costs 2 of them. */
-        int budget = nlines * UI_LINE_CHARS - (row->dim ? 2 : 0);
-        char body[2 * UI_LINE_CHARS + 1];
-        ui_ellipsize(body, sizeof body, row->text, budget);
+        /* A dim row leads with a measured ". " marker; the text budget
+         * shrinks by its width. */
+        int x = UI_MARGIN_X;
+        int max_w = UI_TEXT_W;
+        int base1 = y + (l->two_line ? UI_ROW2_BASE1 : UI_ROW_BASE);
+        if (row->dim) {
+            fb_text_prop(f, x, base1, ". ", UI_FONT_BODY, 1);
+            int dw = fb_text_width_prop(". ", UI_FONT_BODY);
+            x += dw;
+            max_w -= dw;
+        }
 
-        char line[2 * UI_LINE_CHARS + 3];
-        size_t p = 0;
-        if (row->dim) { line[p++] = '.'; line[p++] = ' '; }
-        size_t blen = strlen(body);
-        memcpy(line + p, body, blen);
-        p += blen;
-        line[p] = '\0';
-
-        /* Hard-split across the row's body lines: previews are transcript
-         * openings with no layout worth preserving, and a hard split shows
-         * the most characters (same rule as the settings values). */
-        for (int ln = 0; ln < nlines; ln++) {
-            size_t off = (size_t)ln * UI_LINE_CHARS;
-            if (off >= p && ln > 0) break;
-            size_t take = p - off;
-            if (take > UI_LINE_CHARS) take = UI_LINE_CHARS;
-            char seg[UI_LINE_CHARS + 1];
-            memcpy(seg, line + off, take);
-            seg[take] = '\0';
-            int ly = y + 3 + ln * UI_TEXT_LINE_H;
-            fb_text16(f, 2, ly, seg, 1);
-
-            /* Done rows are struck through rather than prefixed: a "[x] "
-             * marker would cost line budget, and the strike-through is
-             * what the completion gesture promises. Two rows thick so it
-             * survives partial-refresh ghosting. */
-            if (row->done && seg[0])
-                fb_fill(f, 2, ly + 7, fb_text16_width(seg), 2, 1);
+        if (!l->two_line) {
+            row_line(f, x, base1, row->text, max_w, row->done);
+        } else {
+            /* Hard-split per pixel across the row's two body lines:
+             * previews are transcript openings with no layout worth
+             * preserving, and a hard split shows the most characters
+             * (same rule as the settings values). Only the second line
+             * carries the ellipsis. */
+            int fit = fb_text_fit_prop(row->text, UI_FONT_BODY, max_w);
+            char seg[sizeof row->text];
+            memcpy(seg, row->text, (size_t)fit);
+            seg[fit] = '\0';
+            if (seg[0]) {
+                fb_text_prop(f, x, base1, seg, UI_FONT_BODY, 1);
+                if (row->done)
+                    fb_fill(f, x, base1 - 5,
+                            fb_text_width_prop(seg, UI_FONT_BODY), 2, 1);
+            }
+            const char *rest = row->text + fit;
+            while (*rest == ' ') rest++;        /* no leading gap on line 2 */
+            if (*rest)
+                row_line(f, x, y + UI_ROW2_BASE2, rest, max_w, row->done);
         }
 
         if (idx == l->cursor) fb_invert(f, 0, y, UI_W, row_h);
@@ -158,18 +166,27 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
 
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n'; }
 
-#define TEXT_LINE_CHARS UI_LINE_CHARS
+/* Longest body-line buffer: UI_TEXT_W px at the narrowest advance (3 px)
+ * is 65 characters. */
+#define WRAP_BUF 80
 
-/* Word-wraps `text` into TEXT_LINE_CHARS-wide lines (hard-breaking words
- * longer than a line), drawing only lines within [first_line, last_line)
- * at y = UI_STATUS_H + 4 + row*UI_TEXT_LINE_H. f may be NULL for a pure
- * count pass. Returns the total line count regardless of the requested
- * window, so callers can derive a page count. */
+static void wrap_emit(ui_fb_t *f, const char *line, int line_index,
+                      int first_line, int last_line) {
+    if (f && line_index >= first_line && line_index < last_line)
+        fb_text_prop(f, UI_MARGIN_X,
+                     UI_TEXT_FIRST_BASE + (line_index - first_line) * UI_TEXT_LINE_H,
+                     line, UI_FONT_BODY, 1);
+}
+
+/* Word-wraps `text` into UI_TEXT_W-px lines by measured width (hard-
+ * splitting words longer than a line), drawing only lines within
+ * [first_line, last_line) at the page baselines. f may be NULL for a
+ * pure count pass. Returns the total line count regardless of the
+ * requested window, so callers can derive a page count. */
 static int wrap_lines(ui_fb_t *f, const char *text, int first_line, int last_line) {
-    char line[TEXT_LINE_CHARS + 1];
-    int col = 0;
+    char line[WRAP_BUF];
+    size_t len = 0;
     int line_index = 0;
-    int y0 = UI_STATUS_H + 4;
 
     size_t i = 0;
     while (text[i]) {
@@ -182,30 +199,56 @@ static int wrap_lines(ui_fb_t *f, const char *text, int first_line, int last_lin
         size_t wpos = 0;
 
         while (wpos < wlen) {
-            int need_space = (col > 0) ? 1 : 0;
-            int avail = TEXT_LINE_CHARS - col - need_space;
-            if (avail <= 0) {
-                line[col] = '\0';
-                if (f && line_index >= first_line && line_index < last_line)
-                    fb_text16(f, 2, y0 + (line_index - first_line) * UI_TEXT_LINE_H,
-                              line, 1);
-                line_index++;
-                col = 0;
-                continue; /* re-evaluate need_space/avail with a fresh line */
-            }
             size_t remaining = wlen - wpos;
-            size_t take = remaining < (size_t)avail ? remaining : (size_t)avail;
-            if (need_space) line[col++] = ' ';
-            memcpy(line + col, text + wstart + wpos, take);
-            col += (int)take;
-            wpos += take;
+            size_t need_space = (len > 0) ? 1 : 0;
+            size_t room = sizeof line - 1 - len - need_space;
+            size_t take = remaining < room ? remaining : room;
+
+            if (take > 0) {
+                size_t oldlen = len;
+                if (need_space) line[len++] = ' ';
+                memcpy(line + len, text + wstart + wpos, take);
+                len += take;
+                line[len] = '\0';
+                if (fb_text_width_prop(line, UI_FONT_BODY) <= UI_TEXT_W) {
+                    wpos += take;
+                    if (wpos >= wlen) break;    /* word done, stay on line */
+                    /* buffer-full mid-word (width still fine): flush */
+                    wrap_emit(f, line, line_index, first_line, last_line);
+                    line_index++;
+                    len = 0;
+                    continue;
+                }
+                len = oldlen;                   /* too wide: revert */
+                line[len] = '\0';
+            }
+
+            if (len > 0) {
+                /* the word starts a fresh line instead */
+                wrap_emit(f, line, line_index, first_line, last_line);
+                line_index++;
+                len = 0;
+                continue;
+            }
+
+            /* fresh line, word chunk still too wide: hard split at the
+             * pixel budget (fit >= 1 guarantees progress) */
+            {
+                char tmp[WRAP_BUF];
+                size_t t = remaining < sizeof tmp - 1 ? remaining : sizeof tmp - 1;
+                memcpy(tmp, text + wstart + wpos, t);
+                tmp[t] = '\0';
+                int fit = fb_text_fit_prop(tmp, UI_FONT_BODY, UI_TEXT_W);
+                if (fit < 1) fit = 1;
+                tmp[fit] = '\0';
+                wrap_emit(f, tmp, line_index, first_line, last_line);
+                line_index++;
+                wpos += (size_t)fit;
+            }
         }
     }
-    if (col > 0) {
-        line[col] = '\0';
-        if (f && line_index >= first_line && line_index < last_line)
-            fb_text16(f, 2, y0 + (line_index - first_line) * UI_TEXT_LINE_H,
-                      line, 1);
+    if (len > 0) {
+        wrap_emit(f, line, line_index, first_line, last_line);
         line_index++;
     }
     return line_index;
@@ -230,10 +273,11 @@ void widget_banner(ui_fb_t *f, const char *text) {
     int y0 = UI_H - UI_BANNER_H;
     fb_fill(f, 0, y0, UI_W, UI_BANNER_H, 1);
 
-    /* One body line: UI_LINE_CHARS chars is what the strip holds, so the
-     * text is ellipsized to fit rather than wrapped (the dismiss gesture
-     * is a glance-and-clear interaction, not a reading surface). */
-    char line[UI_LINE_CHARS + 1];
-    ui_ellipsize(line, sizeof line, text, UI_LINE_CHARS);
-    fb_text16(f, 4, y0 + 5, line, 0);
+    /* One emphasis line -- a notification is a glance-and-clear
+     * interaction, not a reading surface -- ellipsized to the strip's
+     * measured budget rather than wrapped. */
+    char line[80];
+    fb_ellipsize_prop(line, sizeof line, text, UI_FONT_EMPH,
+                      UI_W - 2 * UI_BANNER_PAD);
+    fb_text_prop(f, UI_BANNER_PAD, y0 + UI_BANNER_BASE, line, UI_FONT_EMPH, 0);
 }

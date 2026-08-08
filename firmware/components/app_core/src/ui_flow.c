@@ -214,18 +214,19 @@ static void render_recordings(ui_flow_t *u, ui_fb_t *fb) {
     l->cursor = u->cursor;
     l->row_count = n;
     l->two_line = 1;   /* two body lines of transcript opening per row --
-                          ~2 * UI_LINE_CHARS chars of real content, the
-                          C7 round-3 density requirement */
+                          the C7 round-3 density requirement; the widget
+                          splits and ellipsizes per pixel */
     for (int i = 0; i < n && i < 32; i++) {
         sidecar_load(u->storage, s_rec_ids[i], &s_sc);
         if (s_sc.transcript[0]) {
-            ui_ellipsize(l->rows[i].text, sizeof l->rows[i].text, s_sc.transcript,
-                         2 * UI_LINE_CHARS);
+            /* copy as much opening as the row buffer holds: the buffer
+             * (ui_row_t.text) is sized past the two-line pixel budget,
+             * so the widget's measured ellipsis is always faithful */
+            str_copy(l->rows[i].text, sizeof l->rows[i].text, s_sc.transcript);
         } else if (strcmp(s_sc.state, "uploaded") == 0) {
             str_copy(l->rows[i].text, sizeof l->rows[i].text, "(pending)");
         } else {
-            /* the design's literal string: 14 chars fit the body line
-             * again (the scale-2 budget that forced "(not sent)" is gone) */
+            /* the design's literal string (fits one measured body line) */
             str_copy(l->rows[i].text, sizeof l->rows[i].text, "(not uploaded)");
         }
     }
@@ -238,37 +239,40 @@ static void render_entry(ui_flow_t *u, ui_fb_t *fb) {
     widget_text_page(fb, text, u->entry_page);
 }
 
-/* Draws `s` hard-wrapped at UI_LINE_CHARS chars across at most max_lines
- * scale-2 lines; when the tail still doesn't fit, the last line is
- * ellipsized (never clipped mid-glyph). Returns y advanced by the lines
- * used. Hard wrap, not word wrap: settings values (MAC, host) have no
- * useful word boundaries. */
-static int settings_lines(ui_fb_t *fb, int y, const char *s, int max_lines) {
+/* Draws `s` hard-split per measured pixel width across at most max_lines
+ * body lines; when the tail still doesn't fit, the last line is
+ * ellipsized (never clipped mid-glyph). Takes and returns the BASELINE,
+ * advanced by the lines used. Hard split, not word wrap: settings values
+ * (MAC, host) have no useful word boundaries. */
+static int settings_lines(ui_fb_t *fb, int baseline, const char *s, int max_lines) {
     size_t len = strlen(s), off = 0;
     for (int ln = 0; ln < max_lines && (off < len || ln == 0); ln++) {
-        char seg[UI_LINE_CHARS + 1];
-        if (ln == max_lines - 1 && len - off > UI_LINE_CHARS) {
-            ui_ellipsize(seg, sizeof seg, s + off, UI_LINE_CHARS);
+        char seg[80];
+        if (ln == max_lines - 1) {
+            fb_ellipsize_prop(seg, sizeof seg, s + off, UI_FONT_BODY, UI_TEXT_W);
             off = len;
         } else {
-            size_t take = len - off;
-            if (take > UI_LINE_CHARS) take = UI_LINE_CHARS;
+            size_t take = (size_t)fb_text_fit_prop(s + off, UI_FONT_BODY, UI_TEXT_W);
+            if (take > sizeof seg - 1) take = sizeof seg - 1;
+            if (take < 1 && off < len) take = 1;   /* progress guarantee */
             memcpy(seg, s + off, take);
             seg[take] = '\0';
             off += take;
         }
-        fb_text16(fb, 2, y, seg, 1);
-        y += UI_TEXT_LINE_H;
+        fb_text_prop(fb, UI_MARGIN_X, baseline, seg, UI_FONT_BODY, 1);
+        baseline += UI_TEXT_LINE_H;
+        if (off >= len) break;
     }
-    return y;
+    return baseline;
 }
 
 static void render_settings(ui_flow_t *u, ui_fb_t *fb) {
-    /* The MAC (17 chars) fits one 24-char body line now; only the bridge
-     * host (up to 63 chars) may still wrap onto a second line. Worst case
-     * 1+1+2+1 = 5 lines ends at y = 24 + 5*20 = 124..139, clear of the
-     * banner strip (y >= 174). */
-    int y = UI_STATUS_H + 4;
+    /* The MAC (17 chars, ~120 px) fits one measured body line; only the
+     * bridge host (up to 63 chars) may still split onto a second line.
+     * Worst case 1+1+2+1 = 5 baselines ends at UI_TEXT_FIRST_BASE +
+     * 4 * UI_TEXT_LINE_H = 108 (+4 descent), well clear of the banner
+     * strip (y >= 170). */
+    int y = UI_TEXT_FIRST_BASE;
     y = settings_lines(fb, y, u->info.mac, 1);
     y = settings_lines(fb, y, u->info.fw_version, 1);
     y = settings_lines(fb, y, u->info.bridge_host, 2);

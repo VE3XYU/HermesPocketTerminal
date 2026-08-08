@@ -3,41 +3,57 @@
 
 #include <stddef.h>
 #include "ui_fb.h"
+#include "ui_font_metrics.h"
 
 /* Layout constants are part of the contract.
  *
- * The panel is 1.54 inches across 200 px (~130 dpi): scale-1 8 px glyphs
- * are ~1.5 mm tall and were rejected as illegible on hardware, and the
- * square scale-2 8x8 glyphs (16 px wide) fit only 12 chars/line -- too
- * little information per line (C7 round-3 finding 5). Body text (list
- * items, transcripts, settings, the status strip) is therefore the
- * vendored Spleen 8x16 (fb_text16): the same 16 px height, half the
- * advance, 24 characters per line. Headlines ("Noted", "REC") stay on
- * the 8x8 font at scale UI_HEAD_SCALE = 24 px.
+ * The type ramp adopts the design of the shipped product on this exact
+ * panel (its ramp: FreeSans 9pt body at 14 px lines, FreeSansBold 12pt
+ * emphasis at 22 px, FreeSansBold 18pt hero at 31 px). Ours is generated
+ * from Liberation Sans (fonts/, SIL OFL 1.1) at cap-height parity:
  *
- * The vertical budget partitions exactly -- with the same arithmetic for
- * both row heights, since UI_ROW2_H = 2 * UI_ROW_H:
+ *   role  font          cap  asc  desc  used for
+ *   body  UI_FONT_BODY   12   14    4   rows, transcripts, settings, status
+ *   emph  UI_FONT_EMPH   17   18    5   list titles, banner
+ *   hero  UI_FONT_HERO   25   27    8   outcome words ("Noted"), "REC"
  *
- *     UI_STATUS_H + (1 title + UI_LIST_ROWS)  * UI_ROW_H  + UI_BANNER_H
- *   =     20      + 22 +      6 * 22                      +     26      = 200
- *     UI_STATUS_H + UI_ROW_H + UI_LIST2_ROWS * UI_ROW2_H + UI_BANNER_H
- *   =     20      + 22 +      3 * 44                      +     26      = 200
+ * Text positions are BASELINES (fb_text_prop). Widths are measured
+ * (fb_text_width_prop) and text is fitted per pixel, never per character
+ * count -- the monospace 24-char grid is gone.
  *
- * so the list (including the cursor-row inversion) can never paint into
- * the banner strip, and the banner never covers list content.
+ * The vertical budget partitions exactly, for both row grids
+ * (7 * UI_ROW_H == 3 * UI_ROW2_H == 126):
+ *
+ *   UI_STATUS_H + UI_TITLE_H + UI_LIST_ROWS  * UI_ROW_H  + UI_BANNER_H
+ * =     20      +     24     +   7 * 18                  +     30       = 200
+ *   UI_STATUS_H + UI_TITLE_H + UI_LIST2_ROWS * UI_ROW2_H + UI_BANNER_H
+ * =     20      +     24     +   3 * 42                  +     30       = 200
+ *
+ * so the list (cursor inversion included) can never paint into the
+ * banner strip and the banner never covers list content. Every baseline
+ * is chosen so the font's full ascent/descent band stays inside its row
+ * or strip -- _Static_asserts in widgets.c hold the arithmetic.
  */
-#define UI_BODY_W      8     /* body glyph advance (Spleen 8x16, fb_text16) */
-#define UI_BODY_H      16    /* body glyph height */
-#define UI_HEAD_SCALE  3     /* headlines: 8x8 font at scale 3 = 24 px */
-#define UI_LINE_CHARS  24    /* chars per body line: 24 * 8 = 192 px + margins */
-#define UI_TEXT_LINE_H 20    /* body text pitch: 16 px glyph + 4 px leading */
-#define UI_STATUS_H    20    /* status strip: y 0..19, body text, divider at y 19 */
-#define UI_ROW_H       22    /* one-line list row: body text, 3 px top/bottom pad */
-#define UI_ROW2_H      44    /* two-line list row (Recordings previews) */
-#define UI_BANNER_H    26    /* one body line, y 174..199 */
-#define UI_LIST_ROWS   6     /* visible one-line rows between title row and banner */
-#define UI_LIST2_ROWS  3     /* visible two-line rows between title row and banner */
-#define UI_TEXT_PAGE_LINES 7 /* transcript page: 7 lines x UI_LINE_CHARS chars */
+#define UI_MARGIN_X    2                        /* left/right text margin */
+#define UI_TEXT_W      (UI_W - 2 * UI_MARGIN_X) /* 196 px usable line width */
+#define UI_STATUS_H    20   /* status strip: y 0..19, divider at y 19 */
+#define UI_STATUS_BASE 14   /* body baseline inside the strip */
+#define UI_STATUS_GAP  6    /* px between status items */
+#define UI_TITLE_H     24   /* list title row (emphasis) */
+#define UI_TITLE_BASE  18   /* emphasis baseline rel. title-row top */
+#define UI_ROW_H       18   /* one-line list row (body); asc+desc == 18 */
+#define UI_ROW_BASE    14   /* body baseline rel. row top */
+#define UI_LIST_ROWS   7    /* visible one-line rows below the title row */
+#define UI_ROW2_H      42   /* two-line list row (Recordings previews) */
+#define UI_ROW2_BASE1  17   /* first body baseline rel. row top */
+#define UI_ROW2_BASE2  35   /* second body baseline (BASE1 + line pitch) */
+#define UI_LIST2_ROWS  3    /* visible two-line rows below the title row */
+#define UI_BANNER_H    30   /* inverted strip, y 170..199 (emphasis) */
+#define UI_BANNER_BASE 21   /* emphasis baseline rel. strip top */
+#define UI_BANNER_PAD  6    /* banner side padding */
+#define UI_TEXT_LINE_H 18   /* body text pitch (reference: 14; +4 breathing) */
+#define UI_TEXT_PAGE_LINES 8 /* transcript page: 8 pixel-wrapped body lines */
+#define UI_TEXT_FIRST_BASE (UI_STATUS_H + 2 + UI_FONT_BODY_ASC) /* page line 0 */
 
 typedef struct {
     int battery_pct;          /* -1 hides */
@@ -47,21 +63,26 @@ typedef struct {
 } ui_status_t;
 void widget_status_line(ui_fb_t *f, const ui_status_t *st);
 
-typedef struct { char text[64]; int done; int dim; } ui_row_t;
+/* Row text capacity covers the widest content a two-line row can ever
+ * draw: at the body font's narrowest advance (3 px) two 196 px lines
+ * hold at most 130 characters, so a 136-byte buffer means a byte-
+ * truncated copy still overflows the pixel budget and the ellipsis can
+ * never be lost to truncation. */
+typedef struct { char text[136]; int done; int dim; } ui_row_t;
 typedef struct {
     char title[48];
     ui_row_t rows[32]; int row_count;
     int cursor;               /* absolute index; widget scrolls the window */
-    int two_line;             /* 1: UI_LIST2_ROWS rows of two body lines each
-                                 (2 * UI_LINE_CHARS chars -- Recordings
+    int two_line;             /* 1: UI_LIST2_ROWS rows of two body lines
+                                 each, hard-split per pixel (Recordings
                                  transcript previews); 0: UI_LIST_ROWS
                                  one-line rows */
 } ui_list_t;
 void widget_list(ui_fb_t *f, const ui_list_t *l);
 
-/* Renders one page of wrapped body text (UI_LINE_CHARS chars per line,
- * UI_TEXT_PAGE_LINES lines per page). Returns total page count for the
- * given text. page is 0-based. */
+/* Renders one page of pixel-word-wrapped body text (UI_TEXT_W px per
+ * line, UI_TEXT_PAGE_LINES lines per page). Returns total page count for
+ * the given text. page is 0-based. */
 int widget_text_page(ui_fb_t *f, const char *text, int page);
 
 /* Page count only -- same wrap arithmetic as widget_text_page without a
@@ -69,6 +90,5 @@ int widget_text_page(ui_fb_t *f, const char *text, int page);
 int widget_text_pages(const char *text);
 
 void widget_banner(ui_fb_t *f, const char *text);   /* inverted strip at bottom */
-void ui_ellipsize(char *dst, size_t cap, const char *src, int max_chars);
 
 #endif
