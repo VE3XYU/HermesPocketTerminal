@@ -1463,11 +1463,15 @@ static void ui_session(wake_cause_t wc) {
 #define DEV_HEARTBEAT_MS    30000               /* heartbeat cadence while staying awake */
 #define DEV_IDLE_TIMEOUT_MS (10u * 60u * 1000u) /* ~10 min without input -> deep sleep */
 #define DEV_PWR_HOLD_MS     2000                /* PWR held this long -> deep sleep */
-#define DEV_BTN_DEBOUNCE_MS 60                  /* PWR-tap debounce: the same continuous
-                                                   re-sampling pattern as power_button_
-                                                   held_at_boot, at tap scale (3 polls).
-                                                   REC uses GEST_REC_HOLD_MS instead --
-                                                   it starts a recording, not a menu */
+#define DEV_BTN_DEBOUNCE_MS 60                  /* RELEASE debounce (C7 round 3, finding
+                                                   3): a press ends only after the button
+                                                   reads open for this long -- ~3 polls
+                                                   of the ~20 ms loop -- so contact
+                                                   bounce can neither split a press nor
+                                                   misclassify a hold. It is NOT a
+                                                   minimum press duration: any latched
+                                                   press classifies on its debounced
+                                                   release. */
 
 /* End-of-session behavior for development builds: stay awake with
  * USB-Serial-JTAG alive so the operator can keep iterating (flash, read
@@ -1475,20 +1479,32 @@ static void ui_session(wake_cause_t wc) {
  * killing the port.
  *
  * C7 finding C: buttons act here now (the operator could not record a
- * second capture without typing 'sleep' first). Outcomes:
- *   - REC held GEST_REC_HOLD_MS of continuous samples (the same sustained
+ * second capture without typing 'sleep' first). C7 round 3, finding 3:
+ * both buttons are EDGE-LATCHED on their first pressed sample and
+ * classified on a DEBOUNCED release -- the old code instead required the
+ * sampled press to reach a 60 ms minimum and silently discarded anything
+ * shorter (t_pwr_down_since = -1 on any open sample), so a quick natural
+ * tap, under-measured by up to one ~20 ms poll and reset outright by a
+ * single bounce-open sample, fell through with no log and no session.
+ * Outcomes:
+ *   - REC held GEST_REC_HOLD_MS since its press edge (the same sustained
  *     hold the UI session's gesture FSM demands, so a stray tap does not
- *     spin up a capture that can only end "Too short"): returns
- *     WAKE_REC_BUTTON -- the caller dispatches a capture session while the
- *     operator is still holding the button (hold-to-talk from this very
- *     press; s_linger_rec_press_ms carries the press time, so the
- *     press-to-record-start line record_capture logs includes this hold).
- *   - PWR tapped (>= debounce, released before DEV_PWR_HOLD_MS): returns
- *     WAKE_PWR_BUTTON -- the caller dispatches a UI session.
- *   - "sleep" + Enter, PWR held ~2 s (release waited so EXT1 doesn't
- *     bounce straight back into a boot), or DEV_IDLE_TIMEOUT_MS of
- *     idleness: deep sleep, never returns. The deep sleep arms the same
- *     sync-interval timer the release build would.
+ *     spin up a capture that can only end "Too short"; open glitches
+ *     shorter than DEV_BTN_DEBOUNCE_MS no longer restart the measurement):
+ *     returns WAKE_REC_BUTTON -- the caller dispatches a capture session
+ *     while the operator is still holding the button (hold-to-talk from
+ *     this very press; s_linger_rec_press_ms carries the press time, so
+ *     the press-to-record-start line record_capture logs includes this
+ *     hold). A REC release short of the hold resets the latch after the
+ *     release debounce.
+ *   - PWR pressed and released (debounced) before DEV_PWR_HOLD_MS -- ANY
+ *     such press, no minimum duration: returns WAKE_PWR_BUTTON -- the
+ *     caller dispatches a UI session. One natural tap = one session.
+ *   - "sleep" + Enter, PWR held ~2 s (fires while still held; release
+ *     waited so EXT1 doesn't bounce straight back into a boot), or
+ *     DEV_IDLE_TIMEOUT_MS of idleness: deep sleep, never returns. The
+ *     deep sleep arms the same sync-interval timer the release build
+ *     would.
  * All timing is wall-clock (esp_timer), never iteration-counted. */
 static wake_cause_t dev_linger(unsigned sleep_s) {
     ESP_LOGI(TAG, "staying awake for development; buttons live: hold REC = record, "
@@ -1499,8 +1515,10 @@ static wake_cause_t dev_linger(unsigned sleep_s) {
     size_t n = 0;
     int64_t t_last_input = esp_timer_get_time() / 1000;
     int64_t t_next_heartbeat = t_last_input + DEV_HEARTBEAT_MS;
-    int64_t t_pwr_down_since = -1;   /* -1 = button not currently pressed */
+    int64_t t_pwr_down_since = -1;   /* -1 = no latched press; else its press edge */
+    int64_t t_pwr_open_since = -1;   /* first open sample after a latched press */
     int64_t t_rec_down_since = -1;
+    int64_t t_rec_open_since = -1;
 
     for (;;) {
         /* console_getc() blocks in the driver up to CONSOLE_POLL_MS, so
@@ -1531,21 +1549,35 @@ static wake_cause_t dev_linger(unsigned sleep_s) {
          * threshold is the UI session's own hold-to-talk threshold
          * (GEST_REC_HOLD_MS, 350 ms) rather than the tap-scale debounce:
          * C7 round 2 -- at 60 ms a stray brush of the button span up a
-         * whole capture session that could only end "Too short". */
+         * whole capture session that could only end "Too short". The
+         * hold is measured from the latched press edge; a bounce-open
+         * shorter than DEV_BTN_DEBOUNCE_MS keeps the latch (finding 3's
+         * reliability standard applied here too). */
         if (board_btn_rec()) {
             t_last_input = now;
+            t_rec_open_since = -1;
             if (t_rec_down_since < 0) t_rec_down_since = now;
-            else if (now - t_rec_down_since >= GEST_REC_HOLD_MS) {
+            if (now - t_rec_down_since >= GEST_REC_HOLD_MS) {
                 s_linger_rec_press_ms = t_rec_down_since;
                 ESP_LOGI(TAG, "REC pressed in linger: starting a capture session");
                 return WAKE_REC_BUTTON;
             }
-        } else {
-            t_rec_down_since = -1;
+        } else if (t_rec_down_since >= 0) {
+            if (t_rec_open_since < 0) t_rec_open_since = now;
+            else if (now - t_rec_open_since >= DEV_BTN_DEBOUNCE_MS) {
+                t_rec_down_since = -1;   /* real release short of the hold */
+                t_rec_open_since = -1;
+            }
         }
 
+        /* PWR: edge-latched, classified on the debounced release. The
+         * 2 s deep-sleep hold fires while still held (below); therefore
+         * every press that ends before it -- with NO minimum duration --
+         * is a tap and opens the UI session. The old >= 60 ms sampled
+         * minimum silently ate quick natural taps (finding 3). */
         if (board_btn_pwr()) {
             t_last_input = now;
+            t_pwr_open_since = -1;
             if (t_pwr_down_since < 0) t_pwr_down_since = now;
             else if (now - t_pwr_down_since >= DEV_PWR_HOLD_MS) {
                 ESP_LOGI(TAG, "PWR held %d ms -- release the button to deep-sleep", DEV_PWR_HOLD_MS);
@@ -1553,15 +1585,15 @@ static wake_cause_t dev_linger(unsigned sleep_s) {
                 vTaskDelay(pdMS_TO_TICKS(100));   /* release bounce margin before arming EXT1 */
                 break;
             }
-        } else {
-            if (t_pwr_down_since >= 0 && now - t_pwr_down_since >= DEV_BTN_DEBOUNCE_MS) {
-                /* released short of the 2 s hold: a tap = UI session (the
-                 * button is already up, so ui_session's held-at-boot
-                 * provisioning probe cannot trigger) */
+        } else if (t_pwr_down_since >= 0) {
+            if (t_pwr_open_since < 0) t_pwr_open_since = now;
+            else if (now - t_pwr_open_since >= DEV_BTN_DEBOUNCE_MS) {
+                /* debounced release short of the 2 s hold: a tap = UI
+                 * session (the button is provably up, so ui_session's
+                 * held-at-boot provisioning probe cannot trigger) */
                 ESP_LOGI(TAG, "PWR tapped in linger: starting a UI session");
                 return WAKE_PWR_BUTTON;
             }
-            t_pwr_down_since = -1;   /* sub-debounce blip: ignore */
         }
 
         if (now >= t_next_heartbeat) {
