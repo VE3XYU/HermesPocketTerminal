@@ -835,6 +835,8 @@ static void run_sync(void) {
     ESP_LOGI(TAG, "sync r=%d uploads=%d notifs=%d acked=%d dash_changed=%d next=%ds",
              r, rep.uploads_retried, rep.notifs_fetched, rep.notifs_acked,
              rep.dashboard_changed, rep.sync_interval_s);
+    ESP_LOGI(TAG, "stack hwm after sync_cycle: %u bytes min free",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
 }
 
 /* ============================================================
@@ -965,6 +967,10 @@ static void session_sync_common(wake_cause_t wc) {
     htp_client_init(&s_cl, &s_tr, s_cfg.token);
     s_cl.battery_pct = board_battery_pct();
     ESP_LOGI(TAG, "battery=%d%% (X-Battery header)", s_cl.battery_pct);
+    /* C5 fix round 1: the overflow died before the teardown's high-water
+     * line could ever print, so log it at session milestones too. */
+    ESP_LOGI(TAG, "stack hwm after wifi: %u bytes min free",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     run_sync();
 }
 
