@@ -31,6 +31,14 @@ static void fresh(void) {
     sidecar_save(&st, &a); rec_index_append(&st, "c-old");
     sidecar_t b; sidecar_init(&b, "c-new");        /* not uploaded, no transcript */
     sidecar_save(&st, &b); rec_index_append(&st, "c-new");
+    /* newest capture on the card is a conversation turn ("hey hermes"):
+     * it must stay out of the Recordings list (protocol-level mode
+     * distinction via conversation_id, finding 4) while remaining on the
+     * card for sync/upload */
+    sidecar_t c; sidecar_init(&c, "c-conv");
+    str_copy(c.conversation_id, sizeof c.conversation_id, "conv-7");
+    str_copy(c.transcript, sizeof c.transcript, "words spoken to hermes");
+    sidecar_save(&st, &c); rec_index_append(&st, "c-conv");
 }
 
 int main(void) {
@@ -62,11 +70,20 @@ int main(void) {
     CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
     CHECK_EQ_INT(u.cursor, 0);
 
+    /* conversation-capture filter (finding 4): three captures on the card,
+     * two browsable -- the cursor wraps at 2, so "c-conv" (newest, but a
+     * conversation turn) is not in the list and cursor 0 is "c-new" */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.cursor, 1);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.cursor, 0);
+
     /* recordings render newest-first with placeholders */
     ui_flow_render(&u, &fb);
     CHECK(fb_count_black(&fb) > 0);
 
-    /* open entry (cursor 0 = c-new: not uploaded) -- partial, same policy */
+    /* open entry (cursor 0 = c-new, NOT the filtered c-conv) -- partial,
+     * same policy */
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_ENTRY);
     CHECK_EQ_STR(u.entry_id, "c-new");

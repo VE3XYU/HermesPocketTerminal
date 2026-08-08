@@ -6,8 +6,8 @@
 #include <stdio.h>
 
 /* Recordings browsing depth: how far back PWR-short can scroll. Bounded
- * by ui_list_t.rows[32] and rec_index_list()'s max <= 32 guard; five
- * scroll windows of UI_LIST_ROWS at the scale-2 row height. */
+ * by ui_list_t.rows[32] and rec_index_list()'s max <= 32 guard; ten
+ * scroll windows of UI_LIST2_ROWS two-line rows. */
 #define UI_FLOW_REC_CAP 30
 
 /* Flow scratch models: static, not stack (C5 stack ruling; see
@@ -29,6 +29,33 @@ void ui_flow_init(ui_flow_t *u, htp_client_t *c, port_storage_t *st, port_kv_t *
 
 /* ---- gesture helpers ---- */
 
+/* The browsable Recordings list: the raw index minus conversation
+ * captures (C7 round-3 finding 4 -- "if this device is a to-do list, why
+ * include the 'hey hermes' ones?"). The filter matches on the sidecar's
+ * conversation_id being non-empty, a protocol-level mode distinction
+ * stamped at capture time -- never on the transcript, so the terminal's
+ * content-blindness invariant holds. Filtered captures stay on the card
+ * and in every sync path (capture_pending_count and the retry scan read
+ * the raw index); they just don't clutter the list. The filter lives
+ * here in the list-build, not in rec_index: the storage query stays
+ * generic and the behavior is pure and host-tested. All three list
+ * consumers (cursor count, entry open, render) use this, so the cursor
+ * always addresses what is drawn. Depth note: the raw read is capped at
+ * UI_FLOW_REC_CAP before filtering, so heavy conversation use shortens
+ * the visible history rather than reading deeper -- same class as the
+ * Task 5 index cap. */
+static int rec_list_filtered(ui_flow_t *u, char ids[][64], int max) {
+    int n = rec_index_list(u->storage, ids, max);
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (sidecar_load(u->storage, ids[i], &s_sc) == 0 && s_sc.conversation_id[0])
+            continue;                       /* conversation turn: not listed */
+        if (kept != i) memcpy(ids[kept], ids[i], sizeof ids[0]);
+        kept++;
+    }
+    return kept;
+}
+
 /* Row count for the active screen's cursor (Dashboard items / Recordings
  * list). Entry paginates via entry_page (see entry_total_pages) instead. */
 static int active_row_count(ui_flow_t *u) {
@@ -36,7 +63,7 @@ static int active_row_count(ui_flow_t *u) {
         case SCR_DASHBOARD:
             return u->dash.item_count;
         case SCR_RECORDINGS:
-            return rec_index_list(u->storage, s_rec_ids, UI_FLOW_REC_CAP);
+            return rec_list_filtered(u, s_rec_ids, UI_FLOW_REC_CAP);
         default:
             return 1;
     }
@@ -109,7 +136,7 @@ ui_action_t ui_flow_gesture(ui_flow_t *u, gesture_t g, char out_path[96]) {
 
         case GEST_PWR_LONG: {
             if (u->screen == SCR_RECORDINGS) {
-                int n = rec_index_list(u->storage, s_rec_ids, UI_FLOW_REC_CAP);
+                int n = rec_list_filtered(u, s_rec_ids, UI_FLOW_REC_CAP);
                 if (n <= 0) return UIF_NONE;
                 int idx = u->cursor;
                 if (idx < 0 || idx >= n) idx = 0;
@@ -179,7 +206,7 @@ static void render_recordings(ui_flow_t *u, ui_fb_t *fb) {
      * append-only index outgrows that (~180 recordings at ~89 B/entry)
      * the NEWEST entries -- the ones this screen exists to show -- fall
      * past the cap and stop appearing. */
-    int n = rec_index_list(u->storage, s_rec_ids, UI_FLOW_REC_CAP);
+    int n = rec_list_filtered(u, s_rec_ids, UI_FLOW_REC_CAP);
 
     ui_list_t *l = &s_list;
     memset(l, 0, sizeof *l);
