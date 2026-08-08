@@ -520,6 +520,16 @@ static void present(int want_full) {
     if (!s_base_drawn || want_full) {
         epd_full(s_fb.px);
         s_base_drawn = 1;
+        /* Every ACTUAL full clears all ghosting, so the ghost-clear budget
+         * restarts here rather than at the (several) call sites that ask
+         * for one. C7 round 2: the base gate above promotes to full without
+         * any caller asking, so the counter used to carry a session's
+         * pre-sleep partials into the fresh screen and fire the first
+         * ghost-clear early. ui_flow_wants_full(UIF_REDRAW_FULL) is just
+         * the reset accessor for that counter; its return is the constant
+         * 1 and means nothing here. s_uif is zero-initialized, so this is
+         * safe on the pre-ensure_uif() paths (screen_fatal at entry). */
+        (void)ui_flow_wants_full(&s_uif, UIF_REDRAW_FULL);
     } else {
         epd_partial(s_fb.px);
     }
