@@ -102,6 +102,8 @@ static sidecar_t s_sc, s_sc_next;
 static int s_pending_cache = -1;    /* memoized capture_pending_count(); -1 = recount.
                                        Invalidated wherever an upload state changes, so
                                        cursor-move redraws don't re-walk the SD index. */
+static int s_sleep_now;             /* menu "Sleep" selected: skip the dev linger and
+                                       deep-sleep as soon as the session tears down */
 static int64_t s_linger_rec_press_ms = -1;  /* C7 finding C: ms-since-boot of the REC
                                                press that exited the dev linger, so
                                                record_capture can log press-to-record-
@@ -544,6 +546,16 @@ static int pending_uploads(void) {
     return s_pending_cache;
 }
 
+/* One invalidation point for both sidecar-derived memos: the pending-
+ * upload count above and ui_flow's Recordings cache (filtered ids +
+ * preview lines + open-entry transcript). They go stale together --
+ * anything that writes a sidecar or the rec index (new capture,
+ * capture_run, sync retry/backfill) invalidates both (C7 round 5). */
+static void invalidate_capture_caches(void) {
+    s_pending_cache = -1;
+    ui_flow_rec_invalidate();
+}
+
 static void status_line_fill(ui_status_t *stt) {
     memset(stt, 0, sizeof *stt);
     stt->battery_pct = board_battery_pct();
@@ -909,7 +921,7 @@ static int record_capture(sidecar_t *sc, const char *conversation_id,
         str_copy(sc->conversation_id, sizeof sc->conversation_id, conversation_id);
     sidecar_save(&s_st, sc);
     rec_index_append(&s_st, id);
-    s_pending_cache = -1;   /* one more not_uploaded sidecar on the card */
+    invalidate_capture_caches();   /* one more not_uploaded sidecar on the card */
     return 0;
 }
 
@@ -1097,10 +1109,10 @@ static void run_sync(sync_report_t *out) {
      * before the render callbacks run, so their status headers must
      * recount; step 4 (backfill) can re-mark an unknown capture as
      * not_uploaded after the renders. */
-    s_pending_cache = -1;
+    invalidate_capture_caches();
     s_dash_painted = 0;   /* set by render_dashboard_cb only if it paints */
     int r = sync_cycle(&scx, out);
-    s_pending_cache = -1;
+    invalidate_capture_caches();
     ESP_LOGI(TAG, "sync r=%d uploads=%d notifs=%d acked=%d dash_changed=%d painted=%d next=%ds",
              r, out->uploads_retried, out->notifs_fetched, out->notifs_acked,
              out->dashboard_changed, s_dash_painted, out->sync_interval_s);
@@ -1166,7 +1178,7 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
 
         awake_cap_arm(AWAKE_CAP_NET_S);   /* upload retries + poll window */
         capture_outcome_t out = capture_run(cx, &s_sc);
-        s_pending_cache = -1;
+        invalidate_capture_caches();
         if (out == CAPTURE_REPLY_READY) continue;
         show_outcome(out);
         break;
@@ -1219,7 +1231,7 @@ static void capture_session_run(int from_ui) {
     };
     awake_cap_arm(AWAKE_CAP_NET_S);   /* upload retries + poll window */
     capture_outcome_t out = capture_run(&cx, &s_sc);
-    s_pending_cache = -1;             /* capture_run moved the upload state */
+    invalidate_capture_caches();      /* capture_run moved the upload state */
     if (out == CAPTURE_REPLY_READY)
         play_reply_and_follow_up(&cx);
     else
@@ -1331,6 +1343,14 @@ static void populate_settings_info(ui_settings_info_t *si) {
     si->sync_interval_s = (int)next_sync_interval();
 }
 
+/* Instant sound on an accepted press (C7 round 5). Runs BEFORE the
+ * redraw (a partial blocks 300-500 ms) and before any network call, so
+ * the operator hears the press land even while the ink is still moving.
+ * audio_click() itself no-ops silently when the codec never came up. */
+static void play_click(ui_click_t c) {
+    if (c != UI_CLICK_NONE) audio_click(c == UI_CLICK_SELECT);
+}
+
 /* PWR wake: paint the cached dashboard immediately, join Wi-Fi in the
  * background, sync once it lands, and serve gestures until 30 s of
  * idleness. Single-threaded display throughout: the only other panel
@@ -1349,7 +1369,22 @@ static void ui_session(wake_cause_t wc) {
     populate_settings_info(&s_uif.info);
     load_cached_dashboard();
 
-    flow_redraw(1);   /* instant dashboard from the SD snapshot */
+    ui_flow_rest(&s_uif);   /* every UI session opens on the resting dashboard
+                               (display state; the first PWR tap opens the menu) */
+    flow_redraw(1);         /* instant dashboard from the SD snapshot */
+    ESP_LOGI(TAG, "ui: first frame done at %lld ms since boot",
+             (long long)(esp_timer_get_time() / 1000));
+
+    /* Codec up ONCE for the whole session so every click is instant
+     * (~300 ms bring-up, paid after the first frame so it never delays
+     * the paint; the common teardown closes it). Bonus: a capture or
+     * playback started from this session skips its own codec bring-up.
+     * Failure degrades silently -- no clicks, UI fully functional. */
+    if (audio_init() == 0)
+        ESP_LOGI(TAG, "ui: clicks ready at %lld ms since boot",
+                 (long long)(esp_timer_get_time() / 1000));
+    else
+        ESP_LOGW(TAG, "ui: codec unavailable; running without clicks");
 
     /* 0 = up, 1 = joining, -1 = down/none. Second entry point for the
      * async join: s_bg_wifi_started tells capture_session not to start
@@ -1420,6 +1455,8 @@ static void ui_session(wake_cause_t wc) {
 
         char path[96];
         ui_action_t a = ui_flow_gesture(&s_uif, ge, path);
+        play_click(s_uif.click);   /* instant feedback, before the network or
+                                      the 300-500 ms partial refresh runs */
         switch (a) {
         case UIF_START_CAPTURE:
             awake_cap_arm(AWAKE_CAP_REC_S);
@@ -1428,12 +1465,40 @@ static void ui_session(wake_cause_t wc) {
         case UIF_PLAY_WAV: {
             char fs[IDF_SD_PATH_MAX];
             awake_cap_arm(AWAKE_CAP_REC_S);   /* a recording can run 120 s */
-            if (idf_ports_sd_path(path, fs, sizeof fs) == 0 && audio_init() == 0) {
-                audio_play_wav(fs, rec_held, NULL);   /* REC press stops it */
-                audio_deinit();
-            }
+            if (idf_ports_sd_path(path, fs, sizeof fs) == 0 && audio_init() == 0)
+                audio_play_wav(fs, rec_held, NULL);   /* REC press stops it;
+                                                         codec stays open for the
+                                                         session's clicks */
+            /* A stopping REC press must not resurface as the next loop
+             * pass's REC tap and immediately replay the entry: wait out
+             * the release, then drop the press from the FSM. */
+            while (board_btn_rec()) vTaskDelay(pdMS_TO_TICKS(20));
+            gesture_init(&g);
             break;
         }
+        case UIF_COMPLETE:
+            /* Click first (played above), THEN the POST: feedback must not
+             * wait on a network round-trip. No change -> no repaint (the
+             * click already answered the press; the missing strike says
+             * the complete didn't land). */
+            if (ui_flow_complete_cursor(&s_uif)) {
+                flow_redraw(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
+                save_dashboard_cache(&s_uif.dash);   /* keep the strike-through
+                                                        across sleeps: the new rev
+                                                        will read "unchanged" */
+            } else {
+                ESP_LOGW(TAG, "complete did not land; leaving the row unmarked");
+            }
+            break;
+        case UIF_SLEEP:
+            /* Menu "Sleep": the flow already rested to the dashboard --
+             * paint it (that image is what the panel keeps through sleep),
+             * then end the session straight into deep sleep, dev linger
+             * bypassed. */
+            ESP_LOGI(TAG, "sleep selected from the menu");
+            flow_redraw(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
+            s_sleep_now = 1;
+            return;
         case UIF_POWER_OFF:
             /* The "Hold to power off..." countdown message was the
              * transient feedback; the visible wipe to white is the
@@ -1447,20 +1512,20 @@ static void ui_session(wake_cause_t wc) {
                                     repaints it) */
             break;
         case UIF_REDRAW_PARTIAL:
-        case UIF_REDRAW_FULL: {
-            int dash_tap = (ge == GEST_REC_SHORT && s_uif.screen == SCR_DASHBOARD);
+        case UIF_REDRAW_FULL:
             flow_redraw(ui_flow_wants_full(&s_uif, a));
-            if (dash_tap)
-                save_dashboard_cache(&s_uif.dash);   /* keep the strike-through
-                                                        across sleeps: the new rev
-                                                        will read "unchanged" */
             break;
-        }
         default:
             break;
         }
     }
     ESP_LOGI(TAG, "ui idle %d s; sleeping", UI_IDLE_TIMEOUT_MS / 1000);
+    /* The panel's retained image through sleep is the resting dashboard,
+     * not whatever menu/list the operator idled out of (round-3 finding
+     * 2's rule: what is displayed at sleep is displayed forever). One
+     * partial, skipped when the screen is already at rest. */
+    if (ui_flow_rest(&s_uif))
+        flow_redraw(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
 }
 
 /* ============================================================
@@ -1517,7 +1582,7 @@ static void ui_session(wake_cause_t wc) {
  * All timing is wall-clock (esp_timer), never iteration-counted. */
 static wake_cause_t dev_linger(unsigned sleep_s) {
     ESP_LOGI(TAG, "staying awake for development; buttons live: hold REC = record, "
-                  "tap PWR = menu; 'sleep' + Enter or hold PWR ~2s = deep sleep now");
+                  "tap PWR = dashboard (tap again = menu); 'sleep' + Enter or hold PWR ~2s = deep sleep now");
     ESP_LOGI(TAG, "auto deep-sleep after %u min idle", (unsigned)(DEV_IDLE_TIMEOUT_MS / 60000u));
 
     char line[16];
@@ -1658,6 +1723,13 @@ void app_main(void) {
     for (;;) {
         awake_cap_arm(wc == WAKE_REC_BUTTON ? AWAKE_CAP_REC_S : AWAKE_CAP_BASE_S);
 
+        /* Button wakes always draw (glyph or dashboard): gate the EPD rail
+         * on now so its 100 ms settle overlaps the SD mount + config load
+         * instead of serializing inside epd_init() (C7 round 5 first-frame
+         * shave; epd_init sleeps only the unelapsed remainder). Timer/cold
+         * wakes stay silent-by-default and keep the rail down. */
+        if (wc == WAKE_REC_BUTTON || wc == WAKE_PWR_BUTTON) board_rail_epd(1);
+
         if (wc == WAKE_REC_BUTTON)      capture_session(0);   /* fast path first */
         else if (wc == WAKE_PWR_BUTTON) ui_session(wc);
         else                            sync_session(wc);     /* timer + cold */
@@ -1680,6 +1752,14 @@ void app_main(void) {
                  (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
         unsigned sleep_s = next_sync_interval();
+        if (s_sleep_now) {
+            /* Menu "Sleep": the operator asked for sleep NOW -- skip the
+             * dev linger, same deep sleep the release build takes. */
+            s_sleep_now = 0;
+            ESP_LOGI(TAG, "menu sleep: entering deep sleep for %u s (wake: REC/PWR button or timer)",
+                     sleep_s);
+            board_deep_sleep(sleep_s);
+        }
 #if HTP_DEV_LINGER
         wc = dev_linger(sleep_s);   /* deep-sleeps (never returns), or hands back
                                        a button press to dispatch as a session */
