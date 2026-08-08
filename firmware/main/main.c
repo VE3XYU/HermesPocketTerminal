@@ -1046,10 +1046,28 @@ static int render_notifications_cb(void *ui_ctx, const htp_notifications_t *n) {
     str_copy(s_uif.banner, sizeof s_uif.banner, n->items[pick].text);
 
     if (s_base_drawn) {
-        /* The framebuffer already holds this session's screen (the capture
-         * outcome, or a dashboard drawn earlier): stamp the banner strip over
-         * it instead of clearing. Same pixels a full ui_flow_render would put
-         * there -- widget_banner is the last thing it draws -- minus the wipe. */
+        /* The framebuffer already holds this session's screen: stamp the
+         * banner strip over it instead of clearing -- same pixels a full
+         * ui_flow_render would put there -- widget_banner is the last thing
+         * render_dashboard() draws -- minus the wipe. C7 round 6 fix round:
+         * that y 170-199 strip is only RESERVED blank space by design on
+         * SCR_DASHBOARD (both resting, cursor < 0, and opened, cursor >= 0
+         * -- ui_flow.h: SCR_DASHBOARD doubles as both). Since round 6's
+         * layout, the same rows are real content on Recordings (row 3's
+         * second preview line) and on an entry page (line 7); stamping
+         * there mid-session would erase a line of text until the next
+         * repaint. Skip the draw off-dashboard -- the banner text stays in
+         * the model (already copied above) and ui_flow_render() paints it
+         * (screen-aware, via render_dashboard()) whenever the operator next
+         * lands on the dashboard. This does not touch sync.c's ack gate
+         * (keyed on s_notifs.count > 0 and this callback returning 0, not
+         * on whether anything was painted) or the urgent chime (fired by
+         * sync.c before this callback even runs). */
+        if (s_uif.screen != SCR_DASHBOARD) {
+            ESP_LOGI(TAG, "notification banner deferred: screen=%d owns that strip",
+                     (int)s_uif.screen);
+            return 0;
+        }
         widget_banner(&s_fb, s_uif.banner);
     } else {
         /* First draw of the session: the framebuffer is blank and the panel's
