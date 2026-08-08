@@ -939,6 +939,17 @@ static void flow_redraw(int want_full) {
     present(want_full);
 }
 
+/* 1 when render_dashboard_cb actually put pixels on the panel during the
+ * sync_cycle that just ran. Reset in run_sync() before every cycle. C7
+ * round 2: the callers below used to guard their status-strip refresh on
+ * sync_report_t.dashboard_changed, i.e. on "the fetch returned a new rev",
+ * which stopped implying "the screen was repainted" the moment finding B
+ * added content-diff suppression -- a new rev carrying identical content
+ * paints nothing, so guarding on it re-opened C6's stale "Saved, will
+ * upload later" header in exactly that corner. Guard on what was painted,
+ * not on what changed. */
+static int s_dash_painted;
+
 static int render_dashboard_cb(void *ui_ctx, const htp_dashboard_t *d) {
     (void)ui_ctx;
     /* C7 finding B: the bridge's rev is a content hash that the agent's
@@ -960,6 +971,7 @@ static int render_dashboard_cb(void *ui_ctx, const htp_dashboard_t *d) {
     status_line_fill(&s_uif.status);
     ui_flow_render(&s_uif, &s_fb);
     present(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
+    s_dash_painted = 1;   /* this paint carried a fresh status header */
     return 0;
 }
 
@@ -1043,11 +1055,12 @@ static void run_sync(sync_report_t *out) {
      * recount; step 4 (backfill) can re-mark an unknown capture as
      * not_uploaded after the renders. */
     s_pending_cache = -1;
+    s_dash_painted = 0;   /* set by render_dashboard_cb only if it paints */
     int r = sync_cycle(&scx, out);
     s_pending_cache = -1;
-    ESP_LOGI(TAG, "sync r=%d uploads=%d notifs=%d acked=%d dash_changed=%d next=%ds",
+    ESP_LOGI(TAG, "sync r=%d uploads=%d notifs=%d acked=%d dash_changed=%d painted=%d next=%ds",
              r, out->uploads_retried, out->notifs_fetched, out->notifs_acked,
-             out->dashboard_changed, out->sync_interval_s);
+             out->dashboard_changed, s_dash_painted, out->sync_interval_s);
     ESP_LOGI(TAG, "stack hwm after sync_cycle: %u bytes min free",
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 }
@@ -1234,8 +1247,11 @@ static void sync_session(wake_cause_t wc) {
     int pend_before = pending_uploads();
     sync_report_t rep;
     run_sync(&rep);
+    /* Guarded on what was painted, not on rep.dashboard_changed: a changed
+     * rev whose content is identical repaints nothing (C7 finding B), and
+     * that case still needs this screen. */
     if ((rep.uploads_retried > 0 || pending_uploads() != pend_before) &&
-        !rep.dashboard_changed)
+        !s_dash_painted)
         screen_status(pending_uploads() == 0 ? "Uploaded" : "Upload retried");
 }
 
@@ -1308,12 +1324,14 @@ static void ui_session(wake_cause_t wc) {
                 s_uif.info.sync_interval_s = (int)next_sync_interval();
                 /* Upload-state changes count as changes: refresh the
                  * header's pending count even when nothing else redrew.
-                 * Guarded like sync_session's twin -- when the dashboard
-                 * did change, render_dashboard_cb already painted the
-                 * fresh screen (with the fresh header) during run_sync(),
-                 * so this would be a redundant partial refresh. */
+                 * Guarded like sync_session's twin -- when
+                 * render_dashboard_cb actually painted during run_sync()
+                 * the fresh screen already carries the fresh header, so
+                 * this would be a redundant partial refresh. A changed rev
+                 * that painted NOTHING (identical content, finding B) does
+                 * still need it. */
                 if ((rep.uploads_retried > 0 || pending_uploads() != pend_before) &&
-                    !rep.dashboard_changed)
+                    !s_dash_painted)
                     flow_redraw(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
                 idle_t0 = s_ck.mono_ms(s_ck.ctx);   /* sync time isn't idle time */
             }
