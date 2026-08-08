@@ -36,6 +36,8 @@ static int mount(bool format_if_mount_failed) {
     esp_err_t err = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot, &mount_cfg, &s_card);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mount failed: %s", esp_err_to_name(err));
+        s_card = NULL;   /* a failed mount never writes out_card, but the
+                            invariant below must hold unconditionally */
         return -1;
     }
 
@@ -43,6 +45,18 @@ static int mount(bool format_if_mount_failed) {
     if (stat("/sdcard/rec", &st) != 0) {
         if (mkdir("/sdcard/rec", 0777) != 0 && errno != EEXIST) {
             ESP_LOGE(TAG, "mkdir /sdcard/rec failed: errno=%d", errno);
+            /* The mount itself succeeded, so s_card is set -- and
+             * board_sd_mount()'s idempotent early-return would hand the
+             * NEXT caller (a linger-launched session) a success for a card
+             * that has no recordings directory, skipping the provisioning /
+             * format offer this failure is supposed to trigger. Undo the
+             * mount so s_card keeps meaning exactly "mounted and ready"
+             * (same unmount pairing as board_sd_unmount_and_format(), and
+             * likewise dropping the pointer whatever the unmount returns). */
+            esp_err_t uerr = esp_vfs_fat_sdcard_unmount("/sdcard", s_card);
+            if (uerr != ESP_OK)
+                ESP_LOGE(TAG, "unmount after mkdir failure: %s", esp_err_to_name(uerr));
+            s_card = NULL;
             return -1;
         }
     }
