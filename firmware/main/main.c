@@ -1134,7 +1134,14 @@ static void show_outcome(capture_outcome_t out) {
  * then holds a 30 s hold-to-talk window; GEST_REC_HOLD_START records a
  * follow-up into the same conversation (sc.conversation_id carried into
  * the new sidecar before capture_run) and loops while replies keep
- * coming. */
+ * coming. A PWR TAP ends the conversation immediately (C7 round 6,
+ * finding 2): same debounced-release classification as everywhere
+ * (gesture_feed), same outcome screen the window timeout draws. Only the
+ * tap ends it -- a hold classifies as GEST_PWR_LONG on release and is
+ * still swallowed, so a 2 s hold keeps meaning "sleep" in the linger the
+ * operator lands in right after "Done", exactly as before. This window
+ * loop is main.c-only (the pure part -- tap classification -- is
+ * host-tested in test_gesture); its behavior rides the target build. */
 static void play_reply_and_follow_up(capture_ctx_t *cx) {
     for (;;) {
         /* One conversation turn: playback + 30 s window + one recording. */
@@ -1147,15 +1154,23 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
         gesture_fsm_t g;
         gesture_init(&g);
         unsigned t0 = s_ck.mono_ms(s_ck.ctx);
-        int follow = 0;
+        int follow = 0, ended = 0;
         while (s_ck.mono_ms(s_ck.ctx) - t0 < FOLLOW_UP_WINDOW_MS) {
             gesture_t ev = gesture_feed(&g, board_btn_rec(), board_btn_pwr(),
                                         s_ck.mono_ms(s_ck.ctx));
             if (ev == GEST_REC_HOLD_START) { follow = 1; break; }
+            if (ev == GEST_PWR_SHORT)     { ended = 1; break; }
             board_delay_ms(20);
         }
         if (!follow) {
-            ESP_LOGI(TAG, "follow-up window closed");
+            if (ended) {
+                ESP_LOGI(TAG, "conversation ended by PWR tap");
+                audio_click(1);   /* select click BEFORE the 300-500 ms
+                                     partial paints; silent no-op if the
+                                     codec never came up */
+            } else {
+                ESP_LOGI(TAG, "follow-up window closed");
+            }
             /* Resting screen: without this the panel keeps whatever the
              * conversation left up (REC glyph / "Uploaded") forever. */
             screen_status_transcript("Done", s_sc.transcript);
