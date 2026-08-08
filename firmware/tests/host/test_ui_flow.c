@@ -69,6 +69,11 @@ int main(void) {
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_FULL);
     CHECK_EQ_INT(u.screen, SCR_ENTRY);
     CHECK_EQ_STR(u.entry_id, "c-new");
+    /* paging: "(no transcript yet)" wraps to 3 scale-2 lines, well inside
+     * one UI_TEXT_PAGE_LINES-line page, so PWR-short wraps back to page 0 */
+    CHECK_EQ_INT(widget_text_pages("(no transcript yet)"), 1);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.entry_page, 0);
     /* play from entry */
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_PLAY_WAV);
     CHECK_EQ_STR(path, "/rec/c-new.wav");
@@ -79,6 +84,20 @@ int main(void) {
     /* settings via cycle; capture and power-off pass through from anywhere */
     ui_flow_gesture(&u, GEST_PWR_DOUBLE, path);
     CHECK_EQ_INT(u.screen, SCR_SETTINGS);
+    /* settings render: MAC and host wrap at UI_LINE_CHARS; everything
+     * stays above the banner strip (scale-2 budget: 6 lines max) */
+    str_copy(u.info.mac, sizeof u.info.mac, "AA:BB:CC:DD:EE:FF");
+    str_copy(u.info.fw_version, sizeof u.info.fw_version, "fw-test");
+    str_copy(u.info.bridge_host, sizeof u.info.bridge_host, "bridge.example.net:8787");
+    u.info.sync_interval_s = 600;
+    ui_flow_render(&u, &fb);
+    CHECK(fb_count_black(&fb) > 0);
+    {
+        int banner_ink = 0;
+        for (int y = UI_H - UI_BANNER_H; y < UI_H; y++)
+            for (int x = 0; x < UI_W; x++) banner_ink += fb_get(&fb, x, y);
+        CHECK_EQ_INT(banner_ink, 0);
+    }
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_HOLD_START, path), UIF_START_CAPTURE);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_OFF, path), UIF_POWER_OFF);
 
