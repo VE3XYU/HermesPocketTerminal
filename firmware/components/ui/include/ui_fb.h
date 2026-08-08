@@ -51,6 +51,14 @@ int fb_text_width_prop(const char *s, ui_font_id_t font);
 /* Longest prefix (in bytes) whose measured width fits max_w. */
 int fb_text_fit_prop(const char *s, ui_font_id_t font, int max_w);
 
+/* Word-wrap break point (C7 round 6): the byte count of one rendered
+ * line of at most max_w px, backed off to the LAST BLANK THAT FITS when
+ * the pixel cut would land mid-word. Only a single word wider than the
+ * whole line is cut at the pixel budget (hard break). Returns >= 1 for
+ * a non-empty s (progress guarantee); the caller skips leading blanks
+ * before starting the next line. */
+int fb_wrap_break_prop(const char *s, ui_font_id_t font, int max_w);
+
 /* Copies src to dst whole when it fits max_w px; otherwise the longest
  * prefix such that prefix + "..." fits, with the "..." appended -- the
  * ellipsis is measured, never assumed. dst never exceeds cap bytes. */

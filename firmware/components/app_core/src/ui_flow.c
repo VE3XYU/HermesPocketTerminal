@@ -373,11 +373,12 @@ static void render_entry(ui_flow_t *u, ui_fb_t *fb) {
     widget_text_page(fb, entry_text(u), u->entry_page);
 }
 
-/* Draws `s` hard-split per measured pixel width across at most max_lines
+/* Draws `s` split per measured pixel width across at most max_lines
  * body lines; when the tail still doesn't fit, the last line is
  * ellipsized (never clipped mid-glyph). Takes and returns the BASELINE,
- * advanced by the lines used. Hard split, not word wrap: settings values
- * (MAC, host) have no useful word boundaries. */
+ * advanced by the lines used. Splits at word boundaries when the value
+ * has any (fb_wrap_break_prop, C7 round 6); space-less values (MAC,
+ * host) hard-split at the pixel budget exactly as before. */
 static int settings_lines(ui_fb_t *fb, int baseline, const char *s, int max_lines) {
     size_t len = strlen(s), off = 0;
     for (int ln = 0; ln < max_lines && (off < len || ln == 0); ln++) {
@@ -386,12 +387,12 @@ static int settings_lines(ui_fb_t *fb, int baseline, const char *s, int max_line
             fb_ellipsize_prop(seg, sizeof seg, s + off, UI_FONT_BODY, UI_TEXT_W);
             off = len;
         } else {
-            size_t take = (size_t)fb_text_fit_prop(s + off, UI_FONT_BODY, UI_TEXT_W);
+            size_t take = (size_t)fb_wrap_break_prop(s + off, UI_FONT_BODY, UI_TEXT_W);
             if (take > sizeof seg - 1) take = sizeof seg - 1;
-            if (take < 1 && off < len) take = 1;   /* progress guarantee */
             memcpy(seg, s + off, take);
             seg[take] = '\0';
             off += take;
+            while (s[off] == ' ') off++;           /* line 2 starts on a word */
         }
         fb_text_prop(fb, UI_MARGIN_X, baseline, seg, UI_FONT_BODY, 1);
         baseline += UI_TEXT_LINE_H;

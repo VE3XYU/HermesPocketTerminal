@@ -146,6 +146,41 @@ int main(void) {
     CHECK(fb_count_black(&fb) > 0);
     CHECK(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H) > 0);
 
+    /* two-line previews break at WORD boundaries (round 6, the photo-
+     * verified "buy a ne / w computer" failure): line 1 ends at the last
+     * space that fits -- no partial-word ink past it -- and the rest
+     * lands on line 2 */
+    {
+        const char *txt = "Remind me to buy a new computer please";
+        ui_list_t wbl = { .row_count = 1, .cursor = -1, .two_line = 1 };
+        strcpy(wbl.title, "Recordings");
+        strcpy(wbl.rows[0].text, txt);
+        int br = fb_wrap_break_prop(txt, UI_FONT_BODY, UI_TEXT_W);
+        CHECK(br < (int)strlen(txt));            /* it does wrap */
+        CHECK_EQ_INT(txt[br], ' ');              /* and on a boundary */
+        char l1[64];
+        memcpy(l1, txt, (size_t)br); l1[br] = '\0';
+        int w1 = fb_text_width_prop(l1, UI_FONT_BODY);
+        int bh = UI_FONT_BODY_ASC + UI_FONT_BODY_DESC;
+        fb_clear(&fb);
+        widget_list(&fb, &wbl);
+        int b1_y = r0_y + UI_ROW2_BASE1 - UI_FONT_BODY_ASC;
+        CHECK(region_ink(UI_MARGIN_X, b1_y, w1, bh) > 0);
+        /* the old hard split painted "ne" past the last space -- banned */
+        CHECK_EQ_INT(region_ink(UI_MARGIN_X + w1, b1_y,
+                                UI_W - UI_MARGIN_X - w1, bh), 0);
+        CHECK(region_ink(0, r0_y + UI_ROW2_BASE2 - UI_FONT_BODY_ASC,
+                         UI_W, bh) > 0);         /* rest continued on line 2 */
+
+        /* a single 30-char word still hard-breaks onto line 2 */
+        strcpy(wbl.rows[0].text, "abcdefghijklmnopqrstuvwxyzabcd");
+        fb_clear(&fb);
+        widget_list(&fb, &wbl);
+        CHECK(region_ink(0, b1_y, UI_W, bh) > 0);
+        CHECK(region_ink(0, r0_y + UI_ROW2_BASE2 - UI_FONT_BODY_ASC,
+                         UI_W, bh) > 0);
+    }
+
     /* short two-line rows draw only one line: the second band stays empty */
     ui_list_t two_short = { .row_count = 2, .cursor = 1, .two_line = 1 };
     strcpy(two_short.title, "Recordings");

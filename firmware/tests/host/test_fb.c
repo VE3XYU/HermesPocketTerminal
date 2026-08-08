@@ -143,5 +143,32 @@ int main(void) {
     fb_text_prop(&fb, -30, 5, "clip", UI_FONT_HERO, 1);
     fb_text_prop(&fb, 190, 199, "clip", UI_FONT_HERO, 1);
     CHECK(fb_count_black(&fb) >= 0);
+
+    /* word-boundary wrap break (round 6): a pixel cut that lands mid-word
+     * backs off to the last space that fits */
+    {
+        const char *s = "Remind me to buy a new computer";
+        /* budget cuts inside "new": the fit prefix ends "...a ne" */
+        int w_cut = fb_text_width_prop("Remind me to buy a ne", UI_FONT_BODY);
+        CHECK_EQ_INT(fb_text_fit_prop(s, UI_FONT_BODY, w_cut),
+                     (int)strlen("Remind me to buy a ne"));
+        CHECK_EQ_INT(fb_wrap_break_prop(s, UI_FONT_BODY, w_cut),
+                     (int)strlen("Remind me to buy a"));
+        /* whole string fits: no break at all */
+        int w_all = fb_text_width_prop(s, UI_FONT_BODY);
+        CHECK_EQ_INT(fb_wrap_break_prop(s, UI_FONT_BODY, w_all), (int)strlen(s));
+        /* cut landing exactly ON a space breaks there */
+        CHECK_EQ_INT(fb_wrap_break_prop("ab cd", UI_FONT_BODY,
+                                        fb_text_width_prop("ab", UI_FONT_BODY)), 2);
+        /* a single 30-char word wider than the whole line hard-breaks at
+         * the pixel budget -- there is no space to back off to */
+        const char *word30 = "abcdefghijklmnopqrstuvwxyzabcd";
+        CHECK_EQ_INT((int)strlen(word30), 30);
+        CHECK(fb_text_width_prop(word30, UI_FONT_BODY) > 196);
+        int hb = fb_wrap_break_prop(word30, UI_FONT_BODY, 196);
+        CHECK_EQ_INT(hb, fb_text_fit_prop(word30, UI_FONT_BODY, 196));
+        CHECK(hb > 0);
+        CHECK(hb < 30);
+    }
     return HARNESS_REPORT();
 }

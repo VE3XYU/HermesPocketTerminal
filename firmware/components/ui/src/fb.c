@@ -101,6 +101,19 @@ int fb_text_fit_prop(const char *s, ui_font_id_t font, int max_w) {
     return fit;
 }
 
+static int is_blank(char c) { return c == ' ' || c == '\t' || c == '\n'; }
+
+int fb_wrap_break_prop(const char *s, ui_font_id_t font, int max_w) {
+    int fit = fb_text_fit_prop(s, font, max_w);
+    if (s[fit] == '\0') return fit;              /* whole string fits */
+    if (is_blank(s[fit])) return fit;            /* cut lands between words */
+    for (int k = fit; k > 0; k--)
+        if (is_blank(s[k - 1])) return k - 1;    /* last blank that fits */
+    return fit > 0 ? fit : 1;                    /* one word wider than the
+                                                    whole line: hard break
+                                                    (>= 1 keeps progress) */
+}
+
 void fb_ellipsize_prop(char *dst, size_t cap, const char *src,
                        ui_font_id_t font, int max_w) {
     if (cap == 0) return;

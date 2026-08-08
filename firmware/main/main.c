@@ -582,10 +582,11 @@ static void status_line_fill(ui_status_t *stt) {
 }
 
 /* Word-wraps msg into the shared framebuffer in the proportional body
- * font, greedy per measured pixel width: each line takes the longest
- * prefix that fits, backed off to the last space (a word longer than the
- * line hard-splits). x is the left edge, base0 the first BASELINE, lines
- * advance by UI_TEXT_LINE_H. */
+ * font, greedy per measured pixel width: each line breaks at the last
+ * space that fits (a word longer than the line hard-splits) -- the same
+ * fb_wrap_break_prop rule every other wrap point uses since C7 round 6.
+ * x is the left edge, base0 the first BASELINE, lines advance by
+ * UI_TEXT_LINE_H. */
 static void draw_wrapped(const char *msg, int x, int base0, int max_lines) {
     int max_w = UI_W - x - UI_MARGIN_X;
     char line[80];
@@ -594,14 +595,7 @@ static void draw_wrapped(const char *msg, int x, int base0, int max_lines) {
     while (*p && lines < max_lines) {
         while (*p == ' ') p++;
         if (!*p) break;
-        int len = (int)strlen(p);
-        int take = fb_text_fit_prop(p, UI_FONT_BODY, max_w);
-        if (take < len && take > 0) {
-            int k = take;
-            while (k > 0 && p[k] != ' ') k--;   /* break at the last space that fits */
-            if (k > 0) take = k;                /* overlong word: hard split */
-        }
-        if (take < 1) take = 1;                 /* progress even off-budget */
+        int take = fb_wrap_break_prop(p, UI_FONT_BODY, max_w);
         if (take > (int)sizeof line - 1) take = (int)sizeof line - 1;
         memcpy(line, p, (size_t)take);
         line[take] = 0;

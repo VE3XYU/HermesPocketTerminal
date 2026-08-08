@@ -94,6 +94,8 @@ void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
     fb_hline(f, 0, UI_STATUS_H - 1, UI_W, 1);
 }
 
+static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n'; }
+
 /* One body line of a list row: ellipsized to the pixel budget, struck
  * through when done (the strike is what the completion gesture promises;
  * two rows thick so it survives partial-refresh ghosting). */
@@ -147,12 +149,12 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
         if (!l->two_line) {
             row_line(f, x, base1, row->text, max_w, row->done);
         } else {
-            /* Hard-split per pixel across the row's two body lines:
-             * previews are transcript openings with no layout worth
-             * preserving, and a hard split shows the most characters
-             * (same rule as the settings values). Only the second line
-             * carries the ellipsis. */
-            int fit = fb_text_fit_prop(row->text, UI_FONT_BODY, max_w);
+            /* Split at a WORD BOUNDARY across the row's two body lines
+             * (C7 round 6: the photo-verified "buy a ne / w computer"
+             * failure): line 1 ends at the last blank that fits, and
+             * only a single word wider than the whole line hard-splits.
+             * Only the second line carries the ellipsis. */
+            int fit = fb_wrap_break_prop(row->text, UI_FONT_BODY, max_w);
             char seg[sizeof row->text];
             memcpy(seg, row->text, (size_t)fit);
             seg[fit] = '\0';
@@ -163,7 +165,7 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
                             fb_text_width_prop(seg, UI_FONT_BODY), 2, 1);
             }
             const char *rest = row->text + fit;
-            while (*rest == ' ') rest++;        /* no leading gap on line 2 */
+            while (is_ws(*rest)) rest++;        /* no leading gap on line 2 */
             if (*rest)
                 row_line(f, x, y + UI_ROW2_BASE2, rest, max_w, row->done);
         }
@@ -171,8 +173,6 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
         if (idx == l->cursor) fb_invert(f, 0, y, UI_W, row_h);
     }
 }
-
-static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n'; }
 
 /* Longest body-line buffer: UI_TEXT_W px at the body's narrowest advance
  * (5 px) is 39 characters. */
