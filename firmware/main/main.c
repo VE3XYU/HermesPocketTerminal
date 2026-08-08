@@ -1144,7 +1144,7 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
  * is mounted, config and wifi.json are loaded, and the Wi-Fi join may
  * already be running or up (s_bg_wifi_started) -- starting a second join
  * would disrupt the first (Task 17 double-start concern). */
-static void capture_session(int from_ui) {
+static void capture_session_run(int from_ui) {
     if (!from_ui) {
         /* Rail first: its settle overlaps the SD mount (audio_init() only
          * sleeps whatever part of the settle window hasn't already passed). */
@@ -1199,6 +1199,17 @@ static void capture_session(int from_ui) {
      * older pending uploads, only the status header needs refreshing. */
     if (rep.uploads_retried > 0)
         refresh_status_strip();
+}
+
+/* Wrapper so the linger's press timestamp is dropped on EVERY exit from
+ * the capture path, not only on the one where record_capture() got far
+ * enough to consume it (C7 round 2): an abort before that -- SD, config or
+ * audio failure -- used to leave it set, and the NEXT capture's
+ * press-to-record log line was then measured from a press that belonged to
+ * the aborted session. */
+static void capture_session(int from_ui) {
+    capture_session_run(from_ui);
+    s_linger_rec_press_ms = -1;
 }
 
 /* ============================================================
