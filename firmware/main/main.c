@@ -876,6 +876,30 @@ static void load_cached_dashboard(void) {
         ESP_LOGW(TAG, "dashboard snapshot ignored (other layout or torn write)");
         return;
     }
+    /* The header proves the blob has the right shape, not that the SD card
+     * didn't bit-rot the body. item_count feeds unchecked array indexing
+     * throughout ui_flow (cursor navigation, the complete gesture's
+     * items[idx] write) and widget_list's scroll window -- a corrupt count
+     * must never reach s_uif.dash. Reject the whole cache rather than clamp
+     * it: this is only a cosmetic preload, so a rejection just means the
+     * first screen paints after Wi-Fi joins instead of instantly. */
+    htp_dashboard_t *d = &s_dash_cache.d;
+    if (d->item_count < 0 || d->item_count > 32 ||
+        d->sync_interval < 60 || d->sync_interval > 86400) {
+        ESP_LOGW(TAG, "dashboard snapshot rejected (corrupt payload)");
+        return;
+    }
+    /* Fixed char fields are raw bytes off the card, not guaranteed
+     * NUL-terminated by whatever corrupted them -- force it before
+     * anything downstream (str_copy/strlen via ui_flow's renderers) reads
+     * past the field into adjacent struct memory. */
+    d->rev[sizeof d->rev - 1] = '\0';
+    d->title[sizeof d->title - 1] = '\0';
+    for (int i = 0; i < d->item_count; i++) {
+        d->items[i].id[sizeof d->items[i].id - 1] = '\0';
+        d->items[i].text[sizeof d->items[i].text - 1] = '\0';
+        d->items[i].style[sizeof d->items[i].style - 1] = '\0';
+    }
     s_uif.dash = s_dash_cache.d;
 }
 
@@ -1242,8 +1266,13 @@ static void ui_session(wake_cause_t wc) {
                 synced = 1;
                 s_uif.info.sync_interval_s = (int)next_sync_interval();
                 /* Upload-state changes count as changes: refresh the
-                 * header's pending count even when nothing else redrew. */
-                if (rep.uploads_retried > 0 || pending_uploads() != pend_before)
+                 * header's pending count even when nothing else redrew.
+                 * Guarded like sync_session's twin -- when the dashboard
+                 * did change, render_dashboard_cb already painted the
+                 * fresh screen (with the fresh header) during run_sync(),
+                 * so this would be a redundant partial refresh. */
+                if ((rep.uploads_retried > 0 || pending_uploads() != pend_before) &&
+                    !rep.dashboard_changed)
                     flow_redraw(0);
                 idle_t0 = s_ck.mono_ms(s_ck.ctx);   /* sync time isn't idle time */
             }

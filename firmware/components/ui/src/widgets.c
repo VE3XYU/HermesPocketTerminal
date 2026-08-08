@@ -57,19 +57,24 @@ void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
      * At scale 2 a fully crowded strip ("100%" + "^32" + "W" + clock) is
      * wider than the panel, so each item is drawn only when it fits
      * entirely before `limit`: lower-priority items drop whole, nothing
-     * is ever clipped mid-glyph. */
+     * is ever clipped mid-glyph. Once an item is dropped, nothing after it
+     * may draw either -- otherwise a lower-priority item can fit in the
+     * gap a higher-priority one left behind, inverting the hierarchy. */
     int x = 2;
-    if (st->battery_pct != -1) {
+    int stop = 0;
+    if (!stop && st->battery_pct != -1) {
         snprintf(buf, sizeof buf, "%d%%", st->battery_pct);
         int w = fb_text_width(buf, UI_TEXT_SCALE);
         if (x + w <= limit) { fb_text(f, x, 2, buf, UI_TEXT_SCALE, 1); x += w + 4; }
+        else stop = 1;
     }
-    if (st->pending_uploads > 0) {
+    if (!stop && st->pending_uploads > 0) {
         snprintf(buf, sizeof buf, "^%d", st->pending_uploads);
         int w = fb_text_width(buf, UI_TEXT_SCALE);
         if (x + w <= limit) { fb_text(f, x, 2, buf, UI_TEXT_SCALE, 1); x += w + 4; }
+        else stop = 1;
     }
-    if (st->wifi_ok) {
+    if (!stop && st->wifi_ok) {
         int w = fb_text_width("W", UI_TEXT_SCALE);
         if (x + w <= limit) fb_text(f, x, 2, "W", UI_TEXT_SCALE, 1);
     }

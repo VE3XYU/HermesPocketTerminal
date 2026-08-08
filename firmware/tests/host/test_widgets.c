@@ -41,6 +41,21 @@ int main(void) {
     CHECK_EQ_INT(region_ink(clock_x - 4, 0, 4, UI_STATUS_H - 1), 0);      /* gap respected */
     CHECK_EQ_INT(region_ink(0, UI_STATUS_H, UI_W, UI_H - UI_STATUS_H), 0);
 
+    /* priority-inversion regression: after "100%" the gap before the clock
+     * is wide enough for "W" (16px) but not for "^32" (48px) -- pending
+     * must drop *and* nothing lower-priority may draw in the space it left
+     * behind, or "W" appears where the dropped pending indicator belongs,
+     * inverting the battery -> pending -> wifi hierarchy. */
+    int batt_w = 4 * 8 * UI_TEXT_SCALE;                    /* "100%" */
+    int pend_w = 3 * 8 * UI_TEXT_SCALE;                    /* "^32" */
+    int wifi_w = 1 * 8 * UI_TEXT_SCALE;                    /* "W" */
+    int batt_end = 2 + batt_w + 4;                         /* x after battery + gap */
+    int gap_limit = clock_x - 4;
+    CHECK(batt_end + wifi_w <= gap_limit);   /* sanity: "W" alone would fit here */
+    CHECK(batt_end + pend_w > gap_limit);    /* sanity: "^32" does not fit here */
+    CHECK_EQ_INT(region_ink(batt_end, 0, wifi_w, UI_STATUS_H - 1), 0);   /* "W" did not
+        draw in the gap the dropped "^32" left behind */
+
     /* list: title, rows at fixed positions, cursor row inverted (heavy ink) */
     fb_clear(&fb);
     ui_list_t l = { .row_count = 3, .cursor = 1 };
