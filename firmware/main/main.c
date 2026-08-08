@@ -549,18 +549,23 @@ static void status_line_fill(ui_status_t *stt) {
     stt->battery_pct = board_battery_pct();
     stt->wifi_ok = s_wifi_ok;
     stt->pending_uploads = pending_uploads();
-    /* Clock: local HH:MM from the RTC-backed epoch. "Local" is the
+    /* Clock: local wall time from the RTC-backed epoch. "Local" is the
      * config.json "timezone" POSIX TZ string applied in load_config()
-     * (C7 finding D); with no field TZ is pinned to UTC0, so localtime_r
-     * degrades to exactly the old gmtime_r rendering. Hidden until the
-     * clock is set. */
+     * (C7 finding D); with no field TZ is pinned to UTC0. Rendered
+     * 12-hour with no AM/PM and no leading zero -- "3:14", "11:17" --
+     * per the operator's C7 round-3 finding 1: a glanceable pocket clock,
+     * not a timestamp. Hidden until the clock is set. */
     long long e = s_ck.epoch_s(s_ck.ctx);
     if (e > 0) {
         time_t t = (time_t)e;
         struct tm tmv;
         localtime_r(&t, &tmv);
-        snprintf(stt->clock_hhmm, sizeof stt->clock_hhmm, "%02d:%02d",
-                 tmv.tm_hour, tmv.tm_min);
+        int h12 = tmv.tm_hour % 12;
+        if (h12 == 0) h12 = 12;
+        /* unsigned + modulo keep the compiler's format-truncation proof
+         * inside the 6-byte field ("12:59" worst case) */
+        snprintf(stt->clock_hhmm, sizeof stt->clock_hhmm, "%u:%02u",
+                 (unsigned)h12 % 13u, (unsigned)tmv.tm_min % 60u);
     }
 }
 
