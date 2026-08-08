@@ -16,6 +16,7 @@ static int slot(fake_storage_t *f, const char *path, int create) {
 }
 static int fs_read(void *ctx, const char *p, void *buf, size_t cap, size_t *len) {
     fake_storage_t *f = ctx; int i = slot(f, p, 0);
+    f->read_count++;
     if (i < 0) return -1;
     size_t n = f->files[i].len < cap ? f->files[i].len : cap;
     memcpy(buf, f->files[i].data, n); if (len) *len = n;

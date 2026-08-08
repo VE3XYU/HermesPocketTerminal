@@ -15,6 +15,17 @@ static fake_storage_t fs; static port_storage_t st;
 static fake_kv_t fk; static port_kv_t kv;
 static ui_flow_t u; static ui_fb_t fb; static char path[96];
 
+/* long enough to wrap past one 8-line page (widget_text_pages asserts so) */
+static const char *LONG_TRANSCRIPT =
+    "the quick brown fox jumps over the lazy dog and keeps running "
+    "the quick brown fox jumps over the lazy dog and keeps running "
+    "the quick brown fox jumps over the lazy dog and keeps running "
+    "the quick brown fox jumps over the lazy dog and keeps running "
+    "the quick brown fox jumps over the lazy dog and keeps running "
+    "the quick brown fox jumps over the lazy dog and keeps running "
+    "the quick brown fox jumps over the lazy dog and keeps running "
+    "the quick brown fox jumps over the lazy dog and keeps running";
+
 static void fresh(void) {
     ft_init(&ft, &tr); htp_client_init(&cl, &tr, "tok");
     fstore_init(&fs, &st); fkv_init(&fk, &kv);
@@ -24,17 +35,17 @@ static void fresh(void) {
     str_copy(u.dash.title, sizeof u.dash.title, "Today");
     str_copy(u.dash.items[0].id, 32, "t-9f2");  str_copy(u.dash.items[0].text, 64, "Buy milk");
     str_copy(u.dash.items[1].id, 32, "t-c41");  str_copy(u.dash.items[1].text, 64, "Call dentist");
-    /* seed two recordings */
+    /* seed two recordings: c-old has a multi-page transcript, c-new none */
     sidecar_t a; sidecar_init(&a, "c-old");
     str_copy(a.state, sizeof a.state, "done");
-    str_copy(a.transcript, sizeof a.transcript, "the older recording words");
+    str_copy(a.transcript, sizeof a.transcript, LONG_TRANSCRIPT);
     sidecar_save(&st, &a); rec_index_append(&st, "c-old");
     sidecar_t b; sidecar_init(&b, "c-new");        /* not uploaded, no transcript */
     sidecar_save(&st, &b); rec_index_append(&st, "c-new");
     /* newest capture on the card is a conversation turn ("hey hermes"):
      * it must stay out of the Recordings list (protocol-level mode
-     * distinction via conversation_id, finding 4) while remaining on the
-     * card for sync/upload */
+     * distinction via conversation_id, round-3 finding 4) while remaining
+     * on the card for sync/upload */
     sidecar_t c; sidecar_init(&c, "c-conv");
     str_copy(c.conversation_id, sizeof c.conversation_id, "conv-7");
     str_copy(c.transcript, sizeof c.transcript, "words spoken to hermes");
@@ -43,64 +54,163 @@ static void fresh(void) {
 
 int main(void) {
     fresh();
-    CHECK_EQ_INT(u.screen, SCR_DASHBOARD);
 
-    /* cursor moves and wraps; actions are partial redraws */
+    /* ---- resting display state: wake shows the dashboard, no cursor ---- */
+    CHECK_EQ_INT(u.screen, SCR_DASHBOARD);
+    CHECK(u.cursor < 0);
+    /* a REC tap at rest is idle (reference grammar): no click, no redraw */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_NONE);
+    CHECK_EQ_INT(u.click, UI_CLICK_NONE);
+
+    /* ---- PWR tap at rest opens the MENU ---- */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_MENU);
+    CHECK_EQ_INT(u.cursor, MENU_DASHBOARD);
+    CHECK_EQ_INT(u.click, UI_CLICK_NEXT);
+    ui_flow_render(&u, &fb);                       /* menu renders with a cursor row */
+    CHECK(fb_count_black(&fb) > 0);
+
+    /* menu: PWR tap advances and wraps, each with a NEXT click */
+    for (int want = 1; want <= MENU_COUNT; want++) {
+        CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+        CHECK_EQ_INT(u.cursor, want % MENU_COUNT);
+        CHECK_EQ_INT(u.click, UI_CLICK_NEXT);
+    }
+
+    /* ---- REC tap selects: Dashboard opens with a visible cursor ---- */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_DASHBOARD);
+    CHECK_EQ_INT(u.cursor, 0);
+    CHECK_EQ_INT(u.click, UI_CLICK_SELECT);
+
+    /* cursor moves and wraps across the 2 items */
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.cursor, 1);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.cursor, 0);
 
-    /* complete under cursor */
+    /* ---- complete under cursor: click-then-POST split ---- */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_COMPLETE);
+    CHECK_EQ_INT(u.click, UI_CLICK_SELECT);
+    CHECK_EQ_INT(u.dash.items[0].done, 0);         /* nothing happened yet */
     ft_push_fixture(&ft, 200, "complete_post.json");
-    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(ui_flow_complete_cursor(&u), 1);
     CHECK_EQ_INT(u.dash.items[0].done, 1);
     CHECK(strstr(ft.req[0].body, "t-9f2") != NULL);
+    /* an already-struck item is not re-completable: identical redraw banned */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_NONE);
+    CHECK_EQ_INT(u.click, UI_CLICK_NONE);
+    CHECK_EQ_INT(ft.req_count, 1);
+    /* a failed POST changes nothing (caller then skips the repaint) */
+    u.cursor = 1;
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_COMPLETE);
+    ft_push(&ft, 0, 500, "{\"error\":\"boom\"}");
+    CHECK_EQ_INT(ui_flow_complete_cursor(&u), 0);
+    CHECK_EQ_INT(u.dash.items[1].done, 0);
+    u.cursor = 0;
 
-    /* banner dismiss takes precedence over complete */
+    /* ---- banner dismiss takes precedence ON THE DASHBOARD only ---- */
     str_copy(u.banner, sizeof u.banner, "Meeting at 10:00");
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_STR(u.banner, "");
-    CHECK_EQ_INT(u.dash.items[0].done, 1);    /* unchanged, no second complete call */
-    CHECK_EQ_INT(ft.req_count, 1);
+    CHECK_EQ_INT(u.click, UI_CLICK_SELECT);
+    CHECK_EQ_INT(u.dash.items[0].done, 1);         /* no second complete call */
+    CHECK_EQ_INT(ft.req_count, 2);
 
-    /* screen cycling is a partial (C7 refresh policy: within-session updates
-     * never flash; fulls are first-draw or ghost-clear only) */
-    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_DOUBLE, path), UIF_REDRAW_PARTIAL);
+    /* ---- the uniform <=1 rule: nowhere visible to advance -> up a level ---- */
+    u.dash.item_count = 1;
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_MENU);              /* not an invisible wrap-in-place */
+    CHECK_EQ_INT(u.cursor, MENU_DASHBOARD);
+    u.dash.item_count = 2;
+
+    /* a pending banner must NOT eat a menu select (it isn't drawn here) */
+    str_copy(u.banner, sizeof u.banner, "Later meeting");
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_DASHBOARD);         /* the select happened */
+    CHECK_EQ_STR(u.banner, "Later meeting");       /* banner survives for the dashboard */
+    u.banner[0] = '\0';
+
+    /* ---- menu -> Recordings ---- */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_MENU);              /* long-PWR = up to the menu */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.cursor, MENU_RECORDINGS);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
     CHECK_EQ_INT(u.cursor, 0);
 
-    /* conversation-capture filter (finding 4): three captures on the card,
-     * two browsable -- the cursor wraps at 2, so "c-conv" (newest, but a
-     * conversation turn) is not in the list and cursor 0 is "c-new" */
+    /* conversation filter (round-3 finding 4): three captures on the card,
+     * two browsable -- the cursor wraps at 2, so "c-conv" is not listed */
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.cursor, 1);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.cursor, 0);
 
-    /* recordings render newest-first with placeholders */
-    ui_flow_render(&u, &fb);
+    /* ---- the session cache: cursor moves + renders cost ZERO reads ----
+     * (before round 5 every keypress re-read the index + up to 30 sidecars
+     * across three call sites -- the measured ~90 file opens per press) */
+    ui_flow_render(&u, &fb);                       /* builds the cache at most once */
     CHECK(fb_count_black(&fb) > 0);
+    {
+        int reads_before = fs.read_count;
+        ui_flow_gesture(&u, GEST_PWR_SHORT, path); /* cursor 1 */
+        ui_flow_render(&u, &fb);
+        ui_flow_gesture(&u, GEST_PWR_SHORT, path); /* cursor 0 */
+        ui_flow_render(&u, &fb);
+        CHECK_EQ_INT(fs.read_count, reads_before); /* O(1) I/O per keypress */
+        ui_flow_rec_invalidate();                  /* capture/sync event... */
+        ui_flow_render(&u, &fb);
+        CHECK(fs.read_count > reads_before);       /* ...forces one rebuild */
+    }
 
-    /* open entry (cursor 0 = c-new, NOT the filtered c-conv) -- partial,
-     * same policy */
-    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
+    /* ---- REC tap opens the entry under the cursor (c-new, newest kept) ---- */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_ENTRY);
     CHECK_EQ_STR(u.entry_id, "c-new");
-    /* paging: "(no transcript yet)" measures well under one body line,
-     * so one page total and PWR-short wraps back to page 0 */
+    CHECK_EQ_INT(u.click, UI_CLICK_SELECT);
+    /* "(no transcript yet)" is one page: a PWR tap has nowhere to page, so
+     * it climbs back to the list instead of redrawing identical content */
     CHECK_EQ_INT(widget_text_pages("(no transcript yet)"), 1);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
-    CHECK_EQ_INT(u.entry_page, 0);
-    /* play from entry */
+    CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
+    CHECK_EQ_INT(u.click, UI_CLICK_NEXT);
+
+    /* re-open: play/stop and back-out */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_ENTRY);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_PLAY_WAV);
     CHECK_EQ_STR(path, "/rec/c-new.wav");
-    /* back out -- partial, same policy */
+    CHECK_EQ_INT(u.click, UI_CLICK_SELECT);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
 
-    /* settings via cycle; capture and power-off pass through from anywhere */
-    ui_flow_gesture(&u, GEST_PWR_DOUBLE, path);
+    /* multi-page entry: c-old's transcript wraps past one page and PWR
+     * taps page through and wrap around (a visible change every tap) */
+    CHECK(widget_text_pages(LONG_TRANSCRIPT) >= 2);
+    ui_flow_gesture(&u, GEST_PWR_SHORT, path);     /* cursor 1 = c-old */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_STR(u.entry_id, "c-old");
+    ui_flow_render(&u, &fb);
+    CHECK_EQ_INT(u.entry_page, 0);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.entry_page, 1);
+    CHECK_EQ_INT(u.screen, SCR_ENTRY);             /* multi-page: stays in the entry */
+    while (u.entry_page != 0)                      /* wraps back to page 0 */
+        CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_ENTRY);
+
+    /* long-PWR climbs: entry -> recordings -> menu (cursor remembers) */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_MENU);
+    CHECK_EQ_INT(u.cursor, MENU_RECORDINGS);
+
+    /* ---- menu -> Settings ---- */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.cursor, MENU_SETTINGS);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_SETTINGS);
     /* settings render: values hard-split per measured pixel width;
      * everything stays above the banner strip (body budget: 5 lines max) */
@@ -116,8 +226,59 @@ int main(void) {
             for (int x = 0; x < UI_W; x++) banner_ink += fb_get(&fb, x, y);
         CHECK_EQ_INT(banner_ink, 0);
     }
+    /* settings has one position: REC selects nothing, PWR climbs to menu */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_NONE);
+    CHECK_EQ_INT(u.click, UI_CLICK_NONE);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_MENU);
+    CHECK_EQ_INT(u.cursor, MENU_SETTINGS);
+
+    /* ---- capture and power-off pass through from anywhere, clickless
+     * (each has its own feedback: the REC glyph / the countdown + wipe) ---- */
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_HOLD_START, path), UIF_START_CAPTURE);
+    CHECK_EQ_INT(u.click, UI_CLICK_NONE);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_OFF, path), UIF_POWER_OFF);
+    CHECK_EQ_INT(u.click, UI_CLICK_NONE);
+
+    /* ---- menu Sleep: rests the display first (the retained sleep image
+     * is the dashboard, never the menu) ---- */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.cursor, MENU_SLEEP);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_SLEEP);
+    CHECK_EQ_INT(u.click, UI_CLICK_SELECT);
+    CHECK_EQ_INT(u.screen, SCR_DASHBOARD);
+    CHECK(u.cursor < 0);
+
+    /* ui_flow_rest reports whether it changed anything */
+    CHECK_EQ_INT(ui_flow_rest(&u), 0);             /* already resting */
+    ui_flow_gesture(&u, GEST_PWR_SHORT, path);     /* -> menu */
+    CHECK_EQ_INT(ui_flow_rest(&u), 1);
+
+    /* long-PWR on the menu backs out to the resting display */
+    ui_flow_gesture(&u, GEST_PWR_SHORT, path);     /* -> menu again */
+    CHECK_EQ_INT(u.screen, SCR_MENU);
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
+    CHECK_EQ_INT(u.screen, SCR_DASHBOARD);
+    CHECK(u.cursor < 0);
+
+    /* ---- empty Recordings: says so, and PWR climbs out ---- */
+    {
+        fstore_init(&fs, &st); fkv_init(&fk, &kv);   /* wipe the card */
+        ui_flow_init(&u, &cl, &st, &kv);
+        sidecar_t c; sidecar_init(&c, "c-conv2");    /* only a conversation turn */
+        str_copy(c.conversation_id, sizeof c.conversation_id, "conv-8");
+        sidecar_save(&st, &c); rec_index_append(&st, "c-conv2");
+        ui_flow_gesture(&u, GEST_PWR_SHORT, path);   /* rest -> menu */
+        ui_flow_gesture(&u, GEST_PWR_SHORT, path);   /* -> Recordings row */
+        CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
+        CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
+        ui_flow_render(&u, &fb);                     /* "No recordings" + title */
+        CHECK(fb_count_black(&fb) > 0);
+        CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_NONE);
+        CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
+        CHECK_EQ_INT(u.screen, SCR_MENU);
+        CHECK_EQ_INT(u.cursor, MENU_RECORDINGS);
+    }
 
     /* dashboard content diff (C7 finding B): a bridge rev bump with
      * pixel-identical content must not repaint. rev and item ids are NOT

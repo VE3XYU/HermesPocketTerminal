@@ -27,26 +27,35 @@ int main(void) {
     const int tap[][3] = { {1,0,0}, {1,0,100}, {0,0,200} };
     CHECK_EQ_INT(run(&g, tap, 3), GEST_REC_SHORT);
 
-    /* PWR short: release <600, no second press within 250 → SHORT after window */
+    /* PWR tap resolves ON THE RELEASE SAMPLE ITSELF -- no double-tap
+     * vocabulary means no post-release waiting window (C7 round 5: the
+     * retired 250 ms window delayed every tap's feedback by that much). */
     gesture_init(&g);
-    const int pshort[][3] = { {0,1,0}, {0,1,100}, {0,0,200}, {0,0,300}, {0,0,460} };
-    CHECK_EQ_INT(run(&g, pshort, 5), GEST_PWR_SHORT);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 0), GEST_NONE);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 100), GEST_NONE);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 200), GEST_PWR_SHORT);   /* the release edge */
 
-    /* PWR double: second press-down within 250 of release */
+    /* two quick taps = two SHORTs, not a double (double-tap retired) */
     gesture_init(&g);
-    const int pdouble[][3] = { {0,1,0}, {0,0,150}, {0,1,300}, {0,0,380} };
-    CHECK_EQ_INT(run(&g, pdouble, 4), GEST_PWR_DOUBLE);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 0), GEST_NONE);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 120), GEST_PWR_SHORT);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 200), GEST_NONE);        /* within the old 250 ms window */
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 320), GEST_PWR_SHORT);
 
     /* PWR long: release after 600 */
     gesture_init(&g);
     const int plong[][3] = { {0,1,0}, {0,1,650}, {0,0,700} };
     CHECK_EQ_INT(run(&g, plong, 3), GEST_PWR_LONG);
+    /* boundary: release at exactly 599 sampled ms is still a tap */
+    gesture_init(&g);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 0), GEST_NONE);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 599), GEST_PWR_SHORT);
 
     /* PWR off: still held at 5000, fires while held */
     gesture_init(&g);
     const int poff[][3] = { {0,1,0}, {0,1,2000}, {0,1,4999}, {0,1,5001} };
     CHECK_EQ_INT(run(&g, poff, 4), GEST_PWR_OFF);
-    /* release afterwards emits nothing */
+    /* release afterwards emits nothing (the hold was consumed) */
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 5200), GEST_NONE);
     return HARNESS_REPORT();
 }
