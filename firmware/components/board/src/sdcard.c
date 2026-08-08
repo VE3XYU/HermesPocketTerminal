@@ -49,7 +49,14 @@ static int mount(bool format_if_mount_failed) {
     return 0;
 }
 
-int board_sd_mount(void) { return mount(false); }
+/* Idempotent (C7 finding C): sessions launched from the dev linger re-run
+ * their init path within one power cycle, and a second
+ * esp_vfs_fat_sdmmc_mount() on a live mount fails ESP_ERR_INVALID_STATE.
+ * s_card is exactly "mounted": set on mount success, cleared on unmount. */
+int board_sd_mount(void) {
+    if (s_card) return 0;
+    return mount(false);
+}
 
 /* Erase-and-reformat path for Task 14's serial-provisioning fallback
  * (operator's card reads RAW / won't mount at all). Only meaningful after

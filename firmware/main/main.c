@@ -65,10 +65,12 @@ static const char *TAG = "htp";
  * Development-linger switch.
  *
  * 1 (development, the default): after a session completes, the device
- * stays awake with the USB-Serial-JTAG console alive -- heartbeat,
- * 'sleep' + Enter, PWR held ~2 s, or DEV_IDLE_TIMEOUT_MS of idleness
- * drop it into the real deep sleep, with the sync timer armed, so the
- * full sleep/wake cycle stays verifiable (C6).
+ * stays awake with the USB-Serial-JTAG console alive. C7 finding C:
+ * buttons ACT during the linger instead of being swallowed -- a REC
+ * press starts a new capture session, a PWR tap opens a UI session
+ * (both end back in the linger); 'sleep' + Enter, PWR held ~2 s, or
+ * DEV_IDLE_TIMEOUT_MS of idleness drop into the real deep sleep with
+ * the sync timer armed, so the full sleep/wake cycle stays verifiable.
  *
  * 0 (release, Task 19 flips this): every session ends directly in
  * board_deep_sleep(next_sync_interval()), no console hold.
@@ -100,6 +102,10 @@ static sidecar_t s_sc, s_sc_next;
 static int s_pending_cache = -1;    /* memoized capture_pending_count(); -1 = recount.
                                        Invalidated wherever an upload state changes, so
                                        cursor-move redraws don't re-walk the SD index. */
+static int64_t s_linger_rec_press_ms = -1;  /* C7 finding C: ms-since-boot of the REC
+                                               press that exited the dev linger, so
+                                               record_capture can log press-to-record-
+                                               start latency. -1 = not a linger launch. */
 
 /* Dashboard snapshot (/dash.bin): the last rendered htp_dashboard_t, so a
  * PWR wake paints the dashboard instantly from SD while Wi-Fi joins in the
@@ -822,8 +828,13 @@ static int record_capture(sidecar_t *sc, const char *conversation_id,
     /* C6 timing line: this is the moment recording begins; the wake-to-
      * record budget (design §5.2 250 ms target, checkpoint line 400 ms)
      * is measured against it. */
-    ESP_LOGI(TAG, "record start at %lld ms since boot, id=%s",
-             (long long)(esp_timer_get_time() / 1000), id);
+    long long t_rec_ms = esp_timer_get_time() / 1000;
+    if (s_linger_rec_press_ms >= 0) {
+        ESP_LOGI(TAG, "record start %lld ms after the linger REC press",
+                 t_rec_ms - (long long)s_linger_rec_press_ms);
+        s_linger_rec_press_ms = -1;
+    }
+    ESP_LOGI(TAG, "record start at %lld ms since boot, id=%s", t_rec_ms, id);
     long bytes = audio_record_to(wavfs, rec_held, NULL, MAX_RECORD_MS);
     capture_bg_join();
 
@@ -1371,32 +1382,44 @@ static void ui_session(wake_cause_t wc) {
 #define DEV_HEARTBEAT_MS    30000               /* heartbeat cadence while staying awake */
 #define DEV_IDLE_TIMEOUT_MS (10u * 60u * 1000u) /* ~10 min without input -> deep sleep */
 #define DEV_PWR_HOLD_MS     2000                /* PWR held this long -> deep sleep */
+#define DEV_BTN_DEBOUNCE_MS 60                  /* continuous-press debounce: the same
+                                                   re-sampling pattern as power_button_
+                                                   held_at_boot, at tap scale (3 polls) */
 
 /* End-of-session behavior for development builds: stay awake with
  * USB-Serial-JTAG alive so the operator can keep iterating (flash, read
  * logs, poke serial), instead of dropping into deep sleep immediately and
- * killing the port. Deep sleep happens only on:
- *   - "sleep" + Enter on the serial console,
- *   - the Power button held ~2 s (then released -- we wait for the release
- *     so board_deep_sleep()'s EXT1 any-low wake doesn't fire the instant
- *     we go down and bounce straight back into a boot),
- *   - DEV_IDLE_TIMEOUT_MS with no serial byte and no button press.
- * All timing is wall-clock (esp_timer), never iteration-counted. Never
- * returns. The eventual deep sleep arms the same sync-interval timer the
- * release build would, so timer wakes stay exercisable. */
-static void dev_stay_awake_then_sleep(unsigned sleep_s) {
-    ESP_LOGI(TAG, "staying awake for development; type 'sleep' + Enter or hold PWR ~2s to deep-sleep now");
+ * killing the port.
+ *
+ * C7 finding C: buttons act here now (the operator could not record a
+ * second capture without typing 'sleep' first). Outcomes:
+ *   - REC pressed (debounced DEV_BTN_DEBOUNCE_MS of continuous samples):
+ *     returns WAKE_REC_BUTTON -- the caller dispatches a capture session
+ *     while the operator is still holding the button (hold-to-talk from
+ *     this very press; s_linger_rec_press_ms carries the press time so
+ *     record_capture logs press-to-record-start).
+ *   - PWR tapped (>= debounce, released before DEV_PWR_HOLD_MS): returns
+ *     WAKE_PWR_BUTTON -- the caller dispatches a UI session.
+ *   - "sleep" + Enter, PWR held ~2 s (release waited so EXT1 doesn't
+ *     bounce straight back into a boot), or DEV_IDLE_TIMEOUT_MS of
+ *     idleness: deep sleep, never returns. The deep sleep arms the same
+ *     sync-interval timer the release build would.
+ * All timing is wall-clock (esp_timer), never iteration-counted. */
+static wake_cause_t dev_linger(unsigned sleep_s) {
+    ESP_LOGI(TAG, "staying awake for development; buttons live: hold REC = record, "
+                  "tap PWR = menu; 'sleep' + Enter or hold PWR ~2s = deep sleep now");
     ESP_LOGI(TAG, "auto deep-sleep after %u min idle", (unsigned)(DEV_IDLE_TIMEOUT_MS / 60000u));
 
     char line[16];
     size_t n = 0;
     int64_t t_last_input = esp_timer_get_time() / 1000;
     int64_t t_next_heartbeat = t_last_input + DEV_HEARTBEAT_MS;
-    int64_t t_pwr_down_since = -1;   /* -1 = PWR not currently pressed */
+    int64_t t_pwr_down_since = -1;   /* -1 = button not currently pressed */
+    int64_t t_rec_down_since = -1;
 
     for (;;) {
         /* console_getc() blocks in the driver up to CONSOLE_POLL_MS, so
-         * this loop wakes ~50x/s when idle -- that's also the PWR-button
+         * this loop wakes ~50x/s when idle -- that's also the button
          * sampling rate. */
         int c = console_getc(CONSOLE_POLL_MS);
         int64_t now = esp_timer_get_time() / 1000;
@@ -1418,6 +1441,20 @@ static void dev_stay_awake_then_sleep(unsigned sleep_s) {
             }
         }
 
+        /* REC: a debounced press exits straight into a capture session.
+         * No wait for release -- the hold IS the recording gesture. */
+        if (board_btn_rec()) {
+            t_last_input = now;
+            if (t_rec_down_since < 0) t_rec_down_since = now;
+            else if (now - t_rec_down_since >= DEV_BTN_DEBOUNCE_MS) {
+                s_linger_rec_press_ms = t_rec_down_since;
+                ESP_LOGI(TAG, "REC pressed in linger: starting a capture session");
+                return WAKE_REC_BUTTON;
+            }
+        } else {
+            t_rec_down_since = -1;
+        }
+
         if (board_btn_pwr()) {
             t_last_input = now;
             if (t_pwr_down_since < 0) t_pwr_down_since = now;
@@ -1428,11 +1465,18 @@ static void dev_stay_awake_then_sleep(unsigned sleep_s) {
                 break;
             }
         } else {
-            t_pwr_down_since = -1;
+            if (t_pwr_down_since >= 0 && now - t_pwr_down_since >= DEV_BTN_DEBOUNCE_MS) {
+                /* released short of the 2 s hold: a tap = UI session (the
+                 * button is already up, so ui_session's held-at-boot
+                 * provisioning probe cannot trigger) */
+                ESP_LOGI(TAG, "PWR tapped in linger: starting a UI session");
+                return WAKE_PWR_BUTTON;
+            }
+            t_pwr_down_since = -1;   /* sub-debounce blip: ignore */
         }
 
         if (now >= t_next_heartbeat) {
-            ESP_LOGI(TAG, "awake (dev hold), up %lld min; 'sleep' + Enter or hold PWR ~2s to deep-sleep",
+            ESP_LOGI(TAG, "awake (dev hold), up %lld min; buttons live; 'sleep' + Enter or hold PWR ~2s to deep-sleep",
                      (long long)(now / 60000));
             t_next_heartbeat = now + DEV_HEARTBEAT_MS;
         }
@@ -1445,6 +1489,7 @@ static void dev_stay_awake_then_sleep(unsigned sleep_s) {
 
     ESP_LOGI(TAG, "entering deep sleep for %u s (wake: REC/PWR button or timer)", sleep_s);
     board_deep_sleep(sleep_s);
+    return WAKE_COLD;   /* unreachable: board_deep_sleep never returns */
 }
 
 #endif /* HTP_DEV_LINGER */
@@ -1474,30 +1519,43 @@ void app_main(void) {
         s_awake_cap = NULL;   /* run uncapped rather than not at all */
         ESP_LOGE(TAG, "awake watchdog unavailable");
     }
-    awake_cap_arm(wc == WAKE_REC_BUTTON ? AWAKE_CAP_REC_S : AWAKE_CAP_BASE_S);
 
-    if (wc == WAKE_REC_BUTTON)      capture_session(0);   /* fast path first */
-    else if (wc == WAKE_PWR_BUTTON) ui_session(wc);
-    else                            sync_session(wc);     /* timer + cold */
+    /* Dispatch loop (C7 finding C): one pass per session. In the release
+     * build the tail deep-sleeps and the loop body runs exactly once; in
+     * the dev build the linger can hand back a pseudo wake cause (REC
+     * press / PWR tap), and the next pass dispatches it like a fresh
+     * button wake -- including re-arming the watchdog. */
+    for (;;) {
+        awake_cap_arm(wc == WAKE_REC_BUTTON ? AWAKE_CAP_REC_S : AWAKE_CAP_BASE_S);
 
-    awake_cap_cancel();
+        if (wc == WAKE_REC_BUTTON)      capture_session(0);   /* fast path first */
+        else if (wc == WAKE_PWR_BUTTON) ui_session(wc);
+        else                            sync_session(wc);     /* timer + cold */
 
-    /* Common teardown: radio off, codec + rail off, panel asleep. All of
-     * these are safe no-ops when the session never brought them up. */
-    idf_wifi_stop();
-    audio_deinit();
-    if (s_epd_up && !s_panel_lost) {
-        epd_sleep();
-        s_epd_up = 0;
-    }
-    ESP_LOGI(TAG, "session done; main task min free stack %u bytes",
-             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        awake_cap_cancel();
 
-    unsigned sleep_s = next_sync_interval();
+        /* Common teardown: radio off, codec + rail off, panel asleep. All
+         * of these are safe no-ops when the session never brought them up. */
+        idf_wifi_stop();
+        s_bg_wifi_started = 0;   /* the radio is down: a linger-launched session
+                                    must start (and wait on) its own join, not
+                                    trust a flag from the stopped one */
+        s_wifi_ok = 0;           /* keep the status header's "W" honest */
+        audio_deinit();
+        if (s_epd_up && !s_panel_lost) {
+            epd_sleep();
+            s_epd_up = 0;
+        }
+        ESP_LOGI(TAG, "session done; main task min free stack %u bytes",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+        unsigned sleep_s = next_sync_interval();
 #if HTP_DEV_LINGER
-    dev_stay_awake_then_sleep(sleep_s);   /* never returns */
+        wc = dev_linger(sleep_s);   /* deep-sleeps (never returns), or hands back
+                                       a button press to dispatch as a session */
 #else
-    ESP_LOGI(TAG, "entering deep sleep for %u s (wake: REC/PWR button or timer)", sleep_s);
-    board_deep_sleep(sleep_s);
+        ESP_LOGI(TAG, "entering deep sleep for %u s (wake: REC/PWR button or timer)", sleep_s);
+        board_deep_sleep(sleep_s);
 #endif
+    }
 }
