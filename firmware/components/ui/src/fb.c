@@ -1,7 +1,5 @@
 #include "ui_fb.h"
 #include <string.h>
-#include "font8x8_basic.h"
-#include "spleen_8x16.h"
 #include "lib_sans_body.h"
 #include "lib_sans_emph.h"
 #include "lib_sans_hero.h"
@@ -50,38 +48,6 @@ void fb_invert(ui_fb_t *f, int x, int y, int w, int h) {
             f->px[yy * UI_STRIDE + xx / 8] ^= (uint8_t)(0x80 >> (xx & 7));
         }
 }
-
-void fb_text(ui_fb_t *f, int x, int y, const char *s, int scale, int black) {
-    for (; *s; s++) {
-        unsigned ch = (unsigned char)*s;
-        if (ch > 127) ch = '?';
-        const unsigned char *glyph = (const unsigned char *)font8x8_basic[ch];
-        for (int gy = 0; gy < 8; gy++)
-            for (int gx = 0; gx < 8; gx++)
-                if (glyph[gy] & (1 << gx))          /* font8x8: LSB = leftmost */
-                    for (int sy = 0; sy < scale; sy++)
-                        for (int sx = 0; sx < scale; sx++)
-                            fb_pixel(f, x + gx * scale + sx, y + gy * scale + sy, black);
-        x += 8 * scale;
-    }
-}
-
-int fb_text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
-
-void fb_text16(ui_fb_t *f, int x, int y, const char *s, int black) {
-    for (; *s; s++) {
-        unsigned ch = (unsigned char)*s;
-        if (ch < 32 || ch > 126) ch = '?';
-        const unsigned char *glyph = spleen8x16[ch - 32];
-        for (int gy = 0; gy < 16; gy++)
-            for (int gx = 0; gx < 8; gx++)
-                if (glyph[gy] & (0x80 >> gx))       /* spleen: MSB = leftmost */
-                    fb_pixel(f, x + gx, y + gy, black);
-        x += 8;
-    }
-}
-
-int fb_text16_width(const char *s) { return (int)strlen(s) * 8; }
 
 /* ---- proportional renderer (GFX glyph format, ui_font.h) ---- */
 

@@ -34,20 +34,6 @@ void fb_fill(ui_fb_t *f, int x, int y, int w, int h, int black);
 
 void fb_invert(ui_fb_t *f, int x, int y, int w, int h);
 
-void fb_text(ui_fb_t *f, int x, int y, const char *s, int scale, int black);
-
-/* 8 * scale * chars */
-int fb_text_width(const char *s, int scale);
-
-/* Body text: Spleen 8x16 (vendored, BSD-2-Clause -- fonts/spleen_8x16.h),
- * a narrow 8 px advance at the same 16 px height the old scale-2 square
- * glyphs had, so a body line carries 24 chars instead of 12. Always scale
- * 1; the extra-large headline sizes stay on fb_text's scaled 8x8. */
-void fb_text16(ui_fb_t *f, int x, int y, const char *s, int black);
-
-/* 8 * chars */
-int fb_text16_width(const char *s);
-
 /* ---- proportional text (Liberation Sans ramp, see ui_font.h) ----
  *
  * All coordinates are the BASELINE (pen) position, GFX-style: glyph ink
