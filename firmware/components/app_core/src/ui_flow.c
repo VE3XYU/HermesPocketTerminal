@@ -332,6 +332,13 @@ static void render_dashboard(ui_flow_t *u, ui_fb_t *fb) {
         l->rows[i].done = u->dash.items[i].done;
     }
     widget_list(fb, l);
+    if (u->dash.item_count == 0)
+        /* Zero items used to render a bare screen under the status bar
+         * (C7 round 6, finding 3). Title stays; the centered hint makes
+         * the emptiness read as deliberate. Centered in the rows region
+         * only -- the banner strip stays reserved on the dashboard. */
+        widget_empty_state(fb, "Nothing yet", "Hold REC to talk",
+                           UI_STATUS_H + UI_TITLE_H, UI_H - UI_BANNER_H);
     if (u->banner[0]) widget_banner(fb, u->banner);
 }
 
@@ -363,10 +370,12 @@ static void render_recordings(ui_flow_t *u, ui_fb_t *fb) {
         str_copy(l->rows[i].text, sizeof l->rows[i].text, s_rc.preview[i]);
     widget_list(fb, l);
 
-    if (n == 0)   /* the empty state must say so, not show a bare title
-                     (a PWR tap here climbs back to the menu) */
-        fb_text_prop(fb, UI_MARGIN_X, UI_STATUS_H + UI_TITLE_H + UI_ROW_BASE,
-                     "No recordings", UI_FONT_BODY, 1);
+    if (n == 0)   /* same deliberate empty-state pattern as the dashboard
+                     (a PWR tap here climbs back to the menu); centered in
+                     the full rows region -- Recordings has no banner
+                     reservation */
+        widget_empty_state(fb, "No recordings", "Hold REC to talk",
+                           UI_STATUS_H + UI_TITLE_H, UI_H);
 }
 
 static void render_entry(ui_flow_t *u, ui_fb_t *fb) {

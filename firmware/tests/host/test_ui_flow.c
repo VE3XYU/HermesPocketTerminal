@@ -272,12 +272,38 @@ int main(void) {
         ui_flow_gesture(&u, GEST_PWR_SHORT, path);   /* -> Recordings row */
         CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_REDRAW_PARTIAL);
         CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
-        ui_flow_render(&u, &fb);                     /* "No recordings" + title */
+        ui_flow_render(&u, &fb);        /* title + centered empty-state hint */
         CHECK(fb_count_black(&fb) > 0);
+        {   /* the hint lands in the rows region, below the title band */
+            int hint = 0;
+            for (int y = UI_STATUS_H + UI_TITLE_H; y < UI_H; y++)
+                for (int x = 0; x < UI_W; x++) hint += fb_get(&fb, x, y);
+            CHECK(hint > 0);
+        }
         CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_NONE);
         CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
         CHECK_EQ_INT(u.screen, SCR_MENU);
         CHECK_EQ_INT(u.cursor, MENU_RECORDINGS);
+    }
+
+    /* ---- empty dashboard (round 6, finding 3): title retained, centered
+     * hint in the rows region, banner strip untouched -- an obviously
+     * deliberate screen, not a bare one ---- */
+    {
+        u.dash.item_count = 0;
+        str_copy(u.dash.title, sizeof u.dash.title, "Today");
+        ui_flow_rest(&u);
+        ui_flow_render(&u, &fb);
+        int title_ink = 0, hint_ink = 0, banner_ink = 0;
+        for (int y = UI_STATUS_H; y < UI_STATUS_H + UI_TITLE_H; y++)
+            for (int x = 0; x < UI_W; x++) title_ink += fb_get(&fb, x, y);
+        for (int y = UI_STATUS_H + UI_TITLE_H; y < UI_H - UI_BANNER_H; y++)
+            for (int x = 0; x < UI_W; x++) hint_ink += fb_get(&fb, x, y);
+        for (int y = UI_H - UI_BANNER_H; y < UI_H; y++)
+            for (int x = 0; x < UI_W; x++) banner_ink += fb_get(&fb, x, y);
+        CHECK(title_ink > 0);        /* "Today" is still there */
+        CHECK(hint_ink > 0);         /* "Nothing yet" / "Hold REC to talk" */
+        CHECK_EQ_INT(banner_ink, 0); /* the banner strip stays reserved */
     }
 
     /* dashboard content diff (C7 finding B): a bridge rev bump with

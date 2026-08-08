@@ -102,4 +102,12 @@ int widget_text_pages(const char *text);
 
 void widget_banner(ui_fb_t *f, const char *text);   /* inverted strip at bottom */
 
+/* Deliberate empty state (C7 round 6): two short body lines, each
+ * horizontally centered by measured width, the pair vertically centered
+ * in [y0, y1). Drawn under a retained title so an empty list reads as
+ * intentional ("Nothing yet" / "Hold REC to talk"), never as a bare or
+ * broken screen. */
+void widget_empty_state(ui_fb_t *f, const char *line1, const char *line2,
+                        int y0, int y1);
+
 #endif

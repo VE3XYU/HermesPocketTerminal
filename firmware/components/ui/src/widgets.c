@@ -277,6 +277,18 @@ int widget_text_pages(const char *text) {
     return pages_for(wrap_lines(NULL, text, 0, 0));
 }
 
+void widget_empty_state(ui_fb_t *f, const char *line1, const char *line2,
+                        int y0, int y1) {
+    /* Total ink band of two body lines at the text pitch. */
+    int band = UI_FONT_BODY_ASC + UI_TEXT_LINE_H + UI_FONT_BODY_DESC;
+    int base1 = y0 + (y1 - y0 - band) / 2 + UI_FONT_BODY_ASC;
+    int w1 = fb_text_width_prop(line1, UI_FONT_BODY);
+    int w2 = fb_text_width_prop(line2, UI_FONT_BODY);
+    fb_text_prop(f, (UI_W - w1) / 2, base1, line1, UI_FONT_BODY, 1);
+    fb_text_prop(f, (UI_W - w2) / 2, base1 + UI_TEXT_LINE_H, line2,
+                 UI_FONT_BODY, 1);
+}
+
 void widget_banner(ui_fb_t *f, const char *text) {
     int y0 = UI_H - UI_BANNER_H;
     fb_fill(f, 0, y0, UI_W, UI_BANNER_H, 1);

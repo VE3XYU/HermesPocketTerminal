@@ -216,6 +216,20 @@ int main(void) {
     CHECK_EQ_INT(pages, pages2);
     CHECK_EQ_INT(widget_text_pages(longtext), pages);   /* count-only helper agrees */
 
+    /* empty-state hint (round 6): two body lines, centered both ways,
+     * confined to [y0, y1) -- margins derived from measured widths */
+    {
+        fb_clear(&fb);
+        widget_empty_state(&fb, "Nothing yet", "Hold REC to talk", 50, 170);
+        int w_wide = fb_text_width_prop("Hold REC to talk", UI_FONT_BODY);
+        int xw = (UI_W - w_wide) / 2;
+        CHECK_EQ_INT(region_ink(0, 0, UI_W, 50), 0);        /* nothing above */
+        CHECK_EQ_INT(region_ink(0, 170, UI_W, UI_H - 170), 0); /* nothing below */
+        CHECK(region_ink(xw, 50, w_wide, 120) > 0);         /* the hint drew */
+        CHECK_EQ_INT(region_ink(0, 50, xw, 120), 0);        /* left margin clean */
+        CHECK_EQ_INT(region_ink(UI_W - xw, 50, xw, 120), 0);/* right margin clean */
+    }
+
     /* banner: inverted strip at the bottom, one ellipsized body line
      * (body, not emphasis, since the round-6 escalation) */
     fb_clear(&fb);
