@@ -7,24 +7,36 @@
 /* Layout constants are part of the contract.
  *
  * The panel is 1.54 inches across 200 px (~130 dpi): scale-1 8 px glyphs
- * are ~1.5 mm tall and were rejected as illegible on hardware. Body text
- * (list items, transcripts, settings) is therefore scale 2 -- 16 px
- * glyphs, 12 characters per line -- and the vertical budget partitions
- * exactly:
+ * are ~1.5 mm tall and were rejected as illegible on hardware, and the
+ * square scale-2 8x8 glyphs (16 px wide) fit only 12 chars/line -- too
+ * little information per line (C7 round-3 finding 5). Body text (list
+ * items, transcripts, settings, the status strip) is therefore the
+ * vendored Spleen 8x16 (fb_text16): the same 16 px height, half the
+ * advance, 24 characters per line. Headlines ("Noted", "REC") stay on
+ * the 8x8 font at scale UI_HEAD_SCALE = 24 px.
  *
- *     UI_STATUS_H + (1 title + UI_LIST_ROWS) * UI_ROW_H + UI_BANNER_H
- *   =     20      +          7 * 22                     +     26      = 200
+ * The vertical budget partitions exactly -- with the same arithmetic for
+ * both row heights, since UI_ROW2_H = 2 * UI_ROW_H:
+ *
+ *     UI_STATUS_H + (1 title + UI_LIST_ROWS)  * UI_ROW_H  + UI_BANNER_H
+ *   =     20      + 22 +      6 * 22                      +     26      = 200
+ *     UI_STATUS_H + UI_ROW_H + UI_LIST2_ROWS * UI_ROW2_H + UI_BANNER_H
+ *   =     20      + 22 +      3 * 44                      +     26      = 200
  *
  * so the list (including the cursor-row inversion) can never paint into
  * the banner strip, and the banner never covers list content.
  */
-#define UI_TEXT_SCALE  2     /* body text: 16 px glyphs */
-#define UI_LINE_CHARS  12    /* chars per scale-2 line: 12 * 16 = 192 px + margins */
-#define UI_TEXT_LINE_H 20    /* scale-2 text pitch: 16 px glyph + 4 px leading */
-#define UI_STATUS_H    20    /* status strip: y 0..19, scale-2 text, divider at y 19 */
-#define UI_ROW_H       22    /* list rows: scale-2 text with 3 px top/bottom padding */
-#define UI_BANNER_H    26    /* one scale-2 line, y 174..199 */
-#define UI_LIST_ROWS   6     /* visible rows between the title row and the banner */
+#define UI_BODY_W      8     /* body glyph advance (Spleen 8x16, fb_text16) */
+#define UI_BODY_H      16    /* body glyph height */
+#define UI_HEAD_SCALE  3     /* headlines: 8x8 font at scale 3 = 24 px */
+#define UI_LINE_CHARS  24    /* chars per body line: 24 * 8 = 192 px + margins */
+#define UI_TEXT_LINE_H 20    /* body text pitch: 16 px glyph + 4 px leading */
+#define UI_STATUS_H    20    /* status strip: y 0..19, body text, divider at y 19 */
+#define UI_ROW_H       22    /* one-line list row: body text, 3 px top/bottom pad */
+#define UI_ROW2_H      44    /* two-line list row (Recordings previews) */
+#define UI_BANNER_H    26    /* one body line, y 174..199 */
+#define UI_LIST_ROWS   6     /* visible one-line rows between title row and banner */
+#define UI_LIST2_ROWS  3     /* visible two-line rows between title row and banner */
 #define UI_TEXT_PAGE_LINES 7 /* transcript page: 7 lines x UI_LINE_CHARS chars */
 
 typedef struct {
@@ -40,12 +52,16 @@ typedef struct {
     char title[48];
     ui_row_t rows[32]; int row_count;
     int cursor;               /* absolute index; widget scrolls the window */
+    int two_line;             /* 1: UI_LIST2_ROWS rows of two body lines each
+                                 (2 * UI_LINE_CHARS chars -- Recordings
+                                 transcript previews); 0: UI_LIST_ROWS
+                                 one-line rows */
 } ui_list_t;
 void widget_list(ui_fb_t *f, const ui_list_t *l);
 
-/* Renders one page of wrapped text (UI_LINE_CHARS chars per line at scale
- * UI_TEXT_SCALE, UI_TEXT_PAGE_LINES lines per page). Returns total page
- * count for the given text. page is 0-based. */
+/* Renders one page of wrapped body text (UI_LINE_CHARS chars per line,
+ * UI_TEXT_PAGE_LINES lines per page). Returns total page count for the
+ * given text. page is 0-based. */
 int widget_text_page(ui_fb_t *f, const char *text, int page);
 
 /* Page count only -- same wrap arithmetic as widget_text_page without a

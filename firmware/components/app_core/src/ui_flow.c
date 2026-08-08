@@ -186,17 +186,20 @@ static void render_recordings(ui_flow_t *u, ui_fb_t *fb) {
     str_copy(l->title, sizeof l->title, "Recordings");
     l->cursor = u->cursor;
     l->row_count = n;
+    l->two_line = 1;   /* two body lines of transcript opening per row --
+                          ~2 * UI_LINE_CHARS chars of real content, the
+                          C7 round-3 density requirement */
     for (int i = 0; i < n && i < 32; i++) {
         sidecar_load(u->storage, s_rec_ids[i], &s_sc);
         if (s_sc.transcript[0]) {
             ui_ellipsize(l->rows[i].text, sizeof l->rows[i].text, s_sc.transcript,
-                         UI_LINE_CHARS);
+                         2 * UI_LINE_CHARS);
         } else if (strcmp(s_sc.state, "uploaded") == 0) {
             str_copy(l->rows[i].text, sizeof l->rows[i].text, "(pending)");
         } else {
-            /* the design's "(not uploaded)" is 14 chars -- 2 over the
-             * scale-2 line budget -- so it is shortened, not ellipsized */
-            str_copy(l->rows[i].text, sizeof l->rows[i].text, "(not sent)");
+            /* the design's literal string: 14 chars fit the body line
+             * again (the scale-2 budget that forced "(not sent)" is gone) */
+            str_copy(l->rows[i].text, sizeof l->rows[i].text, "(not uploaded)");
         }
     }
     widget_list(fb, l);
@@ -227,18 +230,19 @@ static int settings_lines(ui_fb_t *fb, int y, const char *s, int max_lines) {
             seg[take] = '\0';
             off += take;
         }
-        fb_text(fb, 2, y, seg, UI_TEXT_SCALE, 1);
+        fb_text16(fb, 2, y, seg, 1);
         y += UI_TEXT_LINE_H;
     }
     return y;
 }
 
 static void render_settings(ui_flow_t *u, ui_fb_t *fb) {
-    /* MAC (17 chars) and the bridge host wrap onto two scale-2 lines;
-     * worst case 2+1+2+1 = 6 lines ends at y = 24 + 6*20 = 144..159,
-     * clear of the banner strip (y >= 174). */
+    /* The MAC (17 chars) fits one 24-char body line now; only the bridge
+     * host (up to 63 chars) may still wrap onto a second line. Worst case
+     * 1+1+2+1 = 5 lines ends at y = 24 + 5*20 = 124..139, clear of the
+     * banner strip (y >= 174). */
     int y = UI_STATUS_H + 4;
-    y = settings_lines(fb, y, u->info.mac, 2);
+    y = settings_lines(fb, y, u->info.mac, 1);
     y = settings_lines(fb, y, u->info.fw_version, 1);
     y = settings_lines(fb, y, u->info.bridge_host, 2);
     char buf[32];

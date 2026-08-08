@@ -1,6 +1,8 @@
 #include "harness.h"
 #include "ui_fb.h"
 #include "ui_widgets.h"
+#include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 static ui_fb_t fb;
@@ -28,33 +30,46 @@ int main(void) {
     CHECK(region_ink(0, 0, UI_W, UI_STATUS_H) > 0);
     CHECK_EQ_INT(region_ink(0, UI_STATUS_H, UI_W, UI_H - UI_STATUS_H), 0);
 
-    /* crowded status: at scale 2, "100%" + "^32" + "W" + clock is wider than
-     * the panel, so lower-priority items must drop whole -- the 4px gap
-     * left of the right-aligned clock stays empty (nothing bleeds into it,
-     * nothing is clipped mid-glyph) */
-    fb_clear(&fb);
-    ui_status_t crowded = { .battery_pct = 100, .wifi_ok = 1, .pending_uploads = 32,
-                            .clock_hhmm = "10:15" };
-    widget_status_line(&fb, &crowded);
-    int clock_x = UI_W - 2 - 5 * 8 * UI_TEXT_SCALE;       /* "10:15" right-aligned */
+    /* clock right-alignment and its 4 px gap, derived from UI_BODY_W */
+    int clock_x = UI_W - 2 - 5 * UI_BODY_W;               /* "10:15" right-aligned */
     CHECK(region_ink(clock_x, 0, UI_W - clock_x, UI_STATUS_H - 1) > 0);   /* clock drew */
     CHECK_EQ_INT(region_ink(clock_x - 4, 0, 4, UI_STATUS_H - 1), 0);      /* gap respected */
-    CHECK_EQ_INT(region_ink(0, UI_STATUS_H, UI_W, UI_H - UI_STATUS_H), 0);
 
-    /* priority-inversion regression: after "100%" the gap before the clock
-     * is wide enough for "W" (16px) but not for "^32" (48px) -- pending
-     * must drop *and* nothing lower-priority may draw in the space it left
-     * behind, or "W" appears where the dropped pending indicator belongs,
-     * inverting the battery -> pending -> wifi hierarchy. */
-    int batt_w = 4 * 8 * UI_TEXT_SCALE;                    /* "100%" */
-    int pend_w = 3 * 8 * UI_TEXT_SCALE;                    /* "^32" */
-    int wifi_w = 1 * 8 * UI_TEXT_SCALE;                    /* "W" */
-    int batt_end = 2 + batt_w + 4;                         /* x after battery + gap */
-    int gap_limit = clock_x - 4;
-    CHECK(batt_end + wifi_w <= gap_limit);   /* sanity: "W" alone would fit here */
-    CHECK(batt_end + pend_w > gap_limit);    /* sanity: "^32" does not fit here */
-    CHECK_EQ_INT(region_ink(batt_end, 0, wifi_w, UI_STATUS_H - 1), 0);   /* "W" did not
-        draw in the gap the dropped "^32" left behind */
+    /* At the 8 px body advance, every realistic strip fits whole: battery
+     * "100%" + the widest possible pending count + "W" end left of the
+     * clock's limit. Derivation, not screenshot: widths are chars * UI_BODY_W. */
+    char pend_widest[16];
+    snprintf(pend_widest, sizeof pend_widest, "^%d", INT_MAX);
+    int limit = clock_x - 4;
+    int full_cluster_end = 2 + 4 * UI_BODY_W + 4                      /* "100%" */
+                         + (int)strlen(pend_widest) * UI_BODY_W + 4   /* "^2147483647" */
+                         + 1 * UI_BODY_W;                             /* "W" */
+    CHECK(full_cluster_end <= limit);
+    fb_clear(&fb);
+    ui_status_t full = { .battery_pct = 100, .wifi_ok = 1, .pending_uploads = INT_MAX,
+                         .clock_hhmm = "10:15" };
+    widget_status_line(&fb, &full);
+    /* wifi "W" drew at its computed slot -- nothing was dropped */
+    int wifi_x = 2 + 4 * UI_BODY_W + 4 + (int)strlen(pend_widest) * UI_BODY_W + 4;
+    CHECK(region_ink(wifi_x, 0, UI_BODY_W, UI_STATUS_H - 1) > 0);
+
+    /* priority-inversion guard: when an item does not fit, nothing after it
+     * may draw in the gap it left behind (battery -> pending -> wifi order).
+     * The only in-contract way to contest the strip at the 8 px advance is
+     * an absurd battery_pct -- the widget takes any int, so the guard stays
+     * testable even though realistic strips always fit (see above). */
+    char batt_absurd[16];
+    snprintf(batt_absurd, sizeof batt_absurd, "%d%%", 12345678);
+    int batt_end = 2 + (int)strlen(batt_absurd) * UI_BODY_W + 4;
+    CHECK(batt_end + (int)strlen(pend_widest) * UI_BODY_W > limit);  /* pending won't fit */
+    CHECK(batt_end + 1 * UI_BODY_W <= limit);                        /* "W" alone would */
+    fb_clear(&fb);
+    ui_status_t contested = { .battery_pct = 12345678, .wifi_ok = 1,
+                              .pending_uploads = INT_MAX, .clock_hhmm = "10:15" };
+    widget_status_line(&fb, &contested);
+    CHECK(region_ink(2, 0, batt_end - 2 - 4, UI_STATUS_H - 1) > 0);  /* battery drew */
+    CHECK_EQ_INT(region_ink(batt_end, 0, limit - batt_end, UI_STATUS_H - 1), 0);
+    /* ^ neither the dropped pending indicator nor "W" drew after the drop */
 
     /* list: title, rows at fixed positions, cursor row inverted (heavy ink) */
     fb_clear(&fb);
@@ -77,7 +92,7 @@ int main(void) {
     CHECK(region_ink(0, UI_STATUS_H + 3 * UI_ROW_H, UI_W, UI_ROW_H) > row2);
 
     /* scrolling: cursor 15 of 20 keeps the cursor row visible, and the
-     * scale-2 rows (title + UI_LIST_ROWS at UI_ROW_H) exactly fill the
+     * one-line rows (title + UI_LIST_ROWS at UI_ROW_H) exactly fill the
      * space above the banner -- the strip below stays untouched, cursor
      * inversion included */
     ui_list_t big = { .row_count = 20, .cursor = 15 };
@@ -87,6 +102,39 @@ int main(void) {
     widget_list(&fb, &big);
     CHECK(fb_count_black(&fb) > 0);   /* rendered without crash; window math in unit below */
     CHECK_EQ_INT(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H), 0);
+
+    /* two-line rows (Recordings previews): a >UI_LINE_CHARS text spills
+     * onto the row's second body line; UI_LIST2_ROWS rows at UI_ROW2_H
+     * partition the same space, banner strip untouched even scrolled */
+    ui_list_t two = { .row_count = 10, .cursor = 0, .two_line = 1 };
+    strcpy(two.title, "Recordings");
+    for (int i = 0; i < 10; i++)
+        snprintf(two.rows[i].text, 64,
+                 "recording %d transcript opening that runs well past one line", i);
+    fb_clear(&fb);
+    widget_list(&fb, &two);
+    int r0_y = UI_STATUS_H + UI_ROW_H;
+    CHECK(region_ink(0, r0_y + 3, UI_W, UI_BODY_H) > 0);                  /* line 1 */
+    CHECK(region_ink(0, r0_y + 3 + UI_TEXT_LINE_H, UI_W, UI_BODY_H) > 0); /* line 2 */
+    /* cursor inversion floods the full two-line row height */
+    int inv = region_ink(0, r0_y, UI_W, UI_ROW2_H);
+    CHECK(inv > UI_W * UI_ROW2_H / 2);
+    /* scrolled: last visible row ends exactly at the banner's top edge */
+    two.cursor = 7;
+    fb_clear(&fb);
+    widget_list(&fb, &two);
+    CHECK(fb_count_black(&fb) > 0);
+    CHECK_EQ_INT(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H), 0);
+
+    /* short two-line rows draw only one line: the second band stays empty */
+    ui_list_t two_short = { .row_count = 2, .cursor = 1, .two_line = 1 };
+    strcpy(two_short.title, "Recordings");
+    strcpy(two_short.rows[0].text, "(pending)");
+    strcpy(two_short.rows[1].text, "(not uploaded)");
+    fb_clear(&fb);
+    widget_list(&fb, &two_short);
+    CHECK(region_ink(0, r0_y + 3, UI_W, UI_BODY_H) > 0);
+    CHECK_EQ_INT(region_ink(0, r0_y + 3 + UI_TEXT_LINE_H, UI_W, UI_BODY_H), 0);
 
     /* text page: pagination is deterministic at UI_LINE_CHARS chars x
      * UI_TEXT_PAGE_LINES lines per page */
@@ -104,9 +152,9 @@ int main(void) {
     CHECK_EQ_INT(pages, pages2);
     CHECK_EQ_INT(widget_text_pages(longtext), pages);   /* count-only helper agrees */
 
-    /* banner: inverted strip at the bottom, one ellipsized scale-2 line */
+    /* banner: inverted strip at the bottom, one ellipsized body line */
     fb_clear(&fb);
-    widget_banner(&fb, "Meeting with Alex at 10:00 AM");
+    widget_banner(&fb, "Meeting with Alex at 10:00 AM tomorrow morning sharp");
     int strip = region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H);
     CHECK(strip > UI_W * UI_BANNER_H / 2);   /* mostly black (inverted) */
     CHECK_EQ_INT(region_ink(0, 0, UI_W, UI_H - UI_BANNER_H), 0);

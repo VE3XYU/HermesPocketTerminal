@@ -564,8 +564,9 @@ static void status_line_fill(ui_status_t *stt) {
     }
 }
 
-/* Word-wraps msg into the shared framebuffer at `cols` chars/line. */
-static void draw_wrapped(const char *msg, int x, int y0, int dy, int scale,
+/* Word-wraps msg into the shared framebuffer at `cols` chars/line, in the
+ * body font (Spleen 8x16 via fb_text16). */
+static void draw_wrapped(const char *msg, int x, int y0, int dy,
                          int cols, int max_lines) {
     char line[32];
     if (cols > (int)sizeof line - 1) cols = (int)sizeof line - 1;
@@ -582,14 +583,14 @@ static void draw_wrapped(const char *msg, int x, int y0, int dy, int scale,
         }
         memcpy(line, p, (size_t)take);
         line[take] = 0;
-        fb_text(&s_fb, x, y, line, scale, 1);
+        fb_text16(&s_fb, x, y, line, 1);
         p += take;
         y += dy;
         lines++;
     }
 }
 
-/* Status line + big scale-2 message (UI_LINE_CHARS cols), partial refresh. */
+/* Status line + body-font message (UI_LINE_CHARS cols), partial refresh. */
 static void screen_status(const char *msg) {
     ESP_LOGI(TAG, "status: %s", msg);
     if (screen_ready() != 0) return;
@@ -597,7 +598,7 @@ static void screen_status(const char *msg) {
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    draw_wrapped(msg, 4, 44, UI_TEXT_LINE_H, UI_TEXT_SCALE, UI_LINE_CHARS, 6);
+    draw_wrapped(msg, 4, 44, UI_TEXT_LINE_H, UI_LINE_CHARS, 6);
     present(0);
 }
 
@@ -607,8 +608,9 @@ static void screen_status_cb(void *ui_ctx, const char *line) {
     screen_status(line);
 }
 
-/* Primary status word at scale 3 (24 px -- "Noted"/"Done" must be readable
- * at arm's length) + the opening of the transcript at body scale below. */
+/* Primary status word at UI_HEAD_SCALE (24 px -- "Noted"/"Done" must be
+ * readable at arm's length) + the opening of the transcript in the body
+ * font below. */
 static void screen_status_transcript(const char *status, const char *transcript) {
     ESP_LOGI(TAG, "status: %s transcript=%.80s", status, transcript);
     if (screen_ready() != 0) return;
@@ -616,9 +618,9 @@ static void screen_status_transcript(const char *status, const char *transcript)
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    fb_text(&s_fb, 4, 26, status, 3, 1);
+    fb_text(&s_fb, 4, 26, status, UI_HEAD_SCALE, 1);
     draw_wrapped(transcript[0] ? transcript : "(no transcript)", 4, 60,
-                 UI_TEXT_LINE_H, UI_TEXT_SCALE, UI_LINE_CHARS, 5);
+                 UI_TEXT_LINE_H, UI_LINE_CHARS, 5);
     present(0);
 }
 
@@ -635,7 +637,7 @@ static void screen_fatal(const char *msg) {
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    draw_wrapped(msg, 4, 44, UI_TEXT_LINE_H, UI_TEXT_SCALE, UI_LINE_CHARS, 6);
+    draw_wrapped(msg, 4, 44, UI_TEXT_LINE_H, UI_LINE_CHARS, 6);
     present(0);
     epd_sleep();
     s_epd_up = 0;
@@ -777,7 +779,8 @@ static void draw_rec_glyph(void) {
     if (screen_ready() != 0) return;
     fb_clear(&s_fb);
     fb_fill(&s_fb, 92, 72, 16, 16, 1);      /* small centered dot */
-    fb_text(&s_fb, 76, 104, "REC", 2, 1);
+    /* headline size (24 px), centered: 3 chars * 8 * UI_HEAD_SCALE = 72 px */
+    fb_text(&s_fb, (UI_W - 3 * 8 * UI_HEAD_SCALE) / 2, 104, "REC", UI_HEAD_SCALE, 1);
     present(0);
 }
 

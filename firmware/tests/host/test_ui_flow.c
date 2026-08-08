@@ -70,8 +70,8 @@ int main(void) {
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_ENTRY);
     CHECK_EQ_STR(u.entry_id, "c-new");
-    /* paging: "(no transcript yet)" wraps to 3 scale-2 lines, well inside
-     * one UI_TEXT_PAGE_LINES-line page, so PWR-short wraps back to page 0 */
+    /* paging: "(no transcript yet)" (19 chars) fits one UI_LINE_CHARS body
+     * line, well inside one page, so PWR-short wraps back to page 0 */
     CHECK_EQ_INT(widget_text_pages("(no transcript yet)"), 1);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_SHORT, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.entry_page, 0);
@@ -85,8 +85,8 @@ int main(void) {
     /* settings via cycle; capture and power-off pass through from anywhere */
     ui_flow_gesture(&u, GEST_PWR_DOUBLE, path);
     CHECK_EQ_INT(u.screen, SCR_SETTINGS);
-    /* settings render: MAC and host wrap at UI_LINE_CHARS; everything
-     * stays above the banner strip (scale-2 budget: 6 lines max) */
+    /* settings render: values hard-wrap at UI_LINE_CHARS; everything
+     * stays above the banner strip (body budget: 5 lines max) */
     str_copy(u.info.mac, sizeof u.info.mac, "AA:BB:CC:DD:EE:FF");
     str_copy(u.info.fw_version, sizeof u.info.fw_version, "fw-test");
     str_copy(u.info.bridge_host, sizeof u.info.bridge_host, "bridge.example.net:8787");

@@ -1,6 +1,7 @@
 #include "ui_fb.h"
 #include <string.h>
 #include "font8x8_basic.h"
+#include "spleen_8x16.h"
 
 void fb_clear(ui_fb_t *f) { memset(f->px, 0xff, sizeof f->px); }
 
@@ -54,6 +55,21 @@ void fb_text(ui_fb_t *f, int x, int y, const char *s, int scale, int black) {
 }
 
 int fb_text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
+
+void fb_text16(ui_fb_t *f, int x, int y, const char *s, int black) {
+    for (; *s; s++) {
+        unsigned ch = (unsigned char)*s;
+        if (ch < 32 || ch > 126) ch = '?';
+        const unsigned char *glyph = spleen8x16[ch - 32];
+        for (int gy = 0; gy < 16; gy++)
+            for (int gx = 0; gx < 8; gx++)
+                if (glyph[gy] & (0x80 >> gx))       /* spleen: MSB = leftmost */
+                    fb_pixel(f, x + gx, y + gy, black);
+        x += 8;
+    }
+}
+
+int fb_text16_width(const char *s) { return (int)strlen(s) * 8; }
 
 int fb_count_black(const ui_fb_t *f) {
     int n = 0;
