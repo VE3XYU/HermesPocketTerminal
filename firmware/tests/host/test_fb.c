@@ -35,27 +35,30 @@ int main(void) {
 
     /* ---- proportional renderer (Liberation Sans ramp) ---- */
 
-    /* the ramp is proportional: 'W' is wider than 'i', and the three
-     * sizes order body < emphasis < hero for the same string */
+    /* the ramp is proportional: 'W' is wider than 'i', and the four
+     * sizes order small < body < emphasis < hero for the same string */
     CHECK(fb_text_width_prop("W", UI_FONT_BODY) > fb_text_width_prop("i", UI_FONT_BODY));
+    int ws = fb_text_width_prop("Noted", UI_FONT_SMALL);
     int wb = fb_text_width_prop("Noted", UI_FONT_BODY);
     int we = fb_text_width_prop("Noted", UI_FONT_EMPH);
     int wh = fb_text_width_prop("Noted", UI_FONT_HERO);
-    CHECK(wb > 0);
+    CHECK(ws > 0);
+    CHECK(ws < wb);
     CHECK(wb < we);
     CHECK(we < wh);
     /* width is monotone in the string: a prefix is never wider */
     CHECK(fb_text_width_prop("Note", UI_FONT_BODY) <= wb);
 
-    /* cap heights track the reference ramp (see ui_font_metrics.h):
+    /* cap heights match the declared metrics (see ui_font_metrics.h):
      * ink of "H" spans exactly [baseline - cap, baseline) */
     {
         static const struct { ui_font_id_t id; int cap, asc, desc; } ramp[] = {
+            { UI_FONT_SMALL, UI_FONT_SMALL_CAP, UI_FONT_SMALL_ASC, UI_FONT_SMALL_DESC },
             { UI_FONT_BODY, UI_FONT_BODY_CAP, UI_FONT_BODY_ASC, UI_FONT_BODY_DESC },
             { UI_FONT_EMPH, UI_FONT_EMPH_CAP, UI_FONT_EMPH_ASC, UI_FONT_EMPH_DESC },
             { UI_FONT_HERO, UI_FONT_HERO_CAP, UI_FONT_HERO_ASC, UI_FONT_HERO_DESC },
         };
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             int base = 100;
             fb_clear(&fb);
             fb_text_prop(&fb, 10, base, "H", ramp[i].id, 1);

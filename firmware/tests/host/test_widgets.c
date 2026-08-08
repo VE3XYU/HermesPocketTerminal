@@ -23,7 +23,7 @@ int main(void) {
     CHECK_EQ_INT(region_ink(0, UI_STATUS_H, UI_W, UI_H - UI_STATUS_H), 0);
 
     /* clock right-alignment by measured width, and its gap */
-    int clock_x = UI_W - UI_MARGIN_X - fb_text_width_prop("10:15", UI_FONT_BODY);
+    int clock_x = UI_W - UI_MARGIN_X - fb_text_width_prop("10:15", UI_FONT_SMALL);
     CHECK(region_ink(clock_x, 0, UI_W - clock_x, UI_STATUS_H - 1) > 0);   /* clock drew */
     CHECK_EQ_INT(region_ink(clock_x - UI_STATUS_GAP, 0, UI_STATUS_GAP,
                             UI_STATUS_H - 1), 0);                         /* gap respected */
@@ -32,9 +32,9 @@ int main(void) {
      * pending count + "W" end left of the clock's limit. Derivation by
      * measured widths, not screenshot. */
     int limit = clock_x - UI_STATUS_GAP;
-    int w_batt = fb_text_width_prop("100%", UI_FONT_BODY);
-    int w_pend = fb_text_width_prop("^9", UI_FONT_BODY);
-    int w_wifi = fb_text_width_prop("W", UI_FONT_BODY);
+    int w_batt = fb_text_width_prop("100%", UI_FONT_SMALL);
+    int w_pend = fb_text_width_prop("^9", UI_FONT_SMALL);
+    int w_wifi = fb_text_width_prop("W", UI_FONT_SMALL);
     int full_cluster_end = UI_MARGIN_X + w_batt + UI_STATUS_GAP
                          + w_pend + UI_STATUS_GAP + w_wifi;
     CHECK(full_cluster_end <= limit);
@@ -54,7 +54,7 @@ int main(void) {
     char pend_widest[16];
     snprintf(pend_widest, sizeof pend_widest, "^%d", INT_MAX);
     int batt_end = UI_MARGIN_X + w_batt + UI_STATUS_GAP;
-    CHECK(batt_end + fb_text_width_prop(pend_widest, UI_FONT_BODY) > limit);
+    CHECK(batt_end + fb_text_width_prop(pend_widest, UI_FONT_SMALL) > limit);
     CHECK(batt_end + w_wifi <= limit);           /* "W" alone would fit */
     fb_clear(&fb);
     ui_status_t contested = { .battery_pct = 100, .wifi_ok = 1,
@@ -117,8 +117,8 @@ int main(void) {
 
     /* two-line rows (Recordings previews): a text wider than one line
      * spills onto the row's second body line at the text pitch;
-     * UI_LIST2_ROWS rows at UI_ROW2_H partition the same space, banner
-     * strip untouched even scrolled */
+     * UI_LIST2_ROWS rows at UI_ROW2_H own the FULL height below the
+     * title (no banner is ever drawn over Recordings -- round 6) */
     ui_list_t two = { .row_count = 10, .cursor = 0, .two_line = 1 };
     strcpy(two.title, "Recordings");
     for (int i = 0; i < 10; i++)
@@ -136,12 +136,15 @@ int main(void) {
     /* cursor inversion floods the full two-line row height */
     int inv = region_ink(0, r0_y, UI_W, UI_ROW2_H);
     CHECK(inv > UI_W * UI_ROW2_H / 2);
-    /* scrolled: last visible row ends exactly at the banner's top edge */
+    /* scrolled: the last visible row ends exactly at the panel's bottom
+     * edge -- the grid reclaims the old banner reservation (rows there
+     * prove the 3 x 50 partition, nothing paints below y 199 by
+     * construction of fb_pixel) */
     two.cursor = 7;
     fb_clear(&fb);
     widget_list(&fb, &two);
     CHECK(fb_count_black(&fb) > 0);
-    CHECK_EQ_INT(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H), 0);
+    CHECK(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H) > 0);
 
     /* short two-line rows draw only one line: the second band stays empty */
     ui_list_t two_short = { .row_count = 2, .cursor = 1, .two_line = 1 };
@@ -165,7 +168,11 @@ int main(void) {
     int total_w = fb_text_width_prop(longtext, UI_FONT_BODY);
     CHECK(pages >= (total_w / UI_TEXT_W) / UI_TEXT_PAGE_LINES);
     CHECK(fb_count_black(&fb) > 0);
-    CHECK_EQ_INT(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H), 0);  /* clear of the banner strip */
+    CHECK_EQ_INT(region_ink(0, 0, UI_W, UI_STATUS_H), 0);   /* clear of the status strip */
+    /* a full page's 7th line lands in the reclaimed banner area (no
+     * banner is ever drawn over an entry -- round 6): ink proves the
+     * 7-line grid is actually used */
+    CHECK(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H) > 0);
     /* no line paints past the measured budget */
     CHECK_EQ_INT(region_ink(UI_MARGIN_X + UI_TEXT_W, 0,
                             UI_W - UI_MARGIN_X - UI_TEXT_W, UI_H), 0);
@@ -174,7 +181,8 @@ int main(void) {
     CHECK_EQ_INT(pages, pages2);
     CHECK_EQ_INT(widget_text_pages(longtext), pages);   /* count-only helper agrees */
 
-    /* banner: inverted strip at the bottom, one ellipsized emphasis line */
+    /* banner: inverted strip at the bottom, one ellipsized body line
+     * (body, not emphasis, since the round-6 escalation) */
     fb_clear(&fb);
     widget_banner(&fb, "Meeting with Alex at 10:00 AM tomorrow morning sharp");
     int strip = region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H);

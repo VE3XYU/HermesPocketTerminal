@@ -401,13 +401,17 @@ static int settings_lines(ui_fb_t *fb, int baseline, const char *s, int max_line
 }
 
 static void render_settings(ui_flow_t *u, ui_fb_t *fb) {
-    /* The MAC (17 chars, ~120 px) fits one measured body line; only the
-     * bridge host (up to 63 chars) may still split onto a second line.
-     * Worst case 1+1+2+1 = 5 baselines ends at UI_TEXT_FIRST_BASE +
-     * 4 * UI_TEXT_LINE_H = 108 (+4 descent), well clear of the banner
-     * strip (y >= 170). */
+    /* Worst case 1+1+2+1 = 5 baselines ends at UI_TEXT_FIRST_BASE +
+     * 4 * UI_TEXT_LINE_H = 136 (+5 descent = 141), well inside the
+     * panel. */
     int y = UI_TEXT_FIRST_BASE;
-    y = settings_lines(fb, y, u->info.mac, 1);
+    /* The MAC (17 chars) measures ~215-227 px in the escalated body --
+     * wider than the 196 px line -- and its one job is to be compared to
+     * the case sticker character-for-character, so it renders in the
+     * SMALL face (~157 px worst case) on ONE unbroken line rather than
+     * splitting. The only chrome surface besides the status strip. */
+    fb_text_prop(fb, UI_MARGIN_X, y, u->info.mac, UI_FONT_SMALL, 1);
+    y += UI_TEXT_LINE_H;
     y = settings_lines(fb, y, u->info.fw_version, 1);
     y = settings_lines(fb, y, u->info.bridge_host, 2);
     char buf[32];

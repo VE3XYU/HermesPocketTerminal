@@ -15,7 +15,7 @@ static fake_storage_t fs; static port_storage_t st;
 static fake_kv_t fk; static port_kv_t kv;
 static ui_flow_t u; static ui_fb_t fb; static char path[96];
 
-/* long enough to wrap past one 8-line page (widget_text_pages asserts so) */
+/* long enough to wrap past one 7-line page (widget_text_pages asserts so) */
 static const char *LONG_TRANSCRIPT =
     "the quick brown fox jumps over the lazy dog and keeps running "
     "the quick brown fox jumps over the lazy dog and keeps running "

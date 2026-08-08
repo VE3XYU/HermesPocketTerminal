@@ -10,11 +10,12 @@
  * fonts/gen_gfx_font.py -- nothing is copied from Adafruit or from the
  * reference firmware.
  *
- * The type ramp mirrors the shipped product on this panel: a ~9 pt
- * proportional body, ~12 pt bold emphasis, ~18.5 pt bold hero, cap
- * heights within 1 px of that product's FreeSans ramp. Callers address
- * fonts by role id; the tables themselves are private to fb.c (the
- * Task 8 constraint: widgets never include font headers).
+ * The type ramp began as the shipped product's FreeSans ramp and was
+ * escalated over four bench rounds (C7 rounds 3-6): reading text now
+ * runs a full step larger than the reference, and the original 9 pt
+ * body survives as a "small" chrome role (status strip, MAC line).
+ * Callers address fonts by role id; the tables themselves are private
+ * to fb.c (the Task 8 constraint: widgets never include font headers).
  */
 
 typedef struct {
@@ -37,9 +38,10 @@ typedef struct {
 } ui_font_t;
 
 typedef enum {
-    UI_FONT_BODY,   /* Liberation Sans Regular 9 pt: cap 12, asc 14, desc 4 */
-    UI_FONT_EMPH,   /* Liberation Sans Bold 12 pt: cap 17, asc 18, desc 5 */
+    UI_FONT_BODY,   /* Liberation Sans Regular 12 pt: cap 17, asc 18, desc 5 */
+    UI_FONT_EMPH,   /* Liberation Sans Bold 15 pt: cap 20, asc 22, desc 6 */
     UI_FONT_HERO,   /* Liberation Sans Bold 18.5 pt: cap 25, asc 27, desc 8 */
+    UI_FONT_SMALL,  /* Liberation Sans Regular 9 pt: cap 12, asc 14, desc 4 */
 } ui_font_id_t;
 
 #endif

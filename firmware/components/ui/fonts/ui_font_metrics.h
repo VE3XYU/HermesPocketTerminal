@@ -6,13 +6,17 @@
 #ifndef UI_FONT_METRICS_H
 #define UI_FONT_METRICS_H
 
-#define UI_FONT_BODY_CAP  12
-#define UI_FONT_BODY_ASC  14
-#define UI_FONT_BODY_DESC 4
+#define UI_FONT_SMALL_CAP  12
+#define UI_FONT_SMALL_ASC  14
+#define UI_FONT_SMALL_DESC 4
 
-#define UI_FONT_EMPH_CAP  17
-#define UI_FONT_EMPH_ASC  18
-#define UI_FONT_EMPH_DESC 5
+#define UI_FONT_BODY_CAP  17
+#define UI_FONT_BODY_ASC  18
+#define UI_FONT_BODY_DESC 5
+
+#define UI_FONT_EMPH_CAP  20
+#define UI_FONT_EMPH_ASC  22
+#define UI_FONT_EMPH_DESC 6
 
 #define UI_FONT_HERO_CAP  25
 #define UI_FONT_HERO_ASC  27

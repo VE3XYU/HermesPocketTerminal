@@ -1,5 +1,6 @@
 #include "ui_fb.h"
 #include <string.h>
+#include "lib_sans_small.h"
 #include "lib_sans_body.h"
 #include "lib_sans_emph.h"
 #include "lib_sans_hero.h"
@@ -7,9 +8,10 @@
 /* Role id -> generated table (fonts stay private to this file). */
 static const ui_font_t *font_for(ui_font_id_t id) {
     switch (id) {
-        case UI_FONT_EMPH: return &lib_sans_emph;
-        case UI_FONT_HERO: return &lib_sans_hero;
-        default:           return &lib_sans_body;
+        case UI_FONT_EMPH:  return &lib_sans_emph;
+        case UI_FONT_HERO:  return &lib_sans_hero;
+        case UI_FONT_SMALL: return &lib_sans_small;
+        default:            return &lib_sans_body;
     }
 }
 

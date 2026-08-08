@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Generate the terminal's proportional font tables (Adafruit-GFX format).
 
-The type ramp copies the METRICS of the shipped product on this panel
-(FreeSans 9pt body / FreeSansBold 12pt emphasis / FreeSansBold 18pt hero,
-rendered by Adafruit fontconvert conventions: pt at 141 dpi, monochrome).
-FreeSans itself is GPL, so the tables are generated fresh from Liberation
-Sans (SIL OFL 1.1), whose Helvetica-compatible metrics land within 1 px
-of that ramp's cap heights:
+The type ramp STARTED as the metrics of the shipped product on this panel
+(FreeSans 9pt body / 12pt bold emphasis / 18pt bold hero, rendered by
+Adafruit fontconvert conventions: pt at 141 dpi, monochrome). Four bench
+rounds of "bigger" (C7 rounds 3-6) escalated the reading sizes past that
+reference; the fourth escalation (round 6) pushed body to a 17 px cap and
+demoted the original 9pt body to a "small" chrome role (status strip,
+MAC line). FreeSans itself is GPL, so the tables are generated fresh from
+Liberation Sans (SIL OFL 1.1), whose Helvetica-compatible metrics track
+the same ramp:
 
-    role      face                        pt     cap  asc  desc  (FreeSans cap)
-    body      LiberationSans-Regular      9.0     12   14    4    (13)
-    emphasis  LiberationSans-Bold        12.0     17   18    5    (18)
-    hero      LiberationSans-Bold        18.5     25   27    8    (26)
+    role      face                        pt     cap  asc  desc
+    small     LiberationSans-Regular      9.0     12   14    4
+    body      LiberationSans-Regular     12.0     17   18    5
+    emphasis  LiberationSans-Bold        15.0     20   22    6
+    hero      LiberationSans-Bold        18.5     25   27    8
 
 Provenance (pinned; the script refuses mismatched inputs):
     upstream  https://github.com/liberationfonts/liberation-fonts
@@ -29,8 +33,9 @@ Regeneration (from this directory):
     tar -xzf /tmp/liberation.tar.gz -C /tmp
     /tmp/fontenv/bin/python gen_gfx_font.py --ttf-dir /tmp/liberation-fonts-ttf-2.1.5
 
-Output: lib_sans_body.h / lib_sans_emph.h / lib_sans_hero.h (bitmap pool +
-glyph table + ui_font_t descriptor each, ASCII 0x20..0x7E only) and
+Output: lib_sans_small.h / lib_sans_body.h / lib_sans_emph.h /
+lib_sans_hero.h (bitmap pool + glyph table + ui_font_t descriptor each,
+ASCII 0x20..0x7E only) and
 ui_font_metrics.h (cap/ascent/descent as #defines for layout arithmetic).
 The Adafruit-GFX table LAYOUT is an open de-facto standard implemented
 fresh here; no Adafruit code and no third-party font table is copied.
@@ -54,10 +59,12 @@ TTF_SHA256 = {
 
 FONTS = [
     # (output stem, C identifier, ttf, pt, role comment)
-    ("lib_sans_body", "lib_sans_body", "LiberationSans-Regular.ttf", 9.0,
-     "body -- lists, transcripts, settings, status strip"),
-    ("lib_sans_emph", "lib_sans_emph", "LiberationSans-Bold.ttf", 12.0,
-     "emphasis -- titles, banner"),
+    ("lib_sans_small", "lib_sans_small", "LiberationSans-Regular.ttf", 9.0,
+     "small -- status strip and the settings MAC line (chrome, not content)"),
+    ("lib_sans_body", "lib_sans_body", "LiberationSans-Regular.ttf", 12.0,
+     "body -- lists, previews, transcripts, settings, banner, status messages"),
+    ("lib_sans_emph", "lib_sans_emph", "LiberationSans-Bold.ttf", 15.0,
+     "emphasis -- list titles"),
     ("lib_sans_hero", "lib_sans_hero", "LiberationSans-Bold.ttf", 18.5,
      "hero -- outcome words (Noted/Done), REC"),
 ]
@@ -202,8 +209,8 @@ def main():
     mm.append("#ifndef UI_FONT_METRICS_H")
     mm.append("#define UI_FONT_METRICS_H")
     mm.append("")
-    for stem, name in (("lib_sans_body", "BODY"), ("lib_sans_emph", "EMPH"),
-                       ("lib_sans_hero", "HERO")):
+    for stem, name in (("lib_sans_small", "SMALL"), ("lib_sans_body", "BODY"),
+                       ("lib_sans_emph", "EMPH"), ("lib_sans_hero", "HERO")):
         m = metrics[stem]
         mm.append("#define UI_FONT_%s_CAP  %d" % (name, m["cap"]))
         mm.append("#define UI_FONT_%s_ASC  %d" % (name, m["asc"]))

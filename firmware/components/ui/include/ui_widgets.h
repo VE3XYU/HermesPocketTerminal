@@ -7,52 +7,63 @@
 
 /* Layout constants are part of the contract.
  *
- * The type ramp adopts the design of the shipped product on this exact
- * panel (its ramp: FreeSans 9pt body at 14 px lines, FreeSansBold 12pt
- * emphasis at 22 px, FreeSansBold 18pt hero at 31 px). Ours is generated
- * from Liberation Sans (fonts/, SIL OFL 1.1) at cap-height parity:
+ * The type ramp is the fourth bench escalation (C7 round 6) of what
+ * began as the shipped product's FreeSans ramp; reading text now runs a
+ * full step LARGER than that reference, and the reference-sized body
+ * survives as a "small" chrome role. Generated from Liberation Sans
+ * (fonts/, SIL OFL 1.1):
  *
- *   role  font          cap  asc  desc  used for
- *   body  UI_FONT_BODY   12   14    4   rows, transcripts, settings, status
- *   emph  UI_FONT_EMPH   17   18    5   list titles, banner
- *   hero  UI_FONT_HERO   25   27    8   outcome words ("Noted"), "REC"
+ *   role   font           cap  asc  desc  used for
+ *   small  UI_FONT_SMALL   12   14    4   status strip, settings MAC line
+ *   body   UI_FONT_BODY    17   18    5   rows, previews, transcripts,
+ *                                         settings, banner, status msgs
+ *   emph   UI_FONT_EMPH    20   22    6   list titles
+ *   hero   UI_FONT_HERO    25   27    8   outcome words ("Noted"), "REC"
  *
- * Text positions are BASELINES (fb_text_prop). Widths are measured
- * (fb_text_width_prop) and text is fitted per pixel, never per character
- * count -- the monospace 24-char grid is gone.
+ * The banner is BODY, not emphasis: at the escalated sizes a 188 px
+ * emphasis line carries ~13 characters and truncates almost every real
+ * notification, while a body line (17 px caps -- the previous rounds'
+ * emphasis height) still carries ~18. Text positions are BASELINES
+ * (fb_text_prop). Widths are measured (fb_text_width_prop) and text is
+ * fitted per pixel, never per character count.
  *
- * The vertical budget partitions exactly, for both row grids
- * (7 * UI_ROW_H == 3 * UI_ROW2_H == 126):
+ * The vertical budget partitions exactly. The one-line grid reserves the
+ * banner strip (a notification banner is only ever drawn over the
+ * dashboard -- C7 round 5 scoped dismissal there); the two-line grid
+ * owns the full height below the title, because Recordings never shows
+ * a banner and a reserved-but-empty strip would cost a whole preview:
  *
  *   UI_STATUS_H + UI_TITLE_H + UI_LIST_ROWS  * UI_ROW_H  + UI_BANNER_H
- * =     20      +     24     +   7 * 18                  +     30       = 200
- *   UI_STATUS_H + UI_TITLE_H + UI_LIST2_ROWS * UI_ROW2_H + UI_BANNER_H
- * =     20      +     24     +   3 * 42                  +     30       = 200
+ * =     20      +     30     +   5 * 24                  +     30       = 200
+ *   UI_STATUS_H + UI_TITLE_H + UI_LIST2_ROWS * UI_ROW2_H
+ * =     20      +     30     +   3 * 50                               = 200
  *
- * so the list (cursor inversion included) can never paint into the
- * banner strip and the banner never covers list content. Every baseline
- * is chosen so the font's full ascent/descent band stays inside its row
- * or strip -- _Static_asserts in widgets.c hold the arithmetic.
+ * so the dashboard list (cursor inversion included) can never paint into
+ * the banner strip and the banner never covers dashboard content. Every
+ * baseline is chosen so the font's full ascent/descent band stays inside
+ * its row or strip -- _Static_asserts in widgets.c hold the arithmetic.
  */
 #define UI_MARGIN_X    2                        /* left/right text margin */
 #define UI_TEXT_W      (UI_W - 2 * UI_MARGIN_X) /* 196 px usable line width */
 #define UI_STATUS_H    20   /* status strip: y 0..19, divider at y 19 */
-#define UI_STATUS_BASE 14   /* body baseline inside the strip */
+#define UI_STATUS_BASE 14   /* small baseline inside the strip */
 #define UI_STATUS_GAP  6    /* px between status items */
-#define UI_TITLE_H     24   /* list title row (emphasis) */
-#define UI_TITLE_BASE  18   /* emphasis baseline rel. title-row top */
-#define UI_ROW_H       18   /* one-line list row (body); asc+desc == 18 */
-#define UI_ROW_BASE    14   /* body baseline rel. row top */
-#define UI_LIST_ROWS   7    /* visible one-line rows below the title row */
-#define UI_ROW2_H      42   /* two-line list row (Recordings previews) */
-#define UI_ROW2_BASE1  17   /* first body baseline rel. row top */
-#define UI_ROW2_BASE2  35   /* second body baseline (BASE1 + line pitch) */
+#define UI_TITLE_H     30   /* list title row (emphasis) */
+#define UI_TITLE_BASE  22   /* emphasis baseline rel. title-row top */
+#define UI_ROW_H       24   /* one-line list row (body band 23 + 1) */
+#define UI_ROW_BASE    18   /* body baseline rel. row top */
+#define UI_LIST_ROWS   5    /* visible one-line rows below the title row */
+#define UI_ROW2_H      50   /* two-line list row (Recordings previews) */
+#define UI_ROW2_BASE1  20   /* first body baseline rel. row top */
+#define UI_ROW2_BASE2  44   /* second body baseline (BASE1 + line pitch) */
 #define UI_LIST2_ROWS  3    /* visible two-line rows below the title row */
-#define UI_BANNER_H    30   /* inverted strip, y 170..199 (emphasis) */
-#define UI_BANNER_BASE 21   /* emphasis baseline rel. strip top */
+#define UI_BANNER_H    30   /* inverted strip, y 170..199 (body line) */
+#define UI_BANNER_BASE 22   /* body baseline rel. strip top */
 #define UI_BANNER_PAD  6    /* banner side padding */
-#define UI_TEXT_LINE_H 18   /* body text pitch (reference: 14; +4 breathing) */
-#define UI_TEXT_PAGE_LINES 8 /* transcript page: 8 pixel-wrapped body lines */
+#define UI_TEXT_LINE_H 24   /* body text pitch (band 23 + 1 breathing) */
+#define UI_TEXT_PAGE_LINES 7 /* transcript page: 7 pixel-wrapped body lines
+                                (pages, like Recordings, own the full height:
+                                no banner is ever drawn over an entry) */
 #define UI_TEXT_FIRST_BASE (UI_STATUS_H + 2 + UI_FONT_BODY_ASC) /* page line 0 */
 
 typedef struct {
@@ -64,8 +75,8 @@ typedef struct {
 void widget_status_line(ui_fb_t *f, const ui_status_t *st);
 
 /* Row text capacity covers the widest content a two-line row can ever
- * draw: at the body font's narrowest advance (3 px) two 196 px lines
- * hold at most 130 characters, so a 136-byte buffer means a byte-
+ * draw: at the body font's narrowest advance (5 px) two 196 px lines
+ * hold at most 78 characters, so a 136-byte buffer means a byte-
  * truncated copy still overflows the pixel budget and the ellipsis can
  * never be lost to truncation. */
 typedef struct { char text[136]; int done; int dim; } ui_row_t;

@@ -632,7 +632,8 @@ static void screen_status_cb(void *ui_ctx, const char *line) {
 
 /* Primary status word at the hero size (25 px caps -- "Noted"/"Done"
  * must be readable at arm's length) + the opening of the transcript in
- * the body font below, on the hero's 31 px line advance. */
+ * the body font below, on the hero's 31 px line advance. 5 body lines
+ * at the round-6 pitch: baselines 82..178, descent 183 -- on-panel. */
 static void screen_status_transcript(const char *status, const char *transcript) {
     ESP_LOGI(TAG, "status: %s transcript=%.80s", status, transcript);
     if (screen_ready() != 0) return;
@@ -643,7 +644,7 @@ static void screen_status_transcript(const char *status, const char *transcript)
     int hero_base = 26 + UI_FONT_HERO_CAP;      /* cap tops at y = 26 */
     fb_text_prop(&s_fb, 4, hero_base, status, UI_FONT_HERO, 1);
     draw_wrapped(transcript[0] ? transcript : "(no transcript)", 4,
-                 hero_base + 31, 6);
+                 hero_base + 31, 5);
     present(0);
 }
 

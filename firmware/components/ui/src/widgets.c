@@ -13,16 +13,18 @@
  */
 
 /* The vertical budget must partition the panel exactly (see ui_widgets.h):
- * the list's last row (and its cursor inversion) ends at the banner's top
- * edge, so neither can ever paint over the other -- for both row grids. */
+ * the one-line grid reserves the banner strip (banners are only drawn over
+ * the dashboard); the two-line grid owns the full height below the title
+ * (Recordings never shows a banner -- a reserved strip would cost a
+ * preview row). */
 _Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST_ROWS * UI_ROW_H + UI_BANNER_H == UI_H,
                "status + title + rows + banner must partition the 200 px height");
-_Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST2_ROWS * UI_ROW2_H + UI_BANNER_H == UI_H,
-               "the two-line row grid must partition the same 200 px height");
+_Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST2_ROWS * UI_ROW2_H == UI_H,
+               "the two-line row grid must partition the full 200 px height");
 /* Every baseline keeps its font's full ascent/descent band inside its
  * row or strip. */
-_Static_assert(UI_STATUS_BASE >= UI_FONT_BODY_ASC &&
-               UI_STATUS_BASE + UI_FONT_BODY_DESC <= UI_STATUS_H - 1,
+_Static_assert(UI_STATUS_BASE >= UI_FONT_SMALL_ASC &&
+               UI_STATUS_BASE + UI_FONT_SMALL_DESC <= UI_STATUS_H - 1,
                "status text must clear the divider row");
 _Static_assert(UI_TITLE_BASE >= UI_FONT_EMPH_ASC &&
                UI_TITLE_BASE + UI_FONT_EMPH_DESC <= UI_TITLE_H,
@@ -34,24 +36,30 @@ _Static_assert(UI_ROW2_BASE1 >= UI_FONT_BODY_ASC &&
                UI_ROW2_BASE2 + UI_FONT_BODY_DESC <= UI_ROW2_H &&
                UI_ROW2_BASE2 - UI_ROW2_BASE1 == UI_TEXT_LINE_H,
                "two body lines at the text pitch stay inside a two-line row");
-_Static_assert(UI_BANNER_BASE >= UI_FONT_EMPH_ASC &&
-               UI_BANNER_BASE + UI_FONT_EMPH_DESC <= UI_BANNER_H,
+_Static_assert(UI_BANNER_BASE >= UI_FONT_BODY_ASC &&
+               UI_BANNER_BASE + UI_FONT_BODY_DESC <= UI_BANNER_H,
                "banner ink stays inside the banner strip");
-/* Text pages stay clear of the banner strip by construction. */
+/* Text pages fill the height below the status strip (no banner is ever
+ * drawn over an entry). */
 _Static_assert(UI_TEXT_FIRST_BASE - UI_FONT_BODY_ASC >= UI_STATUS_H &&
                UI_TEXT_FIRST_BASE + (UI_TEXT_PAGE_LINES - 1) * UI_TEXT_LINE_H
-                   + UI_FONT_BODY_DESC <= UI_H - UI_BANNER_H,
-               "a full text page must fit above the banner strip");
+                   + UI_FONT_BODY_DESC < UI_H,
+               "a full text page must fit on the panel");
 
 void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
     char buf[24];
 
+    /* The strip renders in the SMALL face (the pre-round-6 body): it is
+     * chrome -- numbers and single letters, not prose -- and holding it
+     * at the reference size keeps the strip at 20 px, which buys the
+     * dashboard a whole extra row over escalating it with the body. */
+
     /* Clock first (right-aligned by measured width): it always fits alone. */
     int limit = UI_W - UI_MARGIN_X;
     if (st->clock_hhmm[0]) {
-        int w = fb_text_width_prop(st->clock_hhmm, UI_FONT_BODY);
+        int w = fb_text_width_prop(st->clock_hhmm, UI_FONT_SMALL);
         int cx = UI_W - UI_MARGIN_X - w;
-        fb_text_prop(f, cx, UI_STATUS_BASE, st->clock_hhmm, UI_FONT_BODY, 1);
+        fb_text_prop(f, cx, UI_STATUS_BASE, st->clock_hhmm, UI_FONT_SMALL, 1);
         limit = cx - UI_STATUS_GAP;
     }
 
@@ -68,19 +76,19 @@ void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
     int stop = 0;
     if (!stop && st->battery_pct != -1) {
         snprintf(buf, sizeof buf, "%d%%", st->battery_pct);
-        int w = fb_text_width_prop(buf, UI_FONT_BODY);
-        if (x + w <= limit) { fb_text_prop(f, x, UI_STATUS_BASE, buf, UI_FONT_BODY, 1); x += w + UI_STATUS_GAP; }
+        int w = fb_text_width_prop(buf, UI_FONT_SMALL);
+        if (x + w <= limit) { fb_text_prop(f, x, UI_STATUS_BASE, buf, UI_FONT_SMALL, 1); x += w + UI_STATUS_GAP; }
         else stop = 1;
     }
     if (!stop && st->pending_uploads > 0) {
         snprintf(buf, sizeof buf, "^%d", st->pending_uploads);
-        int w = fb_text_width_prop(buf, UI_FONT_BODY);
-        if (x + w <= limit) { fb_text_prop(f, x, UI_STATUS_BASE, buf, UI_FONT_BODY, 1); x += w + UI_STATUS_GAP; }
+        int w = fb_text_width_prop(buf, UI_FONT_SMALL);
+        if (x + w <= limit) { fb_text_prop(f, x, UI_STATUS_BASE, buf, UI_FONT_SMALL, 1); x += w + UI_STATUS_GAP; }
         else stop = 1;
     }
     if (!stop && st->wifi_ok) {
-        int w = fb_text_width_prop("W", UI_FONT_BODY);
-        if (x + w <= limit) fb_text_prop(f, x, UI_STATUS_BASE, "W", UI_FONT_BODY, 1);
+        int w = fb_text_width_prop("W", UI_FONT_SMALL);
+        if (x + w <= limit) fb_text_prop(f, x, UI_STATUS_BASE, "W", UI_FONT_SMALL, 1);
     }
 
     fb_hline(f, 0, UI_STATUS_H - 1, UI_W, 1);
@@ -166,8 +174,8 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
 
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n'; }
 
-/* Longest body-line buffer: UI_TEXT_W px at the narrowest advance (3 px)
- * is 65 characters. */
+/* Longest body-line buffer: UI_TEXT_W px at the body's narrowest advance
+ * (5 px) is 39 characters. */
 #define WRAP_BUF 80
 
 static void wrap_emit(ui_fb_t *f, const char *line, int line_index,
@@ -273,11 +281,14 @@ void widget_banner(ui_fb_t *f, const char *text) {
     int y0 = UI_H - UI_BANNER_H;
     fb_fill(f, 0, y0, UI_W, UI_BANNER_H, 1);
 
-    /* One emphasis line -- a notification is a glance-and-clear
-     * interaction, not a reading surface -- ellipsized to the strip's
-     * measured budget rather than wrapped. */
+    /* One BODY line -- a notification is a glance-and-clear interaction,
+     * not a reading surface -- ellipsized to the strip's measured budget
+     * rather than wrapped. Body, not emphasis, since the round-6
+     * escalation: 17 px caps are the previous rounds' emphasis height,
+     * and the 188 px budget still carries ~18 characters where the new
+     * emphasis would carry ~13 and truncate almost everything. */
     char line[80];
-    fb_ellipsize_prop(line, sizeof line, text, UI_FONT_EMPH,
+    fb_ellipsize_prop(line, sizeof line, text, UI_FONT_BODY,
                       UI_W - 2 * UI_BANNER_PAD);
-    fb_text_prop(f, UI_BANNER_PAD, y0 + UI_BANNER_BASE, line, UI_FONT_EMPH, 0);
+    fb_text_prop(f, UI_BANNER_PAD, y0 + UI_BANNER_BASE, line, UI_FONT_BODY, 0);
 }
