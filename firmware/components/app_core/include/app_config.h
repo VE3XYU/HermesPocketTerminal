@@ -10,6 +10,9 @@ typedef struct {
     int  sync_interval_s;        /* default 600; superseded at runtime by dashboard sync_interval */
     int  silence_timeout_s;      /* 0 = disabled (default) */
     char log_level[8];           /* "error"|"warn"|"info"|"debug", default "info" */
+    char timezone[64];           /* optional POSIX TZ string, e.g. "EST5EDT,M3.2.0,M11.1.0";
+                                    "" (absent or overlong) = UTC. Parsed here (pure);
+                                    applied via setenv("TZ")/tzset() in main/ only. */
 } app_config_t;
 int app_config_parse(const char *json, size_t len, app_config_t *out); /* -1 when url/token missing */
 

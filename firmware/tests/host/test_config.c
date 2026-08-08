@@ -20,6 +20,41 @@ int main(void) {
     CHECK_EQ_INT(c.sync_interval_s, 600);        /* defaults */
     CHECK_EQ_INT(c.silence_timeout_s, 0);
     CHECK_EQ_STR(c.log_level, "info");
+    CHECK_EQ_STR(c.timezone, "");                /* absent -> empty -> UTC */
+
+    /* timezone (C7 finding D): optional POSIX TZ string */
+    const char *with_tz =
+        "{\"bridge_url\":\"https://htp.example.net\",\"token\":\"t\","
+        "\"timezone\":\"EST5EDT,M3.2.0,M11.1.0\"}";
+    CHECK_EQ_INT(app_config_parse(with_tz, strlen(with_tz), &c), 0);
+    CHECK_EQ_STR(c.timezone, "EST5EDT,M3.2.0,M11.1.0");
+
+    /* overlong (>= 64 chars): ignored entirely -> UTC, never truncated (a
+     * truncated TZ rule is a different rule, not an approximation); the
+     * config as a whole still parses */
+    {
+        char overlong[256];
+        char tz[80];
+        memset(tz, 'X', sizeof tz - 1);
+        tz[sizeof tz - 1] = '\0';
+        snprintf(overlong, sizeof overlong,
+                 "{\"bridge_url\":\"https://htp.example.net\",\"token\":\"t\","
+                 "\"timezone\":\"%s\"}", tz);
+        CHECK_EQ_INT(app_config_parse(overlong, strlen(overlong), &c), 0);
+        CHECK_EQ_STR(c.timezone, "");
+    }
+    /* boundary: exactly 63 chars fits char[64] */
+    {
+        char overlong[256];
+        char tz[64];
+        memset(tz, 'Y', sizeof tz - 1);
+        tz[sizeof tz - 1] = '\0';
+        snprintf(overlong, sizeof overlong,
+                 "{\"bridge_url\":\"https://htp.example.net\",\"token\":\"t\","
+                 "\"timezone\":\"%s\"}", tz);
+        CHECK_EQ_INT(app_config_parse(overlong, strlen(overlong), &c), 0);
+        CHECK_EQ_STR(c.timezone, tz);
+    }
 
     const char *no_token = "{\"bridge_url\":\"https://x\"}";
     CHECK_EQ_INT(app_config_parse(no_token, strlen(no_token), &c), -1);

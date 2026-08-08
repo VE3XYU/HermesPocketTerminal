@@ -37,6 +37,14 @@ int app_config_parse(const char *json, size_t len, app_config_t *out) {
     get_str(root, "log_level", out->log_level, sizeof out->log_level);
     if (out->log_level[0] == '\0') str_copy(out->log_level, sizeof out->log_level, "info");
 
+    /* Optional POSIX TZ string (C7 finding D), e.g. "EST5EDT,M3.2.0,M11.1.0";
+     * empty = UTC. An overlong value is ignored (stays UTC) rather than
+     * truncated: a truncated TZ rule is a different rule, not an
+     * approximation of the intended one. */
+    cJSON *tz = cJSON_GetObjectItemCaseSensitive(root, "timezone");
+    if (cJSON_IsString(tz) && strlen(tz->valuestring) < sizeof out->timezone)
+        str_copy(out->timezone, sizeof out->timezone, tz->valuestring);
+
     cJSON_Delete(root);
     return 0;
 }

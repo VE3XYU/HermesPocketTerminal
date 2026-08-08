@@ -539,13 +539,16 @@ static void status_line_fill(ui_status_t *stt) {
     stt->battery_pct = board_battery_pct();
     stt->wifi_ok = s_wifi_ok;
     stt->pending_uploads = pending_uploads();
-    /* Clock: UTC HH:MM from the RTC-backed epoch (no timezone in the
-     * config yet -- a Task 19 candidate); hidden until the clock is set. */
+    /* Clock: local HH:MM from the RTC-backed epoch. "Local" is the
+     * config.json "timezone" POSIX TZ string applied in load_config()
+     * (C7 finding D); with no field TZ is pinned to UTC0, so localtime_r
+     * degrades to exactly the old gmtime_r rendering. Hidden until the
+     * clock is set. */
     long long e = s_ck.epoch_s(s_ck.ctx);
     if (e > 0) {
         time_t t = (time_t)e;
         struct tm tmv;
-        gmtime_r(&t, &tmv);
+        localtime_r(&t, &tmv);
         snprintf(stt->clock_hhmm, sizeof stt->clock_hhmm, "%02d:%02d",
                  tmv.tm_hour, tmv.tm_min);
     }
@@ -655,8 +658,16 @@ static int load_config(void) {
         return -1;
     }
     s_have_cfg = 1;
-    ESP_LOGI(TAG, "bridge=%s token=%.4s...(%d) sync=%d",
-             s_cfg.bridge_url, s_cfg.token, (int)strlen(s_cfg.token), s_cfg.sync_interval_s);
+    ESP_LOGI(TAG, "bridge=%s token=%.4s...(%d) sync=%d tz=%s",
+             s_cfg.bridge_url, s_cfg.token, (int)strlen(s_cfg.token), s_cfg.sync_interval_s,
+             s_cfg.timezone[0] ? s_cfg.timezone : "(UTC)");
+    /* C7 finding D: apply the config timezone once per config load -- every
+     * session path funnels through here before it draws a clock. newlib
+     * picks it up via TZ/tzset; an empty field pins UTC explicitly so a
+     * stale environment can never leak into the clock. Applied on the IDF
+     * side only: app_core just parses the string. */
+    setenv("TZ", s_cfg.timezone[0] ? s_cfg.timezone : "UTC0", 1);
+    tzset();
     return 0;
 }
 
