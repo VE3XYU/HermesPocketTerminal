@@ -56,8 +56,9 @@ int main(void) {
     CHECK_EQ_INT(u.dash.items[0].done, 1);    /* unchanged, no second complete call */
     CHECK_EQ_INT(ft.req_count, 1);
 
-    /* screen cycling is a full refresh */
-    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_DOUBLE, path), UIF_REDRAW_FULL);
+    /* screen cycling is a partial (C7 refresh policy: within-session updates
+     * never flash; fulls are first-draw or ghost-clear only) */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_DOUBLE, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
     CHECK_EQ_INT(u.cursor, 0);
 
@@ -65,8 +66,8 @@ int main(void) {
     ui_flow_render(&u, &fb);
     CHECK(fb_count_black(&fb) > 0);
 
-    /* open entry (cursor 0 = c-new: not uploaded) */
-    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_FULL);
+    /* open entry (cursor 0 = c-new: not uploaded) -- partial, same policy */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_ENTRY);
     CHECK_EQ_STR(u.entry_id, "c-new");
     /* paging: "(no transcript yet)" wraps to 3 scale-2 lines, well inside
@@ -77,8 +78,8 @@ int main(void) {
     /* play from entry */
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_SHORT, path), UIF_PLAY_WAV);
     CHECK_EQ_STR(path, "/rec/c-new.wav");
-    /* back out */
-    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_FULL);
+    /* back out -- partial, same policy */
+    CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_LONG, path), UIF_REDRAW_PARTIAL);
     CHECK_EQ_INT(u.screen, SCR_RECORDINGS);
 
     /* settings via cycle; capture and power-off pass through from anywhere */
@@ -101,11 +102,13 @@ int main(void) {
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_HOLD_START, path), UIF_START_CAPTURE);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_OFF, path), UIF_POWER_OFF);
 
-    /* refresh discipline: 8 partials force a full */
+    /* refresh discipline: exactly one ghost-clear full per
+     * UI_GHOST_CLEAR_EVERY partials, from a reset counter */
+    CHECK(ui_flow_wants_full(&u, UIF_REDRAW_FULL));   /* explicit full: 1, resets */
     int fulls = 0;
-    for (int i = 0; i < 9; i++)
+    for (int i = 0; i < UI_GHOST_CLEAR_EVERY; i++)
         if (ui_flow_wants_full(&u, UIF_REDRAW_PARTIAL)) fulls++;
     CHECK_EQ_INT(fulls, 1);
-    CHECK(ui_flow_wants_full(&u, UIF_REDRAW_FULL));
+    CHECK_EQ_INT(u.partial_count, 0);   /* the ghost-clear full reset the budget */
     return HARNESS_REPORT();
 }

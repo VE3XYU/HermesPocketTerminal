@@ -603,9 +603,12 @@ static void screen_status_transcript(const char *status, const char *transcript)
     present(0);
 }
 
-/* Terminal screen for a session that cannot continue: full refresh, then
- * the panel is put to sleep immediately (the image persists without
- * power) so the common teardown has nothing left to do. */
+/* Terminal screen for a session that cannot continue; the panel is put to
+ * sleep immediately (the image persists without power) so the common
+ * teardown has nothing left to do. C7 finding A: no longer forces a full --
+ * nearly every fatal is the session's first draw (SD/config errors at
+ * entry), which present()'s base gate makes a full anyway; a mid-session
+ * fatal ("SD full") is a within-session update like any other. */
 static void screen_fatal(const char *msg) {
     ESP_LOGE(TAG, "fatal: %s", msg);
     if (screen_ready() != 0) return;
@@ -614,7 +617,7 @@ static void screen_fatal(const char *msg) {
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
     draw_wrapped(msg, 4, 44, UI_TEXT_LINE_H, UI_TEXT_SCALE, UI_LINE_CHARS, 6);
-    present(1);
+    present(0);
     epd_sleep();
     s_epd_up = 0;
     s_base_drawn = 0;
@@ -903,9 +906,12 @@ static void load_cached_dashboard(void) {
     s_uif.dash = s_dash_cache.d;
 }
 
-/* Renders ui_flow's current screen with a live status header. */
+/* Renders ui_flow's current screen with a live status header. An explicit
+ * full also resets the ghost-clear budget (a full clears all ghosting, so
+ * the partial count restarts from zero -- C7 finding A). */
 static void flow_redraw(int want_full) {
     if (screen_ready() != 0) return;
+    if (want_full) ui_flow_wants_full(&s_uif, UIF_REDRAW_FULL);
     status_line_fill(&s_uif.status);
     ui_flow_render(&s_uif, &s_fb);
     present(want_full);
@@ -1273,7 +1279,7 @@ static void ui_session(wake_cause_t wc) {
                  * so this would be a redundant partial refresh. */
                 if ((rep.uploads_retried > 0 || pending_uploads() != pend_before) &&
                     !rep.dashboard_changed)
-                    flow_redraw(0);
+                    flow_redraw(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
                 idle_t0 = s_ck.mono_ms(s_ck.ctx);   /* sync time isn't idle time */
             }
         }
@@ -1301,7 +1307,7 @@ static void ui_session(wake_cause_t wc) {
              * release resolves as PWR_LONG) -- swallow it, restore the
              * screen. */
             countdown_shown = 0;
-            flow_redraw(0);
+            flow_redraw(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
             continue;
         }
 

@@ -101,7 +101,10 @@ ui_action_t ui_flow_gesture(ui_flow_t *u, gesture_t g, char out_path[96]) {
                 default:             u->screen = SCR_DASHBOARD;  break;
             }
             u->cursor = 0;
-            return UIF_REDRAW_FULL;
+            /* C7 finding A: screen changes used to force a full; every one
+             * of them is a within-session update, so partial (mode-2 is
+             * flash-free; ghosting is handled by the cadence). */
+            return UIF_REDRAW_PARTIAL;
         }
 
         case GEST_PWR_LONG: {
@@ -113,11 +116,11 @@ ui_action_t ui_flow_gesture(ui_flow_t *u, gesture_t g, char out_path[96]) {
                 str_copy(u->entry_id, sizeof u->entry_id, s_rec_ids[idx]);
                 u->entry_page = 0;
                 u->screen = SCR_ENTRY;
-                return UIF_REDRAW_FULL;
+                return UIF_REDRAW_PARTIAL;   /* C7 finding A, as above */
             }
             if (u->screen == SCR_ENTRY) {
                 u->screen = SCR_RECORDINGS;
-                return UIF_REDRAW_FULL;
+                return UIF_REDRAW_PARTIAL;   /* C7 finding A, as above */
             }
             return UIF_NONE;
         }
@@ -134,7 +137,7 @@ int ui_flow_wants_full(ui_flow_t *u, ui_action_t a) {
     }
     if (a == UIF_REDRAW_PARTIAL) {
         u->partial_count++;
-        if (u->partial_count >= 8) {
+        if (u->partial_count >= UI_GHOST_CLEAR_EVERY) {
             u->partial_count = 0;
             return 1;
         }
