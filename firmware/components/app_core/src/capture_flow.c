@@ -88,18 +88,24 @@ capture_outcome_t capture_run(capture_ctx_t *cx, sidecar_t *sc) {
     return CAPTURE_TIMEOUT;
 }
 
+/* Retry-scan batch buffers: static, not stack -- the id list (2 KB) plus
+ * a sidecar_t (1.2 KB) made capture_retry_pending a 3.3 KB frame, first
+ * on the stack in every sync cycle (C5 stack ruling; see rec_index.c).
+ * Single main task, fully re-populated per call. */
+static char s_retry_ids[32][64];
+static sidecar_t s_retry_sc;
+
 int capture_retry_pending(capture_ctx_t *cx) {
-    char ids[32][64];
-    int n = rec_index_list(cx->storage, ids, 32);
+    int n = rec_index_list(cx->storage, s_retry_ids, 32);
     int confirmed = 0;
     for (int i = 0; i < n; i++) {
-        sidecar_t sc;
-        if (sidecar_load(cx->storage, ids[i], &sc) != 0) continue;
-        if (strcmp(sc.state, "not_uploaded") != 0) continue;
-        if (upload_once(cx, &sc) == HTP_OK) {
-            str_copy(sc.state, sizeof sc.state, "uploaded");
-            sc.uploaded_at = cx->clock->epoch_s(cx->clock->ctx);
-            sidecar_save(cx->storage, &sc);
+        sidecar_t *sc = &s_retry_sc;
+        if (sidecar_load(cx->storage, s_retry_ids[i], sc) != 0) continue;
+        if (strcmp(sc->state, "not_uploaded") != 0) continue;
+        if (upload_once(cx, sc) == HTP_OK) {
+            str_copy(sc->state, sizeof sc->state, "uploaded");
+            sc->uploaded_at = cx->clock->epoch_s(cx->clock->ctx);
+            sidecar_save(cx->storage, sc);
             confirmed++;
         }
     }

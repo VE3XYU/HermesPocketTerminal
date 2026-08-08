@@ -7,6 +7,15 @@
 #define REC_INDEX_PATH "/rec/index"
 #define REC_INDEX_CAP 16384
 
+/* Index read buffer: static, not stack. As a local this was a 16.4 KB
+ * frame (`entry a1, 0x40b0` in the C5 binary) -- allocated in the
+ * prologue before a single byte is read, it alone consumed 80% of the
+ * 20 KB main-task stack and blew it on the first hardware sync session.
+ * Same pure-C single-task ruling as sync.c's batch statics: no OS or
+ * allocator calls, every caller (sync/capture/UI flows) is the one main
+ * task, and the buffer is fully re-read before each use. */
+static char s_index_buf[REC_INDEX_CAP];
+
 int rec_index_append(port_storage_t *st, const char *capture_id) {
     char line[96];
     snprintf(line, sizeof line, "%s\n", capture_id);
@@ -14,12 +23,12 @@ int rec_index_append(port_storage_t *st, const char *capture_id) {
 }
 
 int rec_index_list(port_storage_t *st, char ids[][64], int max) {
-    char buf[REC_INDEX_CAP];
+    char *const buf = s_index_buf;
     size_t len = 0;
 
     if (st == NULL || ids == NULL) return 0;
     if (st->read == NULL) return 0;
-    if (st->read(st->ctx, REC_INDEX_PATH, buf, sizeof(buf) - 1, &len) != 0) {
+    if (st->read(st->ctx, REC_INDEX_PATH, buf, REC_INDEX_CAP - 1, &len) != 0) {
         return 0;
     }
 

@@ -46,15 +46,21 @@ int sidecar_save(port_storage_t *st, const sidecar_t *sc) {
     return ret;
 }
 
+/* JSON read buffer for sidecar_load(): static, not stack -- a 4 KB local
+ * put a 4.2 KB frame on every load call, stacked under the sync and
+ * render flows (C5 stack ruling; see rec_index.c). Single main task,
+ * fully re-read per call. */
+static char s_json_buf[4096];
+
 int sidecar_load(port_storage_t *st, const char *capture_id, sidecar_t *out) {
     memset(out, 0, sizeof *out);
 
     char path[96];
     sidecar_path(path, capture_id);
 
-    char buf[4096];
+    char *const buf = s_json_buf;
     size_t len = 0;
-    if (st->read(st->ctx, path, buf, sizeof buf - 1, &len) != 0)
+    if (st->read(st->ctx, path, buf, sizeof s_json_buf - 1, &len) != 0)
         return -1;
 
     buf[len] = 0;

@@ -8,6 +8,17 @@
 /* recordings list cap: matches the render window budget (Task 10 brief). */
 #define UI_FLOW_REC_CAP (UI_LIST_ROWS * 3)
 
+/* Flow scratch models: static, not stack (C5 stack ruling; see
+ * rec_index.c). As locals these stacked multi-KB frames under the render
+ * callbacks: the id list is 1.9 KB (three call sites), ui_list_t 2.4 KB,
+ * sidecar_t 1.2 KB, and the pagination framebuffer 5 KB. All users run
+ * on the one main task and never nest -- each buffer is fully
+ * re-populated (or memset) before every use. */
+static char      s_rec_ids[UI_FLOW_REC_CAP][64];
+static ui_list_t s_list;
+static sidecar_t s_sc;
+static ui_fb_t   s_scratch_fb;   /* entry_total_pages page counting only */
+
 void ui_flow_init(ui_flow_t *u, htp_client_t *c, port_storage_t *st, port_kv_t *kv) {
     memset(u, 0, sizeof *u);
     u->client = c;
@@ -24,22 +35,18 @@ static int active_row_count(ui_flow_t *u) {
     switch (u->screen) {
         case SCR_DASHBOARD:
             return u->dash.item_count;
-        case SCR_RECORDINGS: {
-            char ids[UI_FLOW_REC_CAP][64];
-            return rec_index_list(u->storage, ids, UI_FLOW_REC_CAP);
-        }
+        case SCR_RECORDINGS:
+            return rec_index_list(u->storage, s_rec_ids, UI_FLOW_REC_CAP);
         default:
             return 1;
     }
 }
 
 static int entry_total_pages(ui_flow_t *u) {
-    sidecar_t sc;
-    sidecar_load(u->storage, u->entry_id, &sc);
-    const char *text = sc.transcript[0] ? sc.transcript : "(no transcript yet)";
-    ui_fb_t scratch;
-    fb_clear(&scratch);
-    return widget_text_page(&scratch, text, 0);
+    sidecar_load(u->storage, u->entry_id, &s_sc);
+    const char *text = s_sc.transcript[0] ? s_sc.transcript : "(no transcript yet)";
+    fb_clear(&s_scratch_fb);
+    return widget_text_page(&s_scratch_fb, text, 0);
 }
 
 ui_action_t ui_flow_gesture(ui_flow_t *u, gesture_t g, char out_path[96]) {
@@ -100,12 +107,11 @@ ui_action_t ui_flow_gesture(ui_flow_t *u, gesture_t g, char out_path[96]) {
 
         case GEST_PWR_LONG: {
             if (u->screen == SCR_RECORDINGS) {
-                char ids[UI_FLOW_REC_CAP][64];
-                int n = rec_index_list(u->storage, ids, UI_FLOW_REC_CAP);
+                int n = rec_index_list(u->storage, s_rec_ids, UI_FLOW_REC_CAP);
                 if (n <= 0) return UIF_NONE;
                 int idx = u->cursor;
                 if (idx < 0 || idx >= n) idx = 0;
-                str_copy(u->entry_id, sizeof u->entry_id, ids[idx]);
+                str_copy(u->entry_id, sizeof u->entry_id, s_rec_ids[idx]);
                 u->entry_page = 0;
                 u->screen = SCR_ENTRY;
                 return UIF_REDRAW_FULL;
@@ -141,46 +147,43 @@ int ui_flow_wants_full(ui_flow_t *u, ui_action_t a) {
 /* ---- render ---- */
 
 static void render_dashboard(ui_flow_t *u, ui_fb_t *fb) {
-    ui_list_t l;
-    memset(&l, 0, sizeof l);
-    str_copy(l.title, sizeof l.title, u->dash.title);
-    l.cursor = u->cursor;
-    l.row_count = u->dash.item_count;
+    ui_list_t *l = &s_list;
+    memset(l, 0, sizeof *l);
+    str_copy(l->title, sizeof l->title, u->dash.title);
+    l->cursor = u->cursor;
+    l->row_count = u->dash.item_count;
     for (int i = 0; i < u->dash.item_count && i < 32; i++) {
-        str_copy(l.rows[i].text, sizeof l.rows[i].text, u->dash.items[i].text);
-        l.rows[i].done = u->dash.items[i].done;
+        str_copy(l->rows[i].text, sizeof l->rows[i].text, u->dash.items[i].text);
+        l->rows[i].done = u->dash.items[i].done;
     }
-    widget_list(fb, &l);
+    widget_list(fb, l);
     if (u->banner[0]) widget_banner(fb, u->banner);
 }
 
 static void render_recordings(ui_flow_t *u, ui_fb_t *fb) {
-    char ids[UI_FLOW_REC_CAP][64];
-    int n = rec_index_list(u->storage, ids, UI_FLOW_REC_CAP);
+    int n = rec_index_list(u->storage, s_rec_ids, UI_FLOW_REC_CAP);
 
-    ui_list_t l;
-    memset(&l, 0, sizeof l);
-    str_copy(l.title, sizeof l.title, "Recordings");
-    l.cursor = u->cursor;
-    l.row_count = n;
+    ui_list_t *l = &s_list;
+    memset(l, 0, sizeof *l);
+    str_copy(l->title, sizeof l->title, "Recordings");
+    l->cursor = u->cursor;
+    l->row_count = n;
     for (int i = 0; i < n && i < 32; i++) {
-        sidecar_t sc;
-        sidecar_load(u->storage, ids[i], &sc);
-        if (sc.transcript[0]) {
-            ui_ellipsize(l.rows[i].text, sizeof l.rows[i].text, sc.transcript, 22);
-        } else if (strcmp(sc.state, "uploaded") == 0) {
-            str_copy(l.rows[i].text, sizeof l.rows[i].text, "(pending)");
+        sidecar_load(u->storage, s_rec_ids[i], &s_sc);
+        if (s_sc.transcript[0]) {
+            ui_ellipsize(l->rows[i].text, sizeof l->rows[i].text, s_sc.transcript, 22);
+        } else if (strcmp(s_sc.state, "uploaded") == 0) {
+            str_copy(l->rows[i].text, sizeof l->rows[i].text, "(pending)");
         } else {
-            str_copy(l.rows[i].text, sizeof l.rows[i].text, "(not uploaded)");
+            str_copy(l->rows[i].text, sizeof l->rows[i].text, "(not uploaded)");
         }
     }
-    widget_list(fb, &l);
+    widget_list(fb, l);
 }
 
 static void render_entry(ui_flow_t *u, ui_fb_t *fb) {
-    sidecar_t sc;
-    sidecar_load(u->storage, u->entry_id, &sc);
-    const char *text = sc.transcript[0] ? sc.transcript : "(no transcript yet)";
+    sidecar_load(u->storage, u->entry_id, &s_sc);
+    const char *text = s_sc.transcript[0] ? s_sc.transcript : "(no transcript yet)";
     widget_text_page(fb, text, u->entry_page);
 }
 

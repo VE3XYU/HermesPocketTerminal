@@ -112,14 +112,20 @@ int htp_upload_capture(htp_client_t *c, const htp_upload_params_t *p) {
     return ok ? HTP_OK : HTP_ERR_PROTO;
 }
 
+/* Query path for htp_poll_captures: static, not stack -- 32 ids x 64
+ * chars + separators is a 2.5 KB buffer, stacked under the sync backfill
+ * and capture polling (C5 stack ruling in app_core/rec_index.c; same
+ * pure-C, single-main-task justification). Fully rebuilt per call. */
+static char s_poll_path[2560];
+
 int htp_poll_captures(htp_client_t *c, const char *const ids[], int n,
                       htp_capture_status_t out[], int max_out, long long *server_time) {
-    char path[2560];   /* 32 ids x 64 chars + separators must fit */
+    char *const path = s_poll_path;
     size_t pos = 0;
-    if (append_fmt(path, sizeof path, &pos, "/htp/v1/captures?ids=") != 0)
+    if (append_fmt(path, sizeof s_poll_path, &pos, "/htp/v1/captures?ids=") != 0)
         return HTP_ERR_CLIENT;
     for (int i = 0; i < n; i++)
-        if (append_fmt(path, sizeof path, &pos, "%s%s", i ? "," : "", ids[i]) != 0)
+        if (append_fmt(path, sizeof s_poll_path, &pos, "%s%s", i ? "," : "", ids[i]) != 0)
             return HTP_ERR_CLIENT;
     htp_request_t req = { .method = "GET", .path = path };
     cJSON *j = NULL;
