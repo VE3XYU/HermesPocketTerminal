@@ -1421,9 +1421,11 @@ static void ui_session(wake_cause_t wc) {
 #define DEV_HEARTBEAT_MS    30000               /* heartbeat cadence while staying awake */
 #define DEV_IDLE_TIMEOUT_MS (10u * 60u * 1000u) /* ~10 min without input -> deep sleep */
 #define DEV_PWR_HOLD_MS     2000                /* PWR held this long -> deep sleep */
-#define DEV_BTN_DEBOUNCE_MS 60                  /* continuous-press debounce: the same
+#define DEV_BTN_DEBOUNCE_MS 60                  /* PWR-tap debounce: the same continuous
                                                    re-sampling pattern as power_button_
-                                                   held_at_boot, at tap scale (3 polls) */
+                                                   held_at_boot, at tap scale (3 polls).
+                                                   REC uses GEST_REC_HOLD_MS instead --
+                                                   it starts a recording, not a menu */
 
 /* End-of-session behavior for development builds: stay awake with
  * USB-Serial-JTAG alive so the operator can keep iterating (flash, read
@@ -1432,11 +1434,13 @@ static void ui_session(wake_cause_t wc) {
  *
  * C7 finding C: buttons act here now (the operator could not record a
  * second capture without typing 'sleep' first). Outcomes:
- *   - REC pressed (debounced DEV_BTN_DEBOUNCE_MS of continuous samples):
- *     returns WAKE_REC_BUTTON -- the caller dispatches a capture session
- *     while the operator is still holding the button (hold-to-talk from
- *     this very press; s_linger_rec_press_ms carries the press time so
- *     record_capture logs press-to-record-start).
+ *   - REC held GEST_REC_HOLD_MS of continuous samples (the same sustained
+ *     hold the UI session's gesture FSM demands, so a stray tap does not
+ *     spin up a capture that can only end "Too short"): returns
+ *     WAKE_REC_BUTTON -- the caller dispatches a capture session while the
+ *     operator is still holding the button (hold-to-talk from this very
+ *     press; s_linger_rec_press_ms carries the press time, so the
+ *     press-to-record-start line record_capture logs includes this hold).
  *   - PWR tapped (>= debounce, released before DEV_PWR_HOLD_MS): returns
  *     WAKE_PWR_BUTTON -- the caller dispatches a UI session.
  *   - "sleep" + Enter, PWR held ~2 s (release waited so EXT1 doesn't
@@ -1480,12 +1484,16 @@ static wake_cause_t dev_linger(unsigned sleep_s) {
             }
         }
 
-        /* REC: a debounced press exits straight into a capture session.
-         * No wait for release -- the hold IS the recording gesture. */
+        /* REC: a sustained hold exits straight into a capture session.
+         * No wait for release -- the hold IS the recording gesture. The
+         * threshold is the UI session's own hold-to-talk threshold
+         * (GEST_REC_HOLD_MS, 350 ms) rather than the tap-scale debounce:
+         * C7 round 2 -- at 60 ms a stray brush of the button span up a
+         * whole capture session that could only end "Too short". */
         if (board_btn_rec()) {
             t_last_input = now;
             if (t_rec_down_since < 0) t_rec_down_since = now;
-            else if (now - t_rec_down_since >= DEV_BTN_DEBOUNCE_MS) {
+            else if (now - t_rec_down_since >= GEST_REC_HOLD_MS) {
                 s_linger_rec_press_ms = t_rec_down_since;
                 ESP_LOGI(TAG, "REC pressed in linger: starting a capture session");
                 return WAKE_REC_BUTTON;
