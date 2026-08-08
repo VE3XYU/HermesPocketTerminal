@@ -24,4 +24,10 @@ i2c_master_bus_handle_t board_i2c_bus(void);
  * overlaps it) instead of always sleeping the full settle window. */
 int board_rail_audio_on_ms(void);
 
+/* Same for the EPD rail: milliseconds since it was last gated on; -1 while
+ * off. epd_init() subtracts already-elapsed settle so a caller that
+ * pre-gated the rail (main.c, button wakes) doesn't pay the full window
+ * again on the first-frame path. */
+int board_rail_epd_on_ms(void);
+
 #endif

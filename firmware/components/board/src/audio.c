@@ -438,6 +438,42 @@ int audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx)
     return failed ? -1 : 0;
 }
 
+/* Keypress clicks (C7 round 5). Two blips one octave apart, keyed by
+ * button: "next" (PWR) low, "select" (REC) high -- learnable in one
+ * session. Unlike audio_beep() there is NO drain delay: the codec stays
+ * open for the whole UI session (main.c brings it up once at session
+ * start), the ring is empty when a click lands, and auto_clear feeds
+ * silence afterwards -- so the write queues in ~1 ms and the sound starts
+ * within one DMA descriptor (32 ms at 16 kHz) of the press. Amplitude
+ * matches the chime's untuned ~9% of full scale. s_play_out is reused as
+ * the staging buffer (same mutual-exclusion argument as the other
+ * statics: one main task, clicks never overlap record/playback). */
+#define CLICK_NEXT_HZ    1000
+#define CLICK_NEXT_MS    30
+#define CLICK_SELECT_HZ  2000
+#define CLICK_SELECT_MS  45
+
+void audio_click(int select)
+{
+    if (s_dev == NULL) return;                    /* codec down: silent no-op */
+    if (codec_open_at(AUDIO_RATE_HZ) != 0) return;
+
+    const int hz = select ? CLICK_SELECT_HZ : CLICK_NEXT_HZ;
+    const int ms = select ? CLICK_SELECT_MS : CLICK_NEXT_MS;
+    const int period = AUDIO_RATE_HZ / hz;
+    int frames = AUDIO_RATE_HZ / 1000 * ms;
+    const int cap = (int)(sizeof s_play_out / sizeof s_play_out[0]) / 2;
+    if (frames > cap) frames = cap;               /* 1024 frames = 64 ms max */
+
+    for (int i = 0; i < frames; i++) {
+        int16_t s = (i % period) < period / 2 ? (int16_t)BEEP_AMPLITUDE
+                                              : (int16_t)-BEEP_AMPLITUDE;
+        s_play_out[2 * i]     = s;
+        s_play_out[2 * i + 1] = s;
+    }
+    esp_codec_dev_write(s_dev, s_play_out, frames * 4);
+}
+
 void audio_beep(void)
 {
     if (s_dev == NULL) return;

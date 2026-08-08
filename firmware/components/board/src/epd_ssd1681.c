@@ -9,6 +9,7 @@
  * uploaded, so no LUT table ships in this file.
  */
 #include "board.h"
+#include "board_priv.h"   /* board_rail_epd_on_ms(): settle-overlap accounting */
 #include "tick_ms.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -192,7 +193,16 @@ static void frame_write(const uint8_t *fb) {
 int epd_init(void) {
     ESP_LOGI(TAG, "init: rail gate=%d (0=on, active-low) at entry", board_rail_epd_level());
     board_rail_epd(1);
-    vTaskDelay(pdMS_TO_TICKS(100));  /* rail settle margin for a cold panel; not datasheet-mandated */
+    /* Rail settle margin for a cold panel (100 ms, not datasheet-mandated).
+     * Only the part of the window that hasn't already elapsed is slept:
+     * main.c pre-gates this rail on button wakes so the settle overlaps
+     * the SD mount + config load, the same trick the audio rail plays
+     * (C7 round 5 first-frame shave). */
+    {
+        int since = board_rail_epd_on_ms();
+        if (since >= 0 && since < 100)
+            board_delay_ms((unsigned)(100 - since));
+    }
 
     /* INPUT_OUTPUT (not plain OUTPUT) so the diagnostic logs below read the
      * real pad level back, not the always-0 a disabled input buffer gives. */

@@ -42,7 +42,27 @@ void board_early_init(void) {
     gpio_config(&in);
 }
 
-void board_rail_epd(int on)   { gpio_set_level(PIN_EPD_PWR, !on); }
+/* EPD rail-on timestamp, mirroring the audio rail's pattern below: lets
+ * epd_init() subtract settle time that already elapsed when a caller
+ * gated the rail on early (main.c pre-gates it on button wakes so the
+ * settle overlaps the SD mount -- C7 round 5 first-frame shave). */
+static int64_t s_epd_rail_on_us = -1;
+
+void board_rail_epd(int on)   {
+    if (on) {
+        if (gpio_get_level(PIN_EPD_PWR) != 0 || s_epd_rail_on_us < 0)
+            s_epd_rail_on_us = esp_timer_get_time();
+    } else {
+        s_epd_rail_on_us = -1;
+    }
+    gpio_set_level(PIN_EPD_PWR, !on);
+}
+
+int board_rail_epd_on_ms(void) {
+    if (s_epd_rail_on_us < 0) return -1;
+    int64_t ms = (esp_timer_get_time() - s_epd_rail_on_us) / 1000;
+    return ms > 0x7fffffff ? 0x7fffffff : (int)ms;
+}
 
 /* Rail-on timestamp for board_rail_audio_on_ms() (board_priv.h): lets
  * audio_init() and the shared-I2C-bus accessor subtract settle time that

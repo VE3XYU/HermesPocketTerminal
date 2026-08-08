@@ -47,6 +47,12 @@ long audio_record_to(const char *path, int (*keep_going)(void *), void *ctx, uns
  * 24 k replies both work). stop_now() polled between chunks. 0 ok. */
 int  audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx);
 void audio_beep(void);   /* short 1 kHz chime, generated, no asset */
+/* UI click feedback (C7 round 5): a generated square blip, queued to the
+ * DMA ring and returned from immediately (no drain wait) so a keypress
+ * click never blocks the gesture loop. select=0 -> "next" (1 kHz, 30 ms),
+ * select=1 -> "select" (2 kHz, 45 ms). Silent no-op unless audio_init()
+ * has run -- callers degrade gracefully when the codec is down. */
+void audio_click(int select);
 void audio_deinit(void); /* PA off, codec closed, rail off */
 
 /* Battery percent (Task 16). ADC1 channel 3 = GPIO 4, oneshot, 8 samples
