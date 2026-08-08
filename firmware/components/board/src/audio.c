@@ -447,11 +447,29 @@ int audio_play_wav(const char *path, int (*stop_now)(void *), void *ctx)
  * within one DMA descriptor (32 ms at 16 kHz) of the press. Amplitude
  * matches the chime's untuned ~9% of full scale. s_play_out is reused as
  * the staging buffer (same mutual-exclusion argument as the other
- * statics: one main task, clicks never overlap record/playback). */
+ * statics: one main task, clicks never overlap record/playback).
+ *
+ * C7 round 6, finding 1 -- the "chuk-ah" second syllable: the raw square
+ * used to START at +/-3000 and STOP at whatever polarity the last sample
+ * happened to hold (the 30 ms next-blip is exactly 30 full periods, so it
+ * always ended at -3000). auto_clear then snaps the line to 0 -- a
+ * 3000-LSB DC step straight into the speaker, whose cone relaxation is
+ * the audible pop that read as a trailing syllable. The fix is an
+ * amplitude envelope: a 3 ms linear attack (48 samples, 0 -> full) and an
+ * 8 ms linear decay (128 samples, full -> 0) whose LAST SAMPLE IS EXACTLY
+ * ZERO, so the transition into auto_clear silence is a no-op and the tail
+ * is silent by construction. Per-edge steps shrink from 3000 LSB to
+ * <= ~63 (amp/48) at the attack and <= ~24 (amp/128) at the decay.
+ * Durations are unchanged (30 / 45 ms, decay included). The write cannot
+ * be truncated: the longest click is 720 frames, the DMA ring holds 4096,
+ * so the single blocking esp_codec_dev_write() queues the whole blip and
+ * the ring plays it out while the codec stays open for the session. */
 #define CLICK_NEXT_HZ    1000
 #define CLICK_NEXT_MS    30
 #define CLICK_SELECT_HZ  2000
 #define CLICK_SELECT_MS  45
+#define CLICK_ATTACK_MS  3            /* linear ramp in, from zero */
+#define CLICK_DECAY_MS   8            /* linear ramp out, TO zero */
 
 void audio_click(int select)
 {
@@ -461,13 +479,18 @@ void audio_click(int select)
     const int hz = select ? CLICK_SELECT_HZ : CLICK_NEXT_HZ;
     const int ms = select ? CLICK_SELECT_MS : CLICK_NEXT_MS;
     const int period = AUDIO_RATE_HZ / hz;
+    const int att = AUDIO_RATE_HZ / 1000 * CLICK_ATTACK_MS;   /* 48 samples */
+    const int dec = AUDIO_RATE_HZ / 1000 * CLICK_DECAY_MS;    /* 128 samples */
     int frames = AUDIO_RATE_HZ / 1000 * ms;
     const int cap = (int)(sizeof s_play_out / sizeof s_play_out[0]) / 2;
     if (frames > cap) frames = cap;               /* 1024 frames = 64 ms max */
 
     for (int i = 0; i < frames; i++) {
-        int16_t s = (i % period) < period / 2 ? (int16_t)BEEP_AMPLITUDE
-                                              : (int16_t)-BEEP_AMPLITUDE;
+        int a = BEEP_AMPLITUDE;
+        if (i < att)                a = a * i / att;                    /* attack */
+        else if (i >= frames - dec) a = a * (frames - 1 - i) / dec;     /* decay,
+                                        last sample (i == frames-1) exactly 0 */
+        int16_t s = (i % period) < period / 2 ? (int16_t)a : (int16_t)-a;
         s_play_out[2 * i]     = s;
         s_play_out[2 * i + 1] = s;
     }
