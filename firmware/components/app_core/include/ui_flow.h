@@ -50,4 +50,13 @@ ui_action_t ui_flow_gesture(ui_flow_t *u, gesture_t g, char out_path[96]);
  * caller explicitly requests a full and resets the ghost-clear budget. */
 int ui_flow_wants_full(ui_flow_t *u, ui_action_t a);
 
+/* 1 when the two dashboards would render identical pixels: title,
+ * item_count, and per-item text/done/style. rev and item ids are
+ * deliberately ignored -- they never touch the panel. C7 finding B: the
+ * bridge bumps its content-hash rev whenever the agent republishes, so a
+ * "changed" dashboard fetch can carry a screen the operator is already
+ * looking at (e.g. right after a complete gesture drew the strike); the
+ * render callback uses this to skip the repaint entirely. */
+int ui_dash_content_equal(const htp_dashboard_t *a, const htp_dashboard_t *b);
+
 #endif

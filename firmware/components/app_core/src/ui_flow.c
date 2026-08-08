@@ -130,6 +130,17 @@ ui_action_t ui_flow_gesture(ui_flow_t *u, gesture_t g, char out_path[96]) {
     }
 }
 
+int ui_dash_content_equal(const htp_dashboard_t *a, const htp_dashboard_t *b) {
+    if (a->item_count != b->item_count) return 0;
+    if (strcmp(a->title, b->title) != 0) return 0;
+    for (int i = 0; i < a->item_count && i < 32; i++) {
+        if (!a->items[i].done != !b->items[i].done) return 0;
+        if (strcmp(a->items[i].text, b->items[i].text) != 0) return 0;
+        if (strcmp(a->items[i].style, b->items[i].style) != 0) return 0;
+    }
+    return 1;
+}
+
 int ui_flow_wants_full(ui_flow_t *u, ui_action_t a) {
     if (a == UIF_REDRAW_FULL) {
         u->partial_count = 0;

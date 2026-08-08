@@ -919,9 +919,22 @@ static void flow_redraw(int want_full) {
 
 static int render_dashboard_cb(void *ui_ctx, const htp_dashboard_t *d) {
     (void)ui_ctx;
-    if (screen_ready() != 0) return -1;
+    /* C7 finding B: the bridge's rev is a content hash that the agent's
+     * republish bumps even when nothing the panel renders differs -- most
+     * visibly seconds after a complete gesture, whose _notify_completion
+     * makes the agent republish the very list the strike partial already
+     * shows. Adopt the fresh model and snapshot it (ids/rev may have
+     * changed and the complete gesture posts ids), but skip the repaint
+     * when no pixel would change. sync.c stores the new rev regardless,
+     * so the next fetch reads "unchanged". */
+    int same = ui_dash_content_equal(&s_uif.dash, d);
     s_uif.dash = *d;
     save_dashboard_cache(d);   /* next PWR wake paints this instantly */
+    if (same) {
+        ESP_LOGI(TAG, "dashboard rev changed, content identical: no repaint");
+        return 0;
+    }
+    if (screen_ready() != 0) return -1;
     status_line_fill(&s_uif.status);
     ui_flow_render(&s_uif, &s_fb);
     present(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));

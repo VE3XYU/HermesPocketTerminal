@@ -102,6 +102,37 @@ int main(void) {
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_REC_HOLD_START, path), UIF_START_CAPTURE);
     CHECK_EQ_INT(ui_flow_gesture(&u, GEST_PWR_OFF, path), UIF_POWER_OFF);
 
+    /* dashboard content diff (C7 finding B): a bridge rev bump with
+     * pixel-identical content must not repaint. rev and item ids are NOT
+     * content -- they never touch the panel. */
+    {
+        htp_dashboard_t a, b;
+        memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
+        a.item_count = b.item_count = 2;
+        str_copy(a.title, sizeof a.title, "Today");
+        str_copy(a.rev, sizeof a.rev, "r-1");
+        str_copy(a.items[0].id, 32, "t-9f2"); str_copy(a.items[0].text, 64, "Buy milk");
+        a.items[0].done = 1;
+        str_copy(a.items[1].id, 32, "t-c41"); str_copy(a.items[1].text, 64, "Call dentist");
+        str_copy(a.items[1].style, 12, "dim");
+        b = a;
+        CHECK_EQ_INT(ui_dash_content_equal(&a, &b), 1);
+        /* the load-bearing case: only rev + ids changed (agent republish) */
+        str_copy(b.rev, sizeof b.rev, "r-2");
+        str_copy(b.items[0].id, 32, "t-000");
+        CHECK_EQ_INT(ui_dash_content_equal(&a, &b), 1);
+        b = a; b.items[0].done = 0;                       /* strike state differs */
+        CHECK_EQ_INT(ui_dash_content_equal(&a, &b), 0);
+        b = a; str_copy(b.items[1].text, 64, "Call mom"); /* text differs */
+        CHECK_EQ_INT(ui_dash_content_equal(&a, &b), 0);
+        b = a; b.items[1].style[0] = '\0';                /* style differs (dim marker) */
+        CHECK_EQ_INT(ui_dash_content_equal(&a, &b), 0);
+        b = a; b.item_count = 1;                          /* item removed */
+        CHECK_EQ_INT(ui_dash_content_equal(&a, &b), 0);
+        b = a; str_copy(b.title, sizeof b.title, "Later"); /* title differs */
+        CHECK_EQ_INT(ui_dash_content_equal(&a, &b), 0);
+    }
+
     /* refresh discipline: exactly one ghost-clear full per
      * UI_GHOST_CLEAR_EVERY partials, from a reset counter */
     CHECK(ui_flow_wants_full(&u, UIF_REDRAW_FULL));   /* explicit full: 1, resets */
