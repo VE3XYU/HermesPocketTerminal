@@ -33,6 +33,18 @@ int idf_wifi_start_connect_async(const wifi_profiles_t *p, port_kv_t *kv);
      * scan started, -1 = could not even start one (no profiles, driver init
      * failure). "Nothing in range" now surfaces from wait_connected(). */
 
+int idf_wifi_poll_connected(void);
+    /* Non-blocking probe for a join started with start_connect_async():
+     * 0 = connected (link re-verified, fast-join cache refreshed),
+     * 1 = still in flight (scan running or association pending),
+     * -1 = failed (nothing in range / association refused). Advances the
+     * join state machine without waiting: a finished scan is collected and
+     * turned into a connect, a failed fast join falls back to a fresh
+     * async scan (once -- same policy as wait_connected(), minus the
+     * blocking). idf_wifi_wait_connected(0) is NOT a substitute: with a
+     * join still pending it would burn the fast-join fallback (or block on
+     * the scan wait) on every call. */
+
 int idf_wifi_wait_connected(unsigned timeout_ms);
     /* Waits for an IP, then re-verifies the association is still up before
      * reporting success (a join that got an IP and immediately dropped is a

@@ -1,9 +1,16 @@
-/* HTP terminal firmware — wake dispatch + full capture session (Task 17).
+/* HTP terminal firmware — wake dispatch, capture/UI/sync sessions (Task 18).
  *
  * app_main() dispatches on the wake cause (design §5.1):
- *   REC button  -> capture_session()      hold-to-talk, upload, reply, sync
- *   PWR button  -> ui_session_stub()      sync-only until Task 18
- *   timer/cold  -> sync_session_stub()    mount, config, Wi-Fi, sync_cycle
+ *   REC button  -> capture_session()   hold-to-talk, upload, reply, sync
+ *   PWR button  -> ui_session()        cached dashboard instantly, background
+ *                                      join + sync, gesture loop, 30 s idle
+ *   timer/cold  -> sync_session()      silent: renders only what changed
+ *
+ * An awake watchdog (design §8) caps every session: a one-shot esp_timer
+ * armed before dispatch and re-armed at phase transitions (recording,
+ * upload/poll, playback, each operator gesture), so a wedged session deep-
+ * sleeps instead of draining the battery while every legitimate phase
+ * finishes ahead of its cap.
  *
  * Task 14's serial-provisioning boot path survives inside the sync/UI
  * sessions: SD mount failure, an unparseable /config.json, or the Power
@@ -22,6 +29,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "board.h"
 #include "tick_ms.h"
@@ -43,6 +51,8 @@
 #include "util.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_mac.h"
+#include "esp_app_desc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -87,6 +97,24 @@ static int s_base_drawn;   /* a full refresh established a partial base */
 static int s_panel_lost;   /* a hung background task may still own fb + EPD SPI */
 static char s_json[2048];  /* config/wifi read + provisioning paste scratch */
 static sidecar_t s_sc, s_sc_next;
+static int s_pending_cache = -1;    /* memoized capture_pending_count(); -1 = recount.
+                                       Invalidated wherever an upload state changes, so
+                                       cursor-move redraws don't re-walk the SD index. */
+
+/* Dashboard snapshot (/dash.bin): the last rendered htp_dashboard_t, so a
+ * PWR wake paints the dashboard instantly from SD while Wi-Fi joins in the
+ * background, and a sync-only notification render has a real list to stamp
+ * the banner onto. Binary struct dump rather than the re-serialized JSON:
+ * htp_client has a parser but no serializer, and the magic + size header
+ * discards a snapshot written by any other firmware layout. */
+#define DASH_CACHE_PATH  "/dash.bin"
+#define DASH_CACHE_MAGIC 0x48445348u
+typedef struct {
+    uint32_t magic;
+    uint32_t size;              /* sizeof(htp_dashboard_t) layout guard */
+    htp_dashboard_t d;
+} dash_cache_t;
+static dash_cache_t s_dash_cache;   /* ~3.7 KB: static per the stack ruling */
 
 #define REPLY_LOGICAL "/reply.tmp.wav"
 #define REPLY_FS      "/sdcard" REPLY_LOGICAL
@@ -97,6 +125,19 @@ static sidecar_t s_sc, s_sc_next;
 #define MAX_RECORD_MS        120000  /* hard cap on one recording (design §5.2) */
 #define MIN_WAV_BYTES        8000    /* < 250 ms of 16 kHz mono: discard */
 #define FOLLOW_UP_WINDOW_MS  30000   /* hold-to-talk window after a reply */
+#define UI_IDLE_TIMEOUT_MS   30000   /* UI session: idle this long -> sleep */
+#define PWR_COUNTDOWN_MS     2000    /* PWR held this long -> power-off warning */
+
+/* Awake-watchdog phase caps (design §8). Armed before dispatch and re-armed
+ * at phase transitions; each value bounds one phase, not the session sum:
+ *   BASE  UI gestures / sync sessions (join 20 s + fetches ~60 s worst)
+ *   REC   phases that may contain one full recording or playback (120 s max)
+ *         plus interaction margin (follow-up window, boot-to-record)
+ *   NET   upload + poll: 3 upload attempts x 60 s timeout + backoff (~185 s)
+ *         + 60 s poll window of 15 s-timeout polls + reply download */
+#define AWAKE_CAP_BASE_S 90
+#define AWAKE_CAP_REC_S  210
+#define AWAKE_CAP_NET_S  300
 
 /* ============================================================
  * Task 14 serial provisioning (C3 hardware reality: the operator's SD
@@ -478,11 +519,30 @@ static void present(int want_full) {
     }
 }
 
+/* Pending-upload count for the status header, memoized because every
+ * redraw calls it and the raw count re-reads the rec index (16 KB SD
+ * read) plus every sidecar. Everything that changes an upload state
+ * resets s_pending_cache to -1. */
+static int pending_uploads(void) {
+    if (s_pending_cache < 0) s_pending_cache = capture_pending_count(&s_st);
+    return s_pending_cache;
+}
+
 static void status_line_fill(ui_status_t *stt) {
     memset(stt, 0, sizeof *stt);
     stt->battery_pct = board_battery_pct();
     stt->wifi_ok = s_wifi_ok;
-    /* pending_uploads and the clock stay blank until Task 18's UI pass */
+    stt->pending_uploads = pending_uploads();
+    /* Clock: UTC HH:MM from the RTC-backed epoch (no timezone in the
+     * config yet -- a Task 19 candidate); hidden until the clock is set. */
+    long long e = s_ck.epoch_s(s_ck.ctx);
+    if (e > 0) {
+        time_t t = (time_t)e;
+        struct tm tmv;
+        gmtime_r(&t, &tmv);
+        snprintf(stt->clock_hhmm, sizeof stt->clock_hhmm, "%02d:%02d",
+                 tmv.tm_hour, tmv.tm_min);
+    }
 }
 
 /* Word-wraps msg into the shared framebuffer at `cols` chars/line. */
@@ -510,7 +570,7 @@ static void draw_wrapped(const char *msg, int x, int y0, int dy, int scale,
     }
 }
 
-/* Status line + big scale-2 message (12 cols/line), partial refresh. */
+/* Status line + big scale-2 message (UI_LINE_CHARS cols), partial refresh. */
 static void screen_status(const char *msg) {
     ESP_LOGI(TAG, "status: %s", msg);
     if (screen_ready() != 0) return;
@@ -518,7 +578,7 @@ static void screen_status(const char *msg) {
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    draw_wrapped(msg, 4, 48, 20, 2, 12, 6);
+    draw_wrapped(msg, 4, 44, UI_TEXT_LINE_H, UI_TEXT_SCALE, UI_LINE_CHARS, 6);
     present(0);
 }
 
@@ -528,7 +588,8 @@ static void screen_status_cb(void *ui_ctx, const char *line) {
     screen_status(line);
 }
 
-/* Big status word + the opening of the transcript below it. */
+/* Primary status word at scale 3 (24 px -- "Noted"/"Done" must be readable
+ * at arm's length) + the opening of the transcript at body scale below. */
 static void screen_status_transcript(const char *status, const char *transcript) {
     ESP_LOGI(TAG, "status: %s transcript=%.80s", status, transcript);
     if (screen_ready() != 0) return;
@@ -536,8 +597,9 @@ static void screen_status_transcript(const char *status, const char *transcript)
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    fb_text(&s_fb, 4, 22, status, 2, 1);
-    draw_wrapped(transcript[0] ? transcript : "(no transcript)", 2, 48, 12, 1, 24, 12);
+    fb_text(&s_fb, 4, 26, status, 3, 1);
+    draw_wrapped(transcript[0] ? transcript : "(no transcript)", 4, 60,
+                 UI_TEXT_LINE_H, UI_TEXT_SCALE, UI_LINE_CHARS, 5);
     present(0);
 }
 
@@ -551,11 +613,24 @@ static void screen_fatal(const char *msg) {
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    draw_wrapped(msg, 4, 48, 20, 2, 12, 6);
+    draw_wrapped(msg, 4, 44, UI_TEXT_LINE_H, UI_TEXT_SCALE, UI_LINE_CHARS, 6);
     present(1);
     epd_sleep();
     s_epd_up = 0;
     s_base_drawn = 0;
+}
+
+/* Redraws only the status strip over whatever screen the panel already
+ * shows (partial refresh): the "upload states changed but the content on
+ * screen is still right" case -- e.g. the after-capture sync retried an
+ * older pending upload while the outcome screen is up. */
+static void refresh_status_strip(void) {
+    if (screen_ready() != 0 || !s_base_drawn) return;
+    ui_status_t stt;
+    status_line_fill(&stt);
+    fb_fill(&s_fb, 0, 0, UI_W, UI_STATUS_H, 0);   /* clear the strip to white */
+    widget_status_line(&s_fb, &stt);
+    present(0);
 }
 
 /* ============================================================
@@ -603,16 +678,51 @@ static uint32_t boot_count_bump(void) {
 
 /* kv "sync_s" (written by sync_cycle from the dashboard), else the card
  * config, else the design default of 600 s. Clamped so a bad value can
- * never arm a zero/absurd timer. */
+ * never arm a zero/absurd timer. Battery policy (design §8): below 15%
+ * the interval quadruples; -1 (ADC unavailable) must not trip it. */
 static unsigned next_sync_interval(void) {
+    unsigned s = 600;
     char v[16];
+    int got = 0;
     if (s_kv.get(s_kv.ctx, "sync_s", v, sizeof v) == 0) {
-        int s = atoi(v);
-        if (s >= 60 && s <= 86400) return (unsigned)s;
+        int n = atoi(v);
+        if (n >= 60 && n <= 86400) { s = (unsigned)n; got = 1; }
     }
-    if (s_have_cfg && s_cfg.sync_interval_s >= 60 && s_cfg.sync_interval_s <= 86400)
-        return (unsigned)s_cfg.sync_interval_s;
-    return 600;
+    if (!got && s_have_cfg && s_cfg.sync_interval_s >= 60 && s_cfg.sync_interval_s <= 86400)
+        s = (unsigned)s_cfg.sync_interval_s;
+
+    int batt = board_battery_pct();
+    if (batt >= 0 && batt < 15) {
+        s *= 4;
+        if (s > 86400) s = 86400;
+    }
+    return s;
+}
+
+/* ============================================================
+ * Awake watchdog (design §8): a one-shot esp_timer whose only job is to
+ * turn a wedged session into a deep sleep instead of a drained battery.
+ * Armed before dispatch, re-armed at phase transitions (see the
+ * AWAKE_CAP_* table), cancelled once the session returns -- the dev
+ * linger has its own idle timeout and must not be capped.
+ * ============================================================ */
+
+static esp_timer_handle_t s_awake_cap;
+
+static void awake_cap_cb(void *arg) {
+    (void)arg;
+    ESP_LOGE(TAG, "awake cap hit");
+    board_deep_sleep(next_sync_interval());
+}
+
+static void awake_cap_arm(unsigned seconds) {
+    if (!s_awake_cap) return;
+    esp_timer_stop(s_awake_cap);   /* harmless when not running */
+    esp_timer_start_once(s_awake_cap, (uint64_t)seconds * 1000000ULL);
+}
+
+static void awake_cap_cancel(void) {
+    if (s_awake_cap) esp_timer_stop(s_awake_cap);
 }
 
 /* ============================================================
@@ -731,20 +841,57 @@ static int record_capture(sidecar_t *sc, const char *conversation_id,
         str_copy(sc->conversation_id, sizeof sc->conversation_id, conversation_id);
     sidecar_save(&s_st, sc);
     rec_index_append(&s_st, id);
+    s_pending_cache = -1;   /* one more not_uploaded sidecar on the card */
     return 0;
 }
 
 /* ============================================================
- * Sync (design §5.4: after every session). Rendering reuses the
- * host-tested ui_flow dashboard renderer, which draws the list first and
- * the banner strip last -- the banner covering the list's bottom rows
- * (including Task 9's cursor-invert overdraw) is load-bearing.
+ * Sync (design §5.4: after every session) and the shared ui_flow model.
+ * Rendering reuses the host-tested ui_flow renderer; since Task 18's
+ * scale-2 layout the list and the banner strip partition the panel
+ * exactly, so neither ever paints over the other.
  * ============================================================ */
+
+static void ensure_uif(void) {
+    static int inited;
+    if (inited) return;
+    ui_flow_init(&s_uif, &s_cl, &s_st, &s_kv);
+    inited = 1;
+}
+
+static void save_dashboard_cache(const htp_dashboard_t *d) {
+    s_dash_cache.magic = DASH_CACHE_MAGIC;
+    s_dash_cache.size = (uint32_t)sizeof(htp_dashboard_t);
+    s_dash_cache.d = *d;
+    if (s_st.write(s_st.ctx, DASH_CACHE_PATH, &s_dash_cache, sizeof s_dash_cache) != 0)
+        ESP_LOGW(TAG, "dashboard snapshot write failed");   /* cosmetic loss only */
+}
+
+static void load_cached_dashboard(void) {
+    size_t len = 0;
+    if (s_st.read(s_st.ctx, DASH_CACHE_PATH, &s_dash_cache, sizeof s_dash_cache, &len) != 0)
+        return;
+    if (len != sizeof s_dash_cache || s_dash_cache.magic != DASH_CACHE_MAGIC ||
+        s_dash_cache.size != (uint32_t)sizeof(htp_dashboard_t)) {
+        ESP_LOGW(TAG, "dashboard snapshot ignored (other layout or torn write)");
+        return;
+    }
+    s_uif.dash = s_dash_cache.d;
+}
+
+/* Renders ui_flow's current screen with a live status header. */
+static void flow_redraw(int want_full) {
+    if (screen_ready() != 0) return;
+    status_line_fill(&s_uif.status);
+    ui_flow_render(&s_uif, &s_fb);
+    present(want_full);
+}
 
 static int render_dashboard_cb(void *ui_ctx, const htp_dashboard_t *d) {
     (void)ui_ctx;
     if (screen_ready() != 0) return -1;
     s_uif.dash = *d;
+    save_dashboard_cache(d);   /* next PWR wake paints this instantly */
     status_line_fill(&s_uif.status);
     ui_flow_render(&s_uif, &s_fb);
     present(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
@@ -802,12 +949,8 @@ static void set_rtc_cb(void *rtc_ctx, long long epoch) {
     board_rtc_set(epoch);
 }
 
-static void run_sync(void) {
-    static int uif_inited;
-    if (!uif_inited) {
-        ui_flow_init(&s_uif, &s_cl, &s_st, &s_kv);
-        uif_inited = 1;
-    }
+static void run_sync(sync_report_t *out) {
+    ensure_uif();
 
     static capture_ctx_t ccx;
     memset(&ccx, 0, sizeof ccx);
@@ -830,11 +973,16 @@ static void run_sync(void) {
     scx.chime = chime_cb;
     scx.set_rtc = set_rtc_cb;
 
-    sync_report_t rep;
-    int r = sync_cycle(&scx, &rep);
+    /* Invalidate before AND after: step 1 (retry) changes upload states
+     * before the render callbacks run, so their status headers must
+     * recount; step 4 (backfill) can re-mark an unknown capture as
+     * not_uploaded after the renders. */
+    s_pending_cache = -1;
+    int r = sync_cycle(&scx, out);
+    s_pending_cache = -1;
     ESP_LOGI(TAG, "sync r=%d uploads=%d notifs=%d acked=%d dash_changed=%d next=%ds",
-             r, rep.uploads_retried, rep.notifs_fetched, rep.notifs_acked,
-             rep.dashboard_changed, rep.sync_interval_s);
+             r, out->uploads_retried, out->notifs_fetched, out->notifs_acked,
+             out->dashboard_changed, out->sync_interval_s);
     ESP_LOGI(TAG, "stack hwm after sync_cycle: %u bytes min free",
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 }
@@ -861,6 +1009,8 @@ static void show_outcome(capture_outcome_t out) {
  * coming. */
 static void play_reply_and_follow_up(capture_ctx_t *cx) {
     for (;;) {
+        /* One conversation turn: playback + 30 s window + one recording. */
+        awake_cap_arm(AWAKE_CAP_REC_S);
         ESP_LOGI(TAG, "playing reply %s", REPLY_FS);
         if (audio_play_wav(REPLY_FS, rec_held, NULL) != 0)
             ESP_LOGE(TAG, "reply playback failed");
@@ -878,6 +1028,9 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
         }
         if (!follow) {
             ESP_LOGI(TAG, "follow-up window closed");
+            /* Resting screen: without this the panel keeps whatever the
+             * conversation left up (REC glyph / "Uploaded") forever. */
+            screen_status_transcript("Done", s_sc.transcript);
             break;
         }
 
@@ -890,27 +1043,36 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
         ESP_LOGI(TAG, "follow-up recorded %ld bytes (~%ld ms)", bytes, bytes / 32);
         s_sc = s_sc_next;   /* the follow-up is now the current capture */
 
+        awake_cap_arm(AWAKE_CAP_NET_S);   /* upload retries + poll window */
         capture_outcome_t out = capture_run(cx, &s_sc);
+        s_pending_cache = -1;
         if (out == CAPTURE_REPLY_READY) continue;
         show_outcome(out);
         break;
     }
 }
 
-static void capture_session(void) {
-    /* Rail first: its settle overlaps the SD mount (audio_init() only
-     * sleeps whatever part of the settle window hasn't already passed). */
-    board_rail_audio(1);
+/* from_ui = 1 when entered from ui_session's UIF_START_CAPTURE: the card
+ * is mounted, config and wifi.json are loaded, and the Wi-Fi join may
+ * already be running or up (s_bg_wifi_started) -- starting a second join
+ * would disrupt the first (Task 17 double-start concern). */
+static void capture_session(int from_ui) {
+    if (!from_ui) {
+        /* Rail first: its settle overlaps the SD mount (audio_init() only
+         * sleeps whatever part of the settle window hasn't already passed). */
+        board_rail_audio(1);
 
-    /* 1. capture-critical init only: SD, config, audio. */
-    if (board_sd_mount() != 0) { screen_fatal("SD card error"); return; }
-    if (load_config() != 0)    { screen_fatal("Config error"); return; }
-    if (audio_init() != 0)     { screen_fatal("Audio error"); return; }
-    load_wifi();   /* soft-fail: capture works offline, upload waits for a sync */
+        /* 1. capture-critical init only: SD, config, audio. */
+        if (board_sd_mount() != 0) { screen_fatal("SD card error"); return; }
+        if (load_config() != 0)    { screen_fatal("Config error"); return; }
+        load_wifi();   /* soft-fail: capture works offline, upload waits for a sync */
+    }
+    if (audio_init() != 0) { screen_fatal("Audio error"); return; }
 
-    /* 2. record, with the Wi-Fi kickoff + glyph overlapped. */
+    /* 2. record, with the glyph -- and, unless a join is already in
+     * flight, the Wi-Fi kickoff -- overlapped. */
     long bytes = 0;
-    int rr = record_capture(&s_sc, NULL, 1, &bytes);
+    int rr = record_capture(&s_sc, NULL, !s_bg_wifi_started, &bytes);
     if (rr < 0) { screen_fatal("SD full"); return; }
     if (rr > 0) { screen_status("Too short"); return; }
     ESP_LOGI(TAG, "recorded %ld bytes (~%ld ms of 16 kHz mono)", bytes, bytes / 32);
@@ -934,48 +1096,223 @@ static void capture_session(void) {
         .poll_interval_ms = 1000, .poll_window_ms = 60000,
         .reply_path = REPLY_LOGICAL,
     };
+    awake_cap_arm(AWAKE_CAP_NET_S);   /* upload retries + poll window */
     capture_outcome_t out = capture_run(&cx, &s_sc);
+    s_pending_cache = -1;             /* capture_run moved the upload state */
     if (out == CAPTURE_REPLY_READY)
         play_reply_and_follow_up(&cx);
     else
         show_outcome(out);
 
-    run_sync();   /* design §5.4: sync after every session */
+    awake_cap_arm(AWAKE_CAP_BASE_S);
+    sync_report_t rep;
+    run_sync(&rep);   /* design §5.4: sync after every session */
+    /* The outcome screen is the content here; if the sync also landed
+     * older pending uploads, only the status header needs refreshing. */
+    if (rep.uploads_retried > 0)
+        refresh_status_strip();
 }
 
 /* ============================================================
- * Sync / UI sessions (UI becomes real in Task 18)
+ * Sync / UI sessions
  * ============================================================ */
 
-static void session_sync_common(wake_cause_t wc) {
+/* Shared session front half: mount, provisioning triggers, config,
+ * wifi.json. Returns 0 with everything loaded, -1 after a fatal screen. */
+static int common_init(wake_cause_t wc) {
     int mounted = (board_sd_mount() == 0);
     int pwr_held = power_button_held_at_boot(wc);
     int config_ok = mounted && load_config() == 0;
 
     if (!mounted || !config_ok || pwr_held) {
         maybe_provision(mounted, config_ok, pwr_held);   /* may never return */
-        if (load_config() != 0) { screen_fatal("Config error"); return; }
+        if (load_config() != 0) { screen_fatal("Config error"); return -1; }
     }
-    if (load_wifi() != 0) { screen_fatal("WiFi config error"); return; }
+    if (load_wifi() != 0) { screen_fatal("WiFi config error"); return -1; }
+    return 0;
+}
+
+/* Timer/cold wake (design §7.3): silent -- the render callbacks only
+ * touch the panel when something actually changed, and an upload-state
+ * change counts as a change (C6 hardware finding: a quiet sync that
+ * landed pending uploads used to leave "Saved, will upload later" up). */
+static void sync_session(wake_cause_t wc) {
+    if (common_init(wc) != 0) return;
+    ensure_uif();
+    load_cached_dashboard();   /* a first-draw notification render stamps the
+                                  banner onto the cached list, not onto a blank */
+
+    /* Battery policy (design §8): below 5%, timer syncs are skipped before
+     * the radio ever powers up. -1 (ADC unavailable) must not trip this. */
+    int batt = board_battery_pct();
+    if (batt >= 0 && batt < 5 && wc == WAKE_TIMER) {
+        ESP_LOGW(TAG, "battery %d%%: skipping timer sync", batt);
+        return;
+    }
 
     if (idf_wifi_connect(&s_wp, &s_kv, SYNC_WIFI_TIMEOUT_MS) != 0) {
-        screen_status("No network");
+        /* Timer wakes stay silent even offline (nothing changed, never
+         * flash); a cold/PWR-triggered boot tells the operator. */
+        if (wc != WAKE_TIMER) screen_status("No network");
         return;   /* the timer wake retries on its own */
     }
     s_wifi_ok = 1;
     idf_transport_init(&s_tr, s_cfg.bridge_url);
     htp_client_init(&s_cl, &s_tr, s_cfg.token);
-    s_cl.battery_pct = board_battery_pct();
+    s_cl.battery_pct = batt;
     ESP_LOGI(TAG, "battery=%d%% (X-Battery header)", s_cl.battery_pct);
     /* C5 fix round 1: the overflow died before the teardown's high-water
      * line could ever print, so log it at session milestones too. */
     ESP_LOGI(TAG, "stack hwm after wifi: %u bytes min free",
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    run_sync();
+
+    int pend_before = pending_uploads();
+    sync_report_t rep;
+    run_sync(&rep);
+    if ((rep.uploads_retried > 0 || pending_uploads() != pend_before) &&
+        !rep.dashboard_changed)
+        screen_status(pending_uploads() == 0 ? "Uploaded" : "Upload retried");
 }
 
-static void sync_session_stub(wake_cause_t wc) { session_sync_common(wc); }
-static void ui_session_stub(wake_cause_t wc)   { session_sync_common(wc); }
+/* Settings screen data: factory MAC (never spoofed, by design -- some
+ * networks need it registered), app version, the host[:port] of the
+ * bridge URL (the port tells the mock bridge from the real one), and the
+ * effective sync interval. */
+static void populate_settings_info(ui_settings_info_t *si) {
+    memset(si, 0, sizeof *si);
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(si->mac, sizeof si->mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    str_copy(si->fw_version, sizeof si->fw_version, esp_app_get_description()->version);
+    const char *h = strstr(s_cfg.bridge_url, "://");
+    h = h ? h + 3 : s_cfg.bridge_url;
+    size_t i = 0;
+    while (h[i] && h[i] != '/' && i < sizeof si->bridge_host - 1) {
+        si->bridge_host[i] = h[i];
+        i++;
+    }
+    si->bridge_host[i] = '\0';
+    si->sync_interval_s = (int)next_sync_interval();
+}
+
+/* PWR wake: paint the cached dashboard immediately, join Wi-Fi in the
+ * background, sync once it lands, and serve gestures until 30 s of
+ * idleness. Single-threaded display throughout: the only other panel
+ * writer (cap_bg) runs inside capture_session(), which joins it before
+ * this task touches the framebuffer again. */
+static void ui_session(wake_cause_t wc) {
+    if (common_init(wc) != 0) return;
+    ensure_uif();
+
+    /* Client up before the network is: a complete-item tap before the
+     * join lands fails with a network error and leaves the item unmarked
+     * -- better than gating every gesture on Wi-Fi. */
+    idf_transport_init(&s_tr, s_cfg.bridge_url);
+    htp_client_init(&s_cl, &s_tr, s_cfg.token);
+    s_cl.battery_pct = board_battery_pct();
+    populate_settings_info(&s_uif.info);
+    load_cached_dashboard();
+
+    flow_redraw(1);   /* instant dashboard from the SD snapshot */
+
+    /* 0 = up, 1 = joining, -1 = down/none. Second entry point for the
+     * async join: s_bg_wifi_started tells capture_session not to start
+     * another one (Task 17 double-start concern). */
+    int wifi_state = -1;
+    if (s_have_wifi && idf_wifi_start_connect_async(&s_wp, &s_kv) == 0) {
+        s_bg_wifi_started = 1;
+        wifi_state = 1;
+    }
+
+    int synced = 0, countdown_shown = 0;
+    gesture_fsm_t g;
+    gesture_init(&g);
+    unsigned idle_t0 = s_ck.mono_ms(s_ck.ctx);
+    while (s_ck.mono_ms(s_ck.ctx) - idle_t0 < UI_IDLE_TIMEOUT_MS) {
+        if (!synced && wifi_state > 0) {
+            wifi_state = idf_wifi_poll_connected();   /* non-blocking probe */
+            if (wifi_state == 0) {
+                s_wifi_ok = 1;
+                s_cl.battery_pct = board_battery_pct();
+                ESP_LOGI(TAG, "battery=%d%% (X-Battery header)", s_cl.battery_pct);
+                int pend_before = pending_uploads();
+                sync_report_t rep;
+                run_sync(&rep);
+                synced = 1;
+                s_uif.info.sync_interval_s = (int)next_sync_interval();
+                /* Upload-state changes count as changes: refresh the
+                 * header's pending count even when nothing else redrew. */
+                if (rep.uploads_retried > 0 || pending_uploads() != pend_before)
+                    flow_redraw(0);
+                idle_t0 = s_ck.mono_ms(s_ck.ctx);   /* sync time isn't idle time */
+            }
+        }
+
+        unsigned now = s_ck.mono_ms(s_ck.ctx);
+        gesture_t ge = gesture_feed(&g, board_btn_rec(), board_btn_pwr(), now);
+
+        /* Power-off countdown: PWR held past 2 s warns once (partial
+         * refresh); the GEST_PWR_OFF at 5 s then executes it. */
+        if (g.pwr_down && !countdown_shown && now - g.pwr_t0 > PWR_COUNTDOWN_MS) {
+            screen_status("Hold to power off...");
+            countdown_shown = 1;
+        }
+
+        if (ge == GEST_NONE) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        idle_t0 = s_ck.mono_ms(s_ck.ctx);
+        awake_cap_arm(AWAKE_CAP_BASE_S);   /* operator present: the cap bounds
+                                              wedges, not interaction */
+
+        if (countdown_shown && ge != GEST_PWR_OFF) {
+            /* Released short of 5 s: the hold was power-off intent (the
+             * release resolves as PWR_LONG) -- swallow it, restore the
+             * screen. */
+            countdown_shown = 0;
+            flow_redraw(0);
+            continue;
+        }
+
+        char path[96];
+        ui_action_t a = ui_flow_gesture(&s_uif, ge, path);
+        switch (a) {
+        case UIF_START_CAPTURE:
+            awake_cap_arm(AWAKE_CAP_REC_S);
+            capture_session(1);
+            return;
+        case UIF_PLAY_WAV: {
+            char fs[IDF_SD_PATH_MAX];
+            awake_cap_arm(AWAKE_CAP_REC_S);   /* a recording can run 120 s */
+            if (idf_ports_sd_path(path, fs, sizeof fs) == 0 && audio_init() == 0) {
+                audio_play_wav(fs, rec_held, NULL);   /* REC press stops it */
+                audio_deinit();
+            }
+            break;
+        }
+        case UIF_POWER_OFF:
+            screen_status("Powering off");
+            board_power_off();   /* releases the VBAT latch; on USB power the
+                                    awake cap turns this into a deep sleep */
+            break;
+        case UIF_REDRAW_PARTIAL:
+        case UIF_REDRAW_FULL: {
+            int dash_tap = (ge == GEST_REC_SHORT && s_uif.screen == SCR_DASHBOARD);
+            flow_redraw(ui_flow_wants_full(&s_uif, a));
+            if (dash_tap)
+                save_dashboard_cache(&s_uif.dash);   /* keep the strike-through
+                                                        across sleeps: the new rev
+                                                        will read "unchanged" */
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    ESP_LOGI(TAG, "ui idle %d s; sleeping", UI_IDLE_TIMEOUT_MS / 1000);
+}
 
 /* ============================================================
  * Development stay-awake tail (see HTP_DEV_LINGER above).
@@ -1079,9 +1416,23 @@ void app_main(void) {
     ESP_LOGI(TAG, "HTP terminal, wake=%s (app_main entry at %lld ms since boot)",
              cause[wc], (long long)t_entry_ms);
 
-    if (wc == WAKE_REC_BUTTON)      capture_session();   /* fast path first */
-    else if (wc == WAKE_PWR_BUTTON) ui_session_stub(wc);
-    else                            sync_session_stub(wc);   /* timer + cold */
+    /* Awake watchdog: armed before dispatch, re-armed at phase transitions
+     * inside the sessions, cancelled once the session returns (the dev
+     * linger has its own idle timeout). A REC wake's first phase includes
+     * the recording itself, hence the bigger initial cap. */
+    const esp_timer_create_args_t cap_args = { .callback = awake_cap_cb,
+                                               .name = "awake_cap" };
+    if (esp_timer_create(&cap_args, &s_awake_cap) != ESP_OK) {
+        s_awake_cap = NULL;   /* run uncapped rather than not at all */
+        ESP_LOGE(TAG, "awake watchdog unavailable");
+    }
+    awake_cap_arm(wc == WAKE_REC_BUTTON ? AWAKE_CAP_REC_S : AWAKE_CAP_BASE_S);
+
+    if (wc == WAKE_REC_BUTTON)      capture_session(0);   /* fast path first */
+    else if (wc == WAKE_PWR_BUTTON) ui_session(wc);
+    else                            sync_session(wc);     /* timer + cold */
+
+    awake_cap_cancel();
 
     /* Common teardown: radio off, codec + rail off, panel asleep. All of
      * these are safe no-ops when the session never brought them up. */

@@ -6,20 +6,23 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
-# Sessions (capture + sync) run on the main task. C5 fix round 1: Task 17's
-# ~12 KB estimate missed rec_index_list's 16.4 KB local read buffer (entry
-# a1, 0x40b0 in the C5 ELF) under capture_retry_pending's 3.3 KB frame --
-# ~20.5 KB of app frames alone, overflow on the first hardware sync. Every
-# multi-KB local on the session paths is file-scope static now (rec_index,
-# sidecar_load, capture_retry_pending, htp_poll_captures, ui_flow render/
-# gesture models). Worst remaining chain, frames measured from the ELF's
-# entry prologues: baseline 0.1 KB -> app_main 48 B -> session 32 B ->
-# run_sync 96 B -> sync_cycle 128 B -> capture_run/retry <=1.3 KB ->
-# htp_* + perform + tr_perform ~0.9 KB -> esp_http_client/lwIP sockets
-# ~2 KB (TCP runs on the tcpip task; core locking off) or newlib/VFS/
-# FatFS/sdmmc ~2.5 KB -> deepest ESP_LOG vfprintf (full newlib) ~1.6 KB,
-# plus ~0.7 KB pre-ISR-stack interrupt overhead: ~7 KB peak. 16 KB leaves
-# >= 9 KB headroom; "stack hwm" log lines report real numbers per session.
+# Sessions (capture + UI + sync) run on the main task. C5 fix round 1:
+# Task 17's ~12 KB estimate missed rec_index_list's 16.4 KB local read
+# buffer under capture_retry_pending's 3.3 KB frame -- ~20.5 KB of app
+# frames alone, overflow on the first hardware sync. Every multi-KB local
+# on the session paths is file-scope static now (rec_index, sidecar_load,
+# capture_retry_pending, htp_poll_captures, ui_flow render models, the
+# Task 18 dashboard snapshot). Worst chain re-measured from the Task 18
+# ELF's entry prologues (ui_session syncs too, and its frame is the
+# largest session frame): baseline 80 B -> app_main 80 B -> ui_session
+# 336 B -> run_sync 64 B -> sync_cycle 128 B -> backfill 1392 B ->
+# htp_poll_captures 192 B -> perform 240 B -> tr_perform 384 B ~= 2.9 KB
+# of app frames -> esp_http_client/lwIP sockets ~2 KB (TCP runs on the
+# tcpip task; core locking off) or newlib/VFS/FatFS/sdmmc ~2.5 KB ->
+# deepest ESP_LOG vfprintf (full newlib) ~1.6 KB, plus ~0.7 KB pre-ISR
+# interrupt overhead: ~7.5 KB peak. No frame in the image beyond 1.4 KB
+# is ours (next are mbedtls/wpa at ~1.1 KB on other tasks). 16 KB leaves
+# >= 8.5 KB headroom; "stack hwm" log lines report real numbers per session.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y

@@ -343,6 +343,34 @@ int idf_wifi_start_connect_async(const wifi_profiles_t *p, port_kv_t *kv) {
     return start_scan_async();
 }
 
+int idf_wifi_poll_connected(void) {
+    if (!s_inited) return -1;
+
+    if (s_scan_pending) {
+        if (!(xEventGroupGetBits(s_events) & BIT_SCAN_DONE)) return 1;
+        /* SCAN_DONE is already set, so wait_scan_and_connect() only drains
+         * results and starts the connect -- no blocking wait left in it. */
+        if (wait_scan_and_connect() != 0) return -1;
+        return 1;   /* association now in flight */
+    }
+
+    EventBits_t b = xEventGroupGetBits(s_events);
+    if (b & BIT_GOT_IP) {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) { on_connected(); return 0; }
+        return -1;   /* had an IP but the link is already down again */
+    }
+    if (b & BIT_FAILED) {
+        if (s_fast_join) {
+            ESP_LOGW(TAG, "fast join failed; falling back to a full scan");
+            s_fast_join = 0;
+            return (start_scan_async() == 0) ? 1 : -1;
+        }
+        return -1;
+    }
+    return 1;   /* join still in flight */
+}
+
 int idf_wifi_wait_connected(unsigned timeout_ms) {
     if (!s_inited) return -1;
 

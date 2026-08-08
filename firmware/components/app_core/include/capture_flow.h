@@ -36,4 +36,9 @@ capture_outcome_t capture_run(capture_ctx_t *cx, sidecar_t *sc);
  * Returns number of captures successfully confirmed uploaded. Does NOT poll. */
 int capture_retry_pending(capture_ctx_t *cx);
 
+/* Number of recordings still awaiting upload (sidecar state not_uploaded):
+ * the status header's pending-uploads count, and the "did this sync change
+ * anything worth redrawing" signal. Storage only, no network. */
+int capture_pending_count(port_storage_t *st);
+
 #endif

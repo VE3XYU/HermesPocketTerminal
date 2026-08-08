@@ -111,12 +111,15 @@ static void test_retry_pending(void) {
     sidecar_save(&st, &three);
     rec_index_append(&st, "c-one"); rec_index_append(&st, "c-two"); rec_index_append(&st, "c-three");
 
+    CHECK_EQ_INT(capture_pending_count(&st), 2);  /* c-one + c-three await upload */
+
     ft_push(&ft, 0, 200, "{\"id\":\"c-three\",\"state\":\"received\"}");  /* newest first */
     ft_push(&ft, 0, 200, "{\"id\":\"c-one\",\"state\":\"received\"}");
     CHECK_EQ_INT(capture_retry_pending(&cx), 2);
     CHECK_EQ_INT(ft.req_count, 2);                /* c-two untouched */
     sidecar_t back; sidecar_load(&st, "c-one", &back);
     CHECK_EQ_STR(back.state, "uploaded");
+    CHECK_EQ_INT(capture_pending_count(&st), 0);  /* retry drained the queue */
 }
 
 int main(void) {

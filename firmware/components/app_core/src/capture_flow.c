@@ -111,3 +111,13 @@ int capture_retry_pending(capture_ctx_t *cx) {
     }
     return confirmed;
 }
+
+int capture_pending_count(port_storage_t *st) {
+    int n = rec_index_list(st, s_retry_ids, 32);   /* shares the batch statics */
+    int pending = 0;
+    for (int i = 0; i < n; i++) {
+        if (sidecar_load(st, s_retry_ids[i], &s_retry_sc) != 0) continue;
+        if (strcmp(s_retry_sc.state, "not_uploaded") == 0) pending++;
+    }
+    return pending;
+}
