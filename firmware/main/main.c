@@ -649,6 +649,22 @@ static void screen_fatal(const char *msg) {
     s_base_drawn = 0;
 }
 
+/* The intentional final image before the rail is cut for good (C7 round-3
+ * finding 2): e-paper retains whatever was last latched with no power at
+ * all, so a transient "Powering off" would have become the permanent
+ * display. A clean full-white FULL refresh -- epd_full busy-waits until
+ * the panel finishes, so the power cut below it can never land
+ * mid-refresh -- leaves a deliberately blank panel, with no ghost of the
+ * countdown text (a partial would diff it away only optically). This is
+ * the ONLY transient->permanent path that must blank: deep sleep always
+ * has a next wake to repaint, and a fatal error screen is a valid
+ * resting image (the operator needs to see it). */
+static void screen_blank_for_power_off(void) {
+    if (screen_ready() != 0) return;
+    fb_clear(&s_fb);
+    present(1);
+}
+
 /* Redraws only the status strip over whatever screen the panel already
  * shows (partial refresh): the "upload states changed but the content on
  * screen is still right" case -- e.g. the after-capture sync retried an
@@ -1410,9 +1426,16 @@ static void ui_session(wake_cause_t wc) {
             break;
         }
         case UIF_POWER_OFF:
-            screen_status("Powering off");
+            /* The "Hold to power off..." countdown message was the
+             * transient feedback; the visible wipe to white is the
+             * confirmation. Nothing may draw after this blank -- it is
+             * the panel's permanent image once the rail drops. */
+            ESP_LOGI(TAG, "powering off: blanking the panel");
+            screen_blank_for_power_off();
             board_power_off();   /* releases the VBAT latch; on USB power the
-                                    awake cap turns this into a deep sleep */
+                                    awake cap turns this into a deep sleep
+                                    (the panel stays blank until that wake
+                                    repaints it) */
             break;
         case UIF_REDRAW_PARTIAL:
         case UIF_REDRAW_FULL: {
