@@ -41,6 +41,12 @@
 
 static const char *TAG = "epd";
 static spi_device_handle_t s_spi;
+/* The SPI bus + device are created once per POWER CYCLE and never freed;
+ * epd_init() is called once per SESSION and there can be several sessions
+ * per power cycle (the dev linger's dispatch loop; the common teardown's
+ * epd_sleep() clears main.c's s_epd_up, so the next session re-inits).
+ * See the latch in epd_init(). */
+static bool s_bus_up;
 
 /* Wall-clock milliseconds since boot. Every busy-wait timeout below is
  * measured against this, never by counting poll iterations. The previous
@@ -203,32 +209,52 @@ int epd_init(void) {
     ESP_LOGI(TAG, "init: rail gate=%d RST=%d BUSY=%d after rail-on settle",
              board_rail_epd_level(), gpio_get_level(PIN_RST), gpio_get_level(PIN_BUSY));
 
-    spi_bus_config_t buscfg = {
-        .mosi_io_num = PIN_MOSI,
-        .miso_io_num = -1,
-        .sclk_io_num = PIN_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = EPD_FRAME_BYTES,
-    };
-    esp_err_t err = spi_bus_initialize(EPD_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_initialize failed: %d", err);
-        return -1;
+    /* Bus/device creation is latched; the panel-wake sequence below it is
+     * not. A second epd_init() in the same power cycle (a linger-launched
+     * session) would otherwise take ESP_ERR_INVALID_STATE from
+     * spi_bus_initialize() on a bus that is still perfectly usable, return
+     * -1, and fail screen_ready() for the whole session: no screens, no
+     * notification renders (so no acks), and the EPD rail left powered
+     * through the linger. Nothing here frees the bus -- deep sleep's reset
+     * re-creates it from scratch on the next boot, and within one power
+     * cycle epd_sleep() only sleeps the *panel* and drops its rail, so the
+     * driver objects stay valid across sleep/init. */
+    if (!s_bus_up) {
+        spi_bus_config_t buscfg = {
+            .mosi_io_num = PIN_MOSI,
+            .miso_io_num = -1,
+            .sclk_io_num = PIN_SCK,
+            .quadwp_io_num = -1,
+            .quadhd_io_num = -1,
+            .max_transfer_sz = EPD_FRAME_BYTES,
+        };
+        esp_err_t err = spi_bus_initialize(EPD_HOST, &buscfg, SPI_DMA_CH_AUTO);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "spi_bus_initialize failed: %d", err);
+            return -1;
+        }
+
+        spi_device_interface_config_t devcfg = {
+            .clock_speed_hz = 10 * 1000 * 1000,
+            .mode = 0,
+            .spics_io_num = PIN_CS,
+            .queue_size = 1,
+        };
+        err = spi_bus_add_device(EPD_HOST, &devcfg, &s_spi);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "spi_bus_add_device failed: %d", err);
+            /* Free the bus so the latch never claims more than what exists:
+             * a retry must be able to run spi_bus_initialize() again. */
+            spi_bus_free(EPD_HOST);
+            return -1;
+        }
+        s_bus_up = true;
     }
 
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 10 * 1000 * 1000,
-        .mode = 0,
-        .spics_io_num = PIN_CS,
-        .queue_size = 1,
-    };
-    err = spi_bus_add_device(EPD_HOST, &devcfg, &s_spi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_add_device failed: %d", err);
-        return -1;
-    }
-
+    /* --- panel wake: rail already on and settled above; reset pulse,
+     * SWRESET, window/waveform setup. Hardware-proven timing, re-run on
+     * EVERY init because the panel lost all of it to the rail cut in
+     * epd_sleep(). --- */
     if (!reset_pulse()) {
         ESP_LOGE(TAG, "epd_init: BUSY never cleared after hardware reset");
         return -1;
