@@ -497,6 +497,23 @@ void audio_click(int select)
     esp_codec_dev_write(s_dev, s_play_out, frames * 4);
 }
 
+/* C7 round 6, finding 2 (fix round) -- audio_beep() had the same "chuk-ah"
+ * problem as the un-enveloped clicks: the raw square chunk started at
+ * +/-BEEP_AMPLITUDE and, being a whole number of periods per chunk, always
+ * ended the LAST chunk at -3000; auto_clear then snapped the line to 0, a
+ * 3000-LSB DC step into the speaker. Same fix as audio_click(): a linear
+ * amplitude envelope whose last sample is exactly zero. The difference is
+ * that the chime is chunked (BEEP_CHUNK_FRAMES = 160 frames, repeated
+ * BEEP_MS / BEEP_CHUNK_MS = 20 times) and the chunk buffer used to be
+ * generated once and rewritten verbatim on every repeat -- so the envelope
+ * has to be computed from the GLOBAL sample index (rep * BEEP_CHUNK_FRAMES +
+ * i) across the whole 200 ms tone, not the per-chunk index, or every chunk
+ * would attack and decay instead of only the first and last. That means the
+ * buffer must be regenerated per repeat (it's 320 B, 20 times a chime --
+ * negligible). Pitch (BEEP_HZ) and total duration (BEEP_MS) are unchanged. */
+#define BEEP_ATTACK_MS 3               /* linear ramp in, from zero */
+#define BEEP_DECAY_MS  8               /* linear ramp out, TO zero */
+
 void audio_beep(void)
 {
     if (s_dev == NULL) return;
@@ -506,16 +523,24 @@ void audio_beep(void)
     if (codec_open_at(AUDIO_RATE_HZ) != 0) return;
 
     int16_t buf[BEEP_CHUNK_FRAMES * 2];
-    const int period = AUDIO_RATE_HZ / BEEP_HZ;   /* 16 samples at 16 kHz */
-    for (int i = 0; i < BEEP_CHUNK_FRAMES; i++) {
-        int16_t s = (i % period) < (period / 2) ? (int16_t)BEEP_AMPLITUDE
-                                                : (int16_t)-BEEP_AMPLITUDE;
-        buf[2 * i]     = s;
-        buf[2 * i + 1] = s;
-    }
-    /* BEEP_CHUNK_FRAMES is a whole number of periods, so repeating the
-     * chunk keeps the waveform phase-continuous. */
+    const int period = AUDIO_RATE_HZ / BEEP_HZ;         /* 16 samples at 16 kHz */
+    const int total   = AUDIO_RATE_HZ / 1000 * BEEP_MS; /* 3200 samples, whole tone */
+    const int att      = AUDIO_RATE_HZ / 1000 * BEEP_ATTACK_MS; /* 48 samples */
+    const int dec       = AUDIO_RATE_HZ / 1000 * BEEP_DECAY_MS;  /* 128 samples */
+    /* BEEP_CHUNK_FRAMES is a whole number of periods, so regenerating each
+     * chunk from the global sample index keeps the waveform
+     * phase-continuous across repeats exactly as the old static buffer did. */
     for (int rep = 0; rep < BEEP_MS / BEEP_CHUNK_MS; rep++) {
+        for (int i = 0; i < BEEP_CHUNK_FRAMES; i++) {
+            int g = rep * BEEP_CHUNK_FRAMES + i;   /* sample index over the whole tone */
+            int a = BEEP_AMPLITUDE;
+            if (g < att)                 a = a * g / att;                  /* attack */
+            else if (g >= total - dec)   a = a * (total - 1 - g) / dec;    /* decay,
+                                        last sample (g == total-1) exactly 0 */
+            int16_t s = (i % period) < (period / 2) ? (int16_t)a : (int16_t)-a;
+            buf[2 * i]     = s;
+            buf[2 * i + 1] = s;
+        }
         if (esp_codec_dev_write(s_dev, buf, (int)sizeof buf) != ESP_CODEC_DEV_OK) break;
     }
     board_delay_ms(AUDIO_DRAIN_MS);
