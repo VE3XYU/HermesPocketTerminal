@@ -24,7 +24,7 @@ static int fs_read(void *ctx, const char *p, void *buf, size_t cap, size_t *len)
 }
 static int fs_write(void *ctx, const char *p, const void *d, size_t n) {
     fake_storage_t *f = ctx;
-    if (f->fail_writes || n > FS_MAX_BYTES) return -1;
+    if (f->fail_writes || f->fail_replace_writes || n > FS_MAX_BYTES) return -1;
     int i = slot(f, p, 1); if (i < 0) return -1;
     memcpy(f->files[i].data, d, n); f->files[i].len = n;
     return 0;

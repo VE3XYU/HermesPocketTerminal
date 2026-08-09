@@ -7,6 +7,25 @@
 #define REC_INDEX_PATH "/rec/index"
 #define REC_INDEX_CAP 16384
 
+/* Compaction (Task 19, closing the limitation accepted in Task 5): the
+ * index is append-only and rec_index_list() can only read the FIRST
+ * REC_INDEX_CAP bytes (the storage port has no seek), so an index past
+ * 16 KB silently stops listing the NEWEST captures -- at ~21 bytes per
+ * real id that is roughly 780 recordings. Once an append sees the file
+ * above REC_INDEX_COMPACT_AT, it atomically rewrites it down to the
+ * newest REC_INDEX_KEEP complete lines first. 8 KB / 128 keeps the file
+ * permanently under the read cap with wide margin, and 128 retained ids
+ * is 4x the 32 that any consumer actually reads (rec_index_list caps max
+ * at 32; retry/backfill scan the newest 32). Trade-off, documented in
+ * firmware/README.md: ids older than the retained window are forgotten
+ * for listing and retry -- the WAV/sidecar files themselves stay on the
+ * card. Safety rule: the index is NEVER destroyed here -- if the read or
+ * the rewrite fails, this falls through to the plain append and the
+ * worst case is yesterday's behavior (oversized index, newest entries
+ * unlistable), not a lost index. */
+#define REC_INDEX_COMPACT_AT 8192
+#define REC_INDEX_KEEP       128
+
 /* Index read buffer: static, not stack. As a local this was a 16.4 KB
  * frame (`entry a1, 0x40b0` in the C5 binary) -- allocated in the
  * prologue before a single byte is read, it alone consumed 80% of the
@@ -16,9 +35,45 @@
  * task, and the buffer is fully re-read before each use. */
 static char s_index_buf[REC_INDEX_CAP];
 
+/* Best-effort compaction; see the constants above. `len` is what the read
+ * returned (<= REC_INDEX_CAP - 1). Works on COMPLETE lines only: a capped
+ * read of a legacy >16 KB index ends mid-line, and retaining that torn
+ * fragment would concatenate it with the next appended id -- everything
+ * after the last '\n' is dropped along with the invisible tail (both were
+ * already unreachable to every reader). */
+static void rec_index_compact(port_storage_t *st, size_t len) {
+    const char *buf = s_index_buf;
+
+    size_t end = len;                     /* end of the last complete line */
+    while (end > 0 && buf[end - 1] != '\n') end--;
+    if (end == 0) return;
+
+    int lines = 0;
+    for (size_t i = 0; i < end; i++)
+        if (buf[i] == '\n') lines++;
+    if (lines <= REC_INDEX_KEEP) return;  /* nothing old enough to drop */
+
+    int drop = lines - REC_INDEX_KEEP;
+    size_t cut = 0;
+    while (cut < end && drop > 0)
+        if (buf[cut++] == '\n') drop--;
+
+    /* Atomic replace by the storage-port contract (sidecar.c relies on the
+     * same guarantee). A failure is deliberately ignored: the old index is
+     * still intact on the card and the caller's append proceeds. */
+    (void)st->write(st->ctx, REC_INDEX_PATH, buf + cut, end - cut);
+}
+
 int rec_index_append(port_storage_t *st, const char *capture_id) {
     char line[96];
     snprintf(line, sizeof line, "%s\n", capture_id);
+
+    size_t len = 0;
+    if (st->read != NULL && st->write != NULL &&
+        st->read(st->ctx, REC_INDEX_PATH, s_index_buf, REC_INDEX_CAP - 1, &len) == 0 &&
+        len > REC_INDEX_COMPACT_AT)
+        rec_index_compact(st, len);
+
     return st->append(st->ctx, REC_INDEX_PATH, line, strlen(line));
 }
 
