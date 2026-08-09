@@ -155,12 +155,29 @@ int capture_retry_pending(capture_ctx_t *cx) {
         if (strcmp(sc->state, "not_uploaded") != 0) continue;
         if (wav_refused(cx, sc)) continue;   /* torn header: now failed on
                                                 the card, out of the queue */
-        if (upload_once(cx, sc) == HTP_OK) {
+        int err = upload_once(cx, sc);
+        if (err == HTP_OK) {
             str_copy(sc->state, sizeof sc->state, "uploaded");
             sc->uploaded_at = cx->clock->epoch_s(cx->clock->ctx);
             sidecar_save(cx->storage, sc);
             confirmed++;
+        } else if (err == HTP_ERR_CLIENT) {
+            /* Same guarantee as capture_run's HTP_ERR_CLIENT branch (see
+             * the trace there): upload_once -> htp_upload_capture can only
+             * return HTP_ERR_CLIENT from a real server 4xx, never a local
+             * fault, so retrying gets the same rejection forever. Reached
+             * when a capture went not_uploaded via a genuine offline/server
+             * failure and is THEN rejected on a later retry (capture_run's
+             * own upload already drains this on the first attempt; this is
+             * the same poison-pill class on the second-chance path). Drain
+             * it the same way instead of re-streaming the WAV every sync. */
+            str_copy(sc->state, sizeof sc->state, "failed");
+            str_copy(sc->error, sizeof sc->error, "upload_rejected");
+            sidecar_save(cx->storage, sc);
         }
+        /* HTP_ERR_AUTH / SERVER / NETWORK / PROTO: sc is left untouched,
+         * so it stays not_uploaded and is retried on the next sync --
+         * unchanged from before this fix. */
     }
     return confirmed;
 }

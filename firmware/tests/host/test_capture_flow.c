@@ -219,6 +219,35 @@ static void test_auth_error_leaves_capture_pending(void) {
     CHECK_EQ_INT(capture_pending_count(&st), 0);
 }
 
+/* Controller ruling (fix round 2): the identical poison-pill class also
+ * reaches capture_retry_pending's OWN upload_once call, not just
+ * capture_run's. Scenario: an earlier capture_run attempt returned
+ * CAPTURE_OFFLINE (network/server trouble, not a rejection), leaving the
+ * sidecar not_uploaded -- fresh() already leaves it in exactly that state,
+ * so no need to actually drive capture_run through the offline path. A
+ * LATER sync's capture_retry_pending call is the one that gets the 4xx
+ * this time; it must drain the same way capture_run's own upload does. */
+static void test_client_error_on_retry_drains_pending_queue(void) {
+    fresh("c-rej2");
+    rec_index_append(&st, "c-rej2");
+    uint8_t hdr[44];
+    wav_write_header(hdr, 16000, 16, 1, 8000);
+    CHECK_EQ_INT(st.write(st.ctx, "/rec/c-rej2.wav", hdr, sizeof hdr), 0);
+    CHECK_EQ_STR(sc.state, "not_uploaded");          /* as if from an earlier offline attempt */
+
+    ft_push(&ft, 0, 422, "{\"error\":\"malformed_capture\"}");
+    CHECK_EQ_INT(capture_retry_pending(&cx), 0);
+    CHECK_EQ_INT(ft.req_count, 1);                   /* one attempt, no retry loop here */
+    sidecar_t back; sidecar_load(&st, "c-rej2", &back);
+    CHECK_EQ_STR(back.state, "failed");
+    CHECK_EQ_STR(back.error, "upload_rejected");
+    CHECK_EQ_INT(capture_pending_count(&st), 0);     /* out of the pending queue */
+
+    /* a following sync must not re-upload it */
+    CHECK_EQ_INT(capture_retry_pending(&cx), 0);
+    CHECK_EQ_INT(ft.req_count, 1);                   /* no new request made */
+}
+
 static void test_retry_pending(void) {
     fresh("c-one");                               /* c-one: not_uploaded */
     sidecar_t two; sidecar_init(&two, "c-two");   /* c-two: already uploaded */
@@ -251,6 +280,7 @@ int main(void) {
     test_retry_skips_torn_wav();
     test_client_error_drains_pending_queue();
     test_auth_error_leaves_capture_pending();
+    test_client_error_on_retry_drains_pending_queue();
     test_retry_pending();
     return HARNESS_REPORT();
 }
