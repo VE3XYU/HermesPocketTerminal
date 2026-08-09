@@ -1458,8 +1458,13 @@ static void ui_session(wake_cause_t wc) {
         gesture_t ge = gesture_feed(&g, board_btn_rec(), board_btn_pwr(), now);
 
         /* Power-off countdown: PWR held past 2 s warns once (partial
-         * refresh); the GEST_PWR_OFF at 5 s then executes it. */
-        if (g.pwr_down && !countdown_shown && now - g.pwr_t0 > PWR_COUNTDOWN_MS) {
+         * refresh); the GEST_PWR_OFF at 5 s then executes it. `!g.pwr_open`
+         * keeps this honest against round 7's release debounce: a press
+         * that ends just under 2 s stays latched (pwr_down) for the
+         * debounce window, and without this gate the warning would fire on
+         * an already-released button and then swallow its gesture. */
+        if (g.pwr_down && !g.pwr_open && !countdown_shown &&
+            now - g.pwr_t0 > PWR_COUNTDOWN_MS) {
             screen_status("Hold to power off...");
             countdown_shown = 1;
         }

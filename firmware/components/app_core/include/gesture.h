@@ -21,10 +21,29 @@ typedef enum { GEST_NONE, GEST_REC_HOLD_START, GEST_REC_SHORT,
 #define GEST_PWR_LONG_MS   600
 #define GEST_PWR_OFF_MS    5000
 
+/* RELEASE debounce (C7 round 7, finding 1). A press ends only once the
+ * button has read open for this long; any closed sample inside the window
+ * cancels the pending release and the press continues from its ORIGINAL
+ * press edge. Without it a single soft ("lazy") press -- whose contact
+ * chatters open/closed across the caller's ~20 ms poll -- was classified
+ * as two gestures and fired two clicks. This is the same discipline the
+ * dev linger has had since round 3 (DEV_BTN_DEBOUNCE_MS), which the
+ * gesture FSM never got. It is NOT a minimum press duration: any latched
+ * press still classifies on its debounced release, and the press length
+ * that decides SHORT vs LONG is measured to the moment the button opened,
+ * never to the end of the debounce window -- a 599 ms tap stays a tap.
+ * Cost: one extra poll (~20-40 ms) of feedback latency, against the
+ * 250 ms window round 5 removed. */
+#define GEST_RELEASE_DEBOUNCE_MS 30
+
 typedef struct {
     int rec_down, pwr_down;
     unsigned rec_t0, pwr_t0;
     int rec_hold_fired, pwr_off_fired;
+    /* pending-release state: *_open = an open sample is waiting out the
+     * debounce, *_open_t0 = the moment the button actually opened */
+    int rec_open, pwr_open;
+    unsigned rec_open_t0, pwr_open_t0;
 } gesture_fsm_t;
 
 void gesture_init(gesture_fsm_t *g);
