@@ -21,20 +21,33 @@ typedef enum { GEST_NONE, GEST_REC_HOLD_START, GEST_REC_SHORT,
 #define GEST_PWR_LONG_MS   600
 #define GEST_PWR_OFF_MS    5000
 
-/* RELEASE debounce (C7 round 7, finding 1). A press ends only once the
- * button has read open for this long; any closed sample inside the window
- * cancels the pending release and the press continues from its ORIGINAL
- * press edge. Without it a single soft ("lazy") press -- whose contact
- * chatters open/closed across the caller's ~20 ms poll -- was classified
- * as two gestures and fired two clicks. This is the same discipline the
- * dev linger has had since round 3 (DEV_BTN_DEBOUNCE_MS), which the
- * gesture FSM never got. It is NOT a minimum press duration: any latched
- * press still classifies on its debounced release, and the press length
- * that decides SHORT vs LONG is measured to the moment the button opened,
- * never to the end of the debounce window -- a 599 ms tap stays a tap.
- * Cost: one extra poll (~20-40 ms) of feedback latency, against the
- * 250 ms window round 5 removed. */
-#define GEST_RELEASE_DEBOUNCE_MS 30
+/* RELEASE debounce (C7 round 7, finding 1; widened for the parked C7
+ * double-beep in Task 19). A press ends only once the button has read
+ * open for this long; any closed sample inside the window cancels the
+ * pending release and the press continues from its ORIGINAL press edge.
+ * Without it a single soft ("lazy") press -- whose contact chatters
+ * open/closed across the caller's ~20 ms poll -- was classified as two
+ * gestures and fired two clicks. This is the same discipline the dev
+ * linger has had since round 3 (DEV_BTN_DEBOUNCE_MS), which the gesture
+ * FSM never got.
+ *
+ * Value history: round 7 shipped 30 ms, which classifies after 2 open
+ * polls (~40 ms) -- and the bench still heard a double beep on releases
+ * from LONGER holds, whose slower roll-off re-strikes the contact at
+ * gaps of 50 ms and more; a re-strike sampled after classification
+ * latched a new press and a second gesture (host repro: test_gesture's
+ * chatter cases). 60 ms -- matching DEV_BTN_DEBOUNCE_MS -- waits 3 open
+ * polls and absorbs sampled re-strike gaps up to ~70 ms. NOT verified on
+ * hardware (the bench wrapped before this change); if the double beep
+ * survives, the next lever is this same knob.
+ *
+ * It is NOT a minimum press duration: any latched press still classifies
+ * on its debounced release, and the press length that decides SHORT vs
+ * LONG is measured to the moment the button opened, never to the end of
+ * the debounce window -- a 599 ms tap stays a tap. Cost: classification
+ * lands one poll later (~60 ms after the open edge instead of ~40),
+ * against the 250 ms window round 5 removed. */
+#define GEST_RELEASE_DEBOUNCE_MS 60
 
 typedef struct {
     int rec_down, pwr_down;

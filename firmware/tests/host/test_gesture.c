@@ -1,6 +1,18 @@
 #include "harness.h"
 #include "gesture.h"
 
+/* Modeling gap (documented, Task 19): every case below feeds the FSM at an
+ * uninterrupted 20 ms cadence. The real UI loop is NOT uninterrupted -- an
+ * e-paper partial refresh blocks it for 300-500 ms, during which buttons go
+ * unsampled and `now` then jumps. Consequences the suite does not model: a
+ * press-and-release completed entirely inside a refresh is never seen at
+ * all, and a press whose release lands inside one has its open edge dated
+ * at the first post-refresh sample, so its measured duration stretches by
+ * up to the refresh time (a tap released mid-refresh can classify LONG).
+ * Both are inherent to sampled input on a blocking display, were accepted
+ * in C7 round 7, and cannot be regression-tested here without also
+ * modeling the display's timing. */
+
 /* helper: run the fsm through (rec,pwr,t) samples, return the first non-NONE gesture */
 static gesture_t run(gesture_fsm_t *g, const int (*seq)[3], int n) {
     gesture_t got = GEST_NONE;
@@ -47,31 +59,31 @@ int main(void) {
     CHECK_EQ_INT(gesture_feed(&g, 1, 0, 0), GEST_NONE);
     CHECK_EQ_INT(gesture_feed(&g, 1, 0, 100), GEST_NONE);
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 200), GEST_NONE);   /* release seen... */
-    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 220), GEST_NONE);   /* ...20 ms: not yet */
-    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 240), GEST_REC_SHORT);   /* 40 ms >= 30 */
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 240), GEST_NONE);   /* ...40 ms: not yet */
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 260), GEST_REC_SHORT);   /* 60 ms >= 60 */
 
     /* PWR tap resolves on the debounced release -- no double-tap
      * vocabulary means no post-release waiting window (C7 round 5: the
      * retired 250 ms window delayed every tap's feedback by that much;
-     * round 7's debounce costs one extra ~20 ms poll, not 250). */
+     * the release debounce costs ~60 ms after the open edge, not 250). */
     gesture_init(&g);
     CHECK_EQ_INT(gesture_feed(&g, 0, 1, 0), GEST_NONE);
     CHECK_EQ_INT(gesture_feed(&g, 0, 1, 100), GEST_NONE);
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 200), GEST_NONE);
-    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 240), GEST_PWR_SHORT);   /* the release edge */
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 260), GEST_PWR_SHORT);   /* the release edge */
 
     /* two quick taps = two SHORTs, not a double (double-tap retired) */
     gesture_init(&g);
     CHECK_EQ_INT(gesture_feed(&g, 0, 1, 0), GEST_NONE);
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 120), GEST_NONE);
-    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 160), GEST_PWR_SHORT);
-    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 200), GEST_NONE);        /* within the old 250 ms window */
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 180), GEST_PWR_SHORT);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 220), GEST_NONE);        /* within the old 250 ms window */
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 320), GEST_NONE);
-    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 360), GEST_PWR_SHORT);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 380), GEST_PWR_SHORT);
 
     /* PWR long: release after 600 */
     gesture_init(&g);
-    const int plong[][3] = { {0,1,0}, {0,1,650}, {0,0,700}, {0,0,740} };
+    const int plong[][3] = { {0,1,0}, {0,1,650}, {0,0,700}, {0,0,760} };
     CHECK_EQ_INT(run(&g, plong, 4), GEST_PWR_LONG);
     /* boundary: release at exactly 599 sampled ms is still a tap -- the
      * debounce window must NOT be counted into the press duration */
@@ -158,6 +170,65 @@ int main(void) {
         CHECK(first_t < 380);   /* measured from the original press edge */
     }
 
+    /* ---- Task 19, the parked C7 double-beep: RELEASE chatter ----
+     * Repro on hardware: hold noticeably longer than a tap, release ->
+     * two blips. Mechanism (round-7 re-review prediction, confirmed here):
+     * a slow finger roll-off makes the contact re-strike at intervals of
+     * 50 ms and more; once the button has read open long enough to
+     * classify, the next sampled re-strike latched a NEW press, and its
+     * release classified a second gesture -> second click. The old 30 ms
+     * window classified after 2 open polls (~40 ms), so any re-strike gap
+     * >= ~50 ms split. At 60 ms the FSM waits 3 open polls and absorbs
+     * re-strike gaps up to ~70 ms sampled at the 20 ms cadence. */
+
+    /* long hold, then release chatter with re-strikes at 760 and 820
+     * (gaps of 60/40 ms): exactly ONE gesture, and still the LONG the
+     * press duration earned */
+    {
+        gesture_fsm_t s;
+        gesture_init(&s);
+        int n = 0;
+        for (int t = 0; t <= 1500; t += 20) {
+            int down = (t < 700) || (t == 760) || (t == 820);
+            gesture_t r = gesture_feed(&s, 0, down, (unsigned)t);
+            if (r != GEST_NONE && n < 8) got[n++] = r;
+        }
+        CHECK_EQ_INT(n, 1);
+        CHECK_EQ_INT(got[0], GEST_PWR_LONG);
+    }
+
+    /* the same chatter on a REC tap: one SHORT, not tap + phantom select */
+    {
+        gesture_fsm_t s;
+        gesture_init(&s);
+        int n = 0;
+        for (int t = 0; t <= 1000; t += 20) {
+            int down = (t < 200) || (t == 260);
+            gesture_t r = gesture_feed(&s, down, 0, (unsigned)t);
+            if (r != GEST_NONE && n < 8) got[n++] = r;
+        }
+        CHECK_EQ_INT(n, 1);
+        CHECK_EQ_INT(got[0], GEST_REC_SHORT);
+    }
+
+    /* ---- Task 19 blessing of two emergent behaviors (ledger r6) ----
+     * (a) A PWR press that began DURING reply playback is invisible until
+     * the follow-up window's FSM starts sampling (playback polls only
+     * REC): the press is latched on the window's first sample, its
+     * pre-window duration is not counted, so the release classifies as a
+     * tap -- and a tap is exactly what ends the conversation. */
+    gesture_init(&g);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 1, 0), GEST_NONE);   /* already held at entry */
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 200), GEST_NONE);
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 280), GEST_PWR_SHORT);
+    /* (b) REC held past the point it stopped playback keeps being held
+     * into the window: hold-to-talk fires 350 ms after the first sample,
+     * rolling the same physical hold into the follow-up recording. */
+    gesture_init(&g);
+    CHECK_EQ_INT(gesture_feed(&g, 1, 0, 0), GEST_NONE);   /* still held from the stop */
+    CHECK_EQ_INT(gesture_feed(&g, 1, 0, 340), GEST_NONE);
+    CHECK_EQ_INT(gesture_feed(&g, 1, 0, 360), GEST_REC_HOLD_START);
+
     /* both buttons acting on the same sample: one gesture leaves per call
      * and the PWR release is NOT dropped -- it emerges on the next sample */
     {
@@ -165,8 +236,8 @@ int main(void) {
         gesture_init(&s);
         gesture_feed(&s, 1, 1, 0);                       /* both down */
         CHECK_EQ_INT(gesture_feed(&s, 0, 0, 100), GEST_NONE);   /* both open */
-        gesture_t a = gesture_feed(&s, 0, 0, 140);
-        gesture_t b = gesture_feed(&s, 0, 0, 160);
+        gesture_t a = gesture_feed(&s, 0, 0, 160);
+        gesture_t b = gesture_feed(&s, 0, 0, 180);
         CHECK_EQ_INT(a, GEST_REC_SHORT);
         CHECK_EQ_INT(b, GEST_PWR_SHORT);
     }
