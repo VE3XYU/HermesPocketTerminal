@@ -6,9 +6,12 @@
  *
  * The divider ratio and the voltage->percent curve below are the reference
  * hardware's nominal values, NOT measured on this board: a 2:1 divider and
- * a straight line from 3300 mV (empty) to 4200 mV (full). Task 19 replaces
- * the curve with one measured against a real discharge (design §11.3), so
- * treat the number as "plausible", not accurate.
+ * a straight line from 3300 mV (empty) to 4200 mV (full). PROVISIONAL
+ * (design §11.3): no discharge measurement was taken before the bench
+ * wrapped, so the endpoints stand as Li-ion nominals. The calibration
+ * procedure -- read batt_mv from this file's serial line at full charge
+ * and near-empty, then edit BATT_MV_FULL / BATT_MV_EMPTY -- is written
+ * out in firmware/README.md.
  */
 #include "board.h"
 #include "esp_adc/adc_oneshot.h"
@@ -96,6 +99,11 @@ int board_battery_pct(void) {
     int pct = (batt_mv - BATT_MV_EMPTY) * 100 / (BATT_MV_FULL - BATT_MV_EMPTY);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    ESP_LOGD(TAG, "raw=%d pin=%dmV batt=%dmV pct=%d", raw_avg, pin_mv, batt_mv, pct);
+    /* INFO, not DEBUG (Task 19): batt_mv is the number the calibration
+     * procedure in firmware/README.md asks the operator to read at full
+     * charge and near-empty -- it must appear at the default log level.
+     * One line per ADC read (once per session/request), so the cost is a
+     * few serial lines per wake. */
+    ESP_LOGI(TAG, "raw=%d pin=%dmV batt=%dmV pct=%d", raw_avg, pin_mv, batt_mv, pct);
     return pct;
 }

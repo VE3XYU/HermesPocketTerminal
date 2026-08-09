@@ -64,18 +64,22 @@ static const char *TAG = "htp";
 /* ============================================================
  * Development-linger switch.
  *
- * 1 (development, the default): after a session completes, the device
- * stays awake with the USB-Serial-JTAG console alive. C7 finding C:
- * buttons ACT during the linger instead of being swallowed -- a REC
- * press starts a new capture session, a PWR tap opens a UI session
- * (both end back in the linger); 'sleep' + Enter, PWR held ~2 s, or
- * DEV_IDLE_TIMEOUT_MS of idleness drop into the real deep sleep with
- * the sync timer armed, so the full sleep/wake cycle stays verifiable.
+ * 0 (RELEASE, the default since Task 19): every session ends directly in
+ * board_deep_sleep(next_sync_interval()), no console hold -- deep sleep
+ * is the battery budget's resting state (both paths hardware-verified in
+ * C6: explicit sleep and the 10-min idle auto-sleep).
  *
- * 0 (release, Task 19 flips this): every session ends directly in
- * board_deep_sleep(next_sync_interval()), no console hold.
+ * 1 (development bench): after a session completes, the device stays
+ * awake with the USB-Serial-JTAG console alive (deep sleep kills the USB
+ * port mid-iteration). C7 finding C: buttons ACT during the linger
+ * instead of being swallowed -- a REC press starts a new capture
+ * session, a PWR tap opens a UI session (both end back in the linger);
+ * 'sleep' + Enter, PWR held ~2 s, or DEV_IDLE_TIMEOUT_MS of idleness
+ * drop into the real deep sleep with the sync timer armed, so the full
+ * sleep/wake cycle stays verifiable. Flip this one character to get the
+ * bench behavior back.
  * ============================================================ */
-#define HTP_DEV_LINGER 1
+#define HTP_DEV_LINGER 0
 
 /* ============================================================
  * Session state. One main task runs everything sequentially, and the
