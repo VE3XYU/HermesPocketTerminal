@@ -330,8 +330,10 @@ static void render_dashboard(ui_flow_t *u, ui_fb_t *fb) {
      * already clamps at 32 (the network parser, the cache loader), but
      * widget_list indexes rows[row_count - 1] and scrolls by it -- a
      * future source of a bad count must degrade to a truncated list, not
-     * an OOB read of ui_list_t.rows[32]. */
-    l->row_count = u->dash.item_count <= 32 ? u->dash.item_count : 32;
+     * an OOB read of ui_list_t.rows[32]. Clamped at both ends: a negative
+     * count would otherwise pass straight through and index rows[-1]. */
+    l->row_count = u->dash.item_count < 0 ? 0
+                 : (u->dash.item_count > 32 ? 32 : u->dash.item_count);
     /* C7 round 7: the banner strip IS the last row band, so a pending
      * banner costs the list its last visible row rather than painting over
      * it. Dashboard-only, because the banner is drawn nowhere else. */
