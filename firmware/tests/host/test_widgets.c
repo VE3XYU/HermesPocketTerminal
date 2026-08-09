@@ -34,7 +34,7 @@ int main(void) {
     int limit = clock_x - UI_STATUS_GAP;
     int w_batt = fb_text_width_prop("100%", UI_FONT_SMALL);
     int w_pend = fb_text_width_prop("^9", UI_FONT_SMALL);
-    int w_wifi = fb_text_width_prop("W", UI_FONT_SMALL);
+    int w_wifi = UI_WIFI_W;
     int full_cluster_end = UI_MARGIN_X + w_batt + UI_STATUS_GAP
                          + w_pend + UI_STATUS_GAP + w_wifi;
     CHECK(full_cluster_end <= limit);
@@ -42,9 +42,34 @@ int main(void) {
     ui_status_t full = { .battery_pct = 100, .wifi_ok = 1, .pending_uploads = 9,
                          .clock_hhmm = "10:15" };
     widget_status_line(&fb, &full);
-    /* wifi "W" drew at its measured slot -- nothing was dropped */
+    /* the wifi glyph drew at its slot -- nothing was dropped */
     int wifi_x = UI_MARGIN_X + w_batt + UI_STATUS_GAP + w_pend + UI_STATUS_GAP;
     CHECK(region_ink(wifi_x, 0, w_wifi, UI_STATUS_H - 1) > 0);
+
+    /* C7 round 7, finding 4 -- the wifi glyph is a real mark, present only
+     * when the link is up, and it fits its cell exactly (no ink outside
+     * UI_WIFI_W x UI_WIFI_H, none in the divider row). */
+    {
+        int cell = region_ink(wifi_x, UI_STATUS_BASE - UI_WIFI_H, UI_WIFI_W, UI_WIFI_H);
+        CHECK(cell > 20);                       /* a fan, not a stray pixel */
+        CHECK(cell < UI_WIFI_W * UI_WIFI_H);    /* and not a solid block */
+        /* everything the glyph draws is inside the cell */
+        CHECK_EQ_INT(region_ink(wifi_x, 0, w_wifi, UI_STATUS_H - 1), cell);
+        /* the column right of the glyph is clear of it (clock aside) */
+        CHECK_EQ_INT(region_ink(wifi_x + UI_WIFI_W, 0, limit - wifi_x - UI_WIFI_W,
+                                UI_STATUS_H - 1), 0);
+        /* the mark is bottom-heavy: the dot rows carry the solid stroke */
+        CHECK(region_ink(wifi_x, UI_STATUS_BASE - 3, UI_WIFI_W, 3) == 9);
+
+        /* wifi down: the same strip, minus exactly the glyph */
+        fb_clear(&fb);
+        ui_status_t down = full;
+        down.wifi_ok = 0;
+        widget_status_line(&fb, &down);
+        CHECK_EQ_INT(region_ink(wifi_x, 0, w_wifi, UI_STATUS_H - 1), 0);
+        fb_clear(&fb);
+        widget_status_line(&fb, &full);
+    }
 
     /* priority-inversion guard: when an item does not fit, nothing after
      * it may draw in the gap it left behind (battery -> pending -> wifi

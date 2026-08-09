@@ -68,6 +68,47 @@ _Static_assert(UI_TEXT_FIRST_BASE - UI_FONT_BODY_ASC >= UI_STATUS_H &&
                    + UI_FONT_BODY_DESC < UI_H,
                "a full text page must fit on the panel");
 
+/* Wi-Fi fan, hand-plotted (C7 round 7, finding 4). Rows of UI_WIFI_W bits,
+ * MSB = leftmost column; nothing is copied from any asset. The arcs are
+ * circle segments about the dot at the bottom centre (radii ~6 and ~4,
+ * spanning about +/-55 degrees either side of vertical), with a clear row
+ * between each ring so the mark stays legible at 1 px stroke on e-paper:
+ *
+ *      ...#######...      outer arc, r ~ 6
+ *      .##.......##.
+ *      #...........#
+ *      .............
+ *      .....###.....      middle arc, r ~ 4
+ *      ...##.....##.
+ *      .............
+ *      .....###.....      dot
+ *      .....###.....
+ *      .....###.....
+ */
+static const uint16_t k_wifi_rows[UI_WIFI_H] = {
+    0x03F8,   /* 0001111111000 */
+    0x0C06,   /* 0110000000110 */
+    0x1001,   /* 1000000000001 */
+    0x0000,
+    0x00E0,   /* 0000001110000 */
+    0x0318,   /* 0001100011000 */
+    0x0000,
+    0x00E0,
+    0x00E0,
+    0x00E0,
+};
+_Static_assert(UI_STATUS_BASE - UI_WIFI_H >= 0 &&
+               UI_STATUS_BASE - 1 <= UI_STATUS_H - 2,
+               "the wifi glyph must sit inside the strip, above the divider");
+
+void widget_wifi_glyph(ui_fb_t *f, int x, int baseline, int black) {
+    int y0 = baseline - UI_WIFI_H;   /* bottom row lands at baseline - 1 */
+    for (int r = 0; r < UI_WIFI_H; r++)
+        for (int c = 0; c < UI_WIFI_W; c++)
+            if (k_wifi_rows[r] & (uint16_t)(1u << (UI_WIFI_W - 1 - c)))
+                fb_pixel(f, x + c, y0 + r, black);
+}
+
 void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
     char buf[24];
 
@@ -91,9 +132,9 @@ void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
      * clipped mid-glyph, and once an item is dropped, nothing after it
      * may draw either -- otherwise a lower-priority item can fit in the
      * gap a higher-priority one left behind, inverting the hierarchy.
-     * (Every realistic strip -- "100%" + "^<int max>" + "W" + clock --
-     * fits outright at the body size, so the drop path is a guard, not
-     * an expectation; the host test derives both facts.) */
+     * (Every realistic strip -- "100%" + "^<int max>" + the wifi glyph +
+     * clock -- fits outright, so the drop path is a guard, not an
+     * expectation; the host test derives both facts.) */
     int x = UI_MARGIN_X;
     int stop = 0;
     if (!stop && st->battery_pct != -1) {
@@ -109,8 +150,7 @@ void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
         else stop = 1;
     }
     if (!stop && st->wifi_ok) {
-        int w = fb_text_width_prop("W", UI_FONT_SMALL);
-        if (x + w <= limit) fb_text_prop(f, x, UI_STATUS_BASE, "W", UI_FONT_SMALL, 1);
+        if (x + UI_WIFI_W <= limit) widget_wifi_glyph(f, x, UI_STATUS_BASE, 1);
     }
 
     fb_hline(f, 0, UI_STATUS_H - 1, UI_W, 1);

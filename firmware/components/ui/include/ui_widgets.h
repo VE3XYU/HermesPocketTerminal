@@ -97,6 +97,18 @@
                                 no banner is ever drawn over an entry) */
 #define UI_TEXT_FIRST_BASE (UI_STATUS_H + 2 + UI_FONT_BODY_ASC) /* page line 0 */
 
+/* Wi-Fi indicator (C7 round 7, finding 4): a real fan glyph -- dot plus
+ * two concentric arcs -- instead of the letter "W", which read as text
+ * next to the battery percentage. Hand-plotted here as a bitmap (no
+ * copied asset), 13 x 10 px: wider than tall like every wifi mark, and
+ * sized to sit against the SMALL face's 12 px caps. */
+#define UI_WIFI_W 13
+#define UI_WIFI_H 10
+
+/* Draws the glyph with its BOTTOM row one pixel above `baseline`, so it
+ * sits on the same optical line as the strip's text. x is the left edge. */
+void widget_wifi_glyph(ui_fb_t *f, int x, int baseline, int black);
+
 typedef struct {
     int battery_pct;          /* -1 hides */
     int wifi_ok;              /* 0/1 */
