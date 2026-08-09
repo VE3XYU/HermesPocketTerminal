@@ -71,6 +71,7 @@ async def test_note_reaches_done_without_entering_processing(parts, fake_clock):
     assert capture.state == "done"
     assert capture.transcript == "Add milk to the shopping list"
     assert capture.reply_text is None
+    assert capture.conversation_id is None, "a note must not be assigned a conversation"
     assert agent.ingested == [("Add milk to the shopping list", 1)]
     assert agent.conversations == [], "a note must never open a conversation"
     assert speech.synthesized == [], "a note must never be synthesized"
@@ -119,6 +120,69 @@ async def test_follow_up_reuses_conversation_and_sends_history(parts, fake_clock
 
     assert captures.get("c-2").conversation_id == "v-1"
     assert agent.conversations[1][1] == [("Hey Hermes, what time is dinner?", "Dinner is at 7 PM.")]
+
+
+async def test_echoed_conversation_id_routes_to_conversation_without_a_salutation(
+    parts, fake_clock
+):
+    """Design §5.1/§6.3: the device echoes X-Conversation-Id on the capture that
+    follows a spoken reply, and "a follow-up capture carrying that ID is sent to
+    the agent with the recent exchange history included". The salutation rule
+    (§6.2) decides disposition only for captures that carry no conversation ID --
+    a natural follow-up ("Okay, and what about Sunday?") is spoken without one.
+
+    Reproduced on hardware at checkpoint C6: the device echoed the ID correctly,
+    but the bridge routed on the salutation alone and turned the follow-up into
+    an orphaned note ("Noted") instead of continuing the exchange.
+    """
+    captures, storage, _ = parts
+    speech = FakeSpeechProvider(
+        transcripts={
+            "c-1": "Hey Hermes, what's on my calendar Saturday?",
+            "c-2": "Okay, and what about Sunday?",
+        }
+    )
+    agent = FakeAgentClient(reply_text="Nothing on Saturday.")
+    pipeline = build(parts, fake_clock, speech=speech, agent=agent)
+
+    upload(parts, "c-1")
+    await pipeline.process("c-1")
+    upload(parts, "c-2", conversation_id="v-1")
+    await pipeline.process("c-2")
+
+    capture = captures.get("c-2")
+    assert capture.state == "reply_ready", "the follow-up must be answered, not noted"
+    assert capture.reply_text == "Nothing on Saturday."
+    assert capture.conversation_id == "v-1", "the echoed conversation must be kept, not replaced"
+    assert storage.has_reply("c-2")
+    assert agent.ingested == [], "a conversation turn is never ingested as a note"
+    assert agent.conversations[1][0] == "Okay, and what about Sunday?"
+    assert agent.conversations[1][1] == [
+        ("Hey Hermes, what's on my calendar Saturday?", "Nothing on Saturday.")
+    ], "the follow-up must carry the recent exchange history"
+
+
+async def test_echoed_conversation_id_still_strips_a_salutation_from_the_prompt(
+    parts, fake_clock
+):
+    """Regression guard: routing on the conversation ID must not stop the
+    salutation being stripped when the user does repeat it mid-conversation.
+    """
+    captures, _, _ = parts
+    speech = FakeSpeechProvider(
+        transcripts={"c-1": "Hey Hermes, what time is dinner?", "c-2": "Hey Hermes, and dessert?"}
+    )
+    agent = FakeAgentClient(reply_text="Dinner is at 7 PM.")
+    pipeline = build(parts, fake_clock, speech=speech, agent=agent)
+
+    upload(parts, "c-1")
+    await pipeline.process("c-1")
+    upload(parts, "c-2", conversation_id="v-1")
+    await pipeline.process("c-2")
+
+    assert captures.get("c-2").conversation_id == "v-1"
+    assert agent.conversations[1][0] == "and dessert?", "the prefix is still stripped"
+    assert agent.ingested == []
 
 
 async def test_transcription_failure_marks_capture_failed(parts, fake_clock):

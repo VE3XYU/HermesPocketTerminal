@@ -75,7 +75,15 @@ class Pipeline:
         self._captures.set_transcript(capture_id, transcript)
         remainder = salutation.detect(transcript, self._prefixes)
 
-        if remainder is None:
+        # Salutation detection (design §6.2) decides disposition only for captures
+        # that arrive without a conversation ID. A capture whose conversation_id is
+        # already set was uploaded with the device echoing the ID this bridge handed
+        # back on the previous turn (§5.1), which means the user is answering a
+        # spoken reply -- and follow-ups are spoken naturally, without repeating the
+        # salutation. Routing such a capture by salutation alone turned every
+        # follow-up into an orphaned note. The prompt is still the stripped
+        # remainder when a salutation is present, and the full transcript otherwise.
+        if remainder is None and capture.conversation_id is None:
             await self._finish_note(capture_id, transcript, capture.recorded_at)
         else:
             await self._answer(capture_id, remainder or transcript, capture.conversation_id)

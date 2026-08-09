@@ -1,6 +1,8 @@
 # HTP Firmware — Design
 
-Version 0.1 — 2026-08-05
+Version 0.2 — 2026-08-09. Originally written 2026-08-05; reconciled with the as-built
+device at wrap-up (Task 19) — corrections are marked "as built" with the hardware
+checkpoint that motivated them.
 
 ## 1. Purpose and scope
 
@@ -30,6 +32,12 @@ The target is a commercial ESP32-S3 voice-notes handheld (board profile
 in `reference/pala_note/` purely as hardware reference; pin assignments and
 initialization order were confirmed from it.
 
+Hardware ground truth established during bring-up (C1/C3): the module is an
+ESP32-S3-PICO-1 (LGA56), **N8R8** — 8 MB embedded flash plus 8 MB octal PSRAM. The SD
+card must be formatted FAT32 **with long-filename support enabled in the firmware**
+(`CONFIG_FATFS_LFN_HEAP=y`): the layout below uses names like `config.json.tmp` that
+are illegal under bare 8.3.
+
 | Subsystem | Parts and pins |
 |---|---|
 | Display | 1.54″ 200×200 monochrome e-paper, SSD1681-class controller, full + partial refresh. SPI2: DC 10, CS 11, SCK 12, MOSI 13, RST 9, BUSY 8. Power gate GPIO 6 (active low) |
@@ -37,7 +45,7 @@ initialization order were confirmed from it.
 | Storage | SD card, SD-MMC 1-bit: CLK 39, CMD 41, D0 40 |
 | Buttons | Record GPIO 0, Power/menu GPIO 18. Both are deep-sleep EXT1 wake sources (any-low) |
 | Power | VBAT hold latch GPIO 17 (active high, held across deep sleep), battery ADC GPIO 4 |
-| I2C (SDA 47, SCL 48) | ES8311 control, PCF8563-class RTC at 0x51, SHTC3 temperature/humidity at 0x70 (unused in MVP) |
+| I2C (SDA 47, SCL 48) | ES8311 control, **PCF85063** RTC at 0x51, SHTC3 temperature/humidity at 0x70 (unused in MVP). As-built correction (C6): the design originally assumed a PCF8563; the part is a PCF85063 with a different register layout — a PCF8563 driver would read alarm/control registers as time. Verified against the reference firmware's register map |
 
 Facts the design leans on, proven by the stock firmware on this exact board: I2S capture
 streams to SD comfortably at 16 kHz; the codec's capture path delivers interleaved
@@ -81,6 +89,14 @@ The repository is public. `reference/pala_note/` is third-party, gitignored, and
 copied from. `esp_codec_dev` and the ES8311 driver are vendored from Espressif upstream
 (Apache-2.0) with license headers intact. The SSD1681 driver, and everything else, is
 written fresh from datasheets and this design.
+
+Typography, as built (C7 rounds 3–6, four legibility escalations): the UI renders a
+**proportional Liberation Sans ramp** (small/body/emphasis/hero) from GFX-format glyph
+tables generated at metric parity with the reference product's type ramp — Liberation
+Sans 2.1.5 under the SIL OFL 1.1, generation script and source hash committed under
+`components/ui/fonts/`. Nothing is copied from the reference firmware or from any GFX
+library's shipped tables. The 8×8 monospace font the early tasks used is fully
+retired.
 
 ---
 
@@ -154,7 +170,11 @@ MVP — release is the natural end).
      cycle, then sleep.
    - `reply_ready` → download and play the reply (§5.3), open a 30-second follow-up
      window: hold-to-talk records a new capture carrying the returned
-     `conversation_id`. Sleep when the window lapses.
+     `conversation_id`. Sleep when the window lapses. As built (C7): a **Power tap
+     during the window ends the conversation immediately** (with a click and the
+     resting outcome screen) rather than waiting out the 30 seconds; a REC press that
+     stopped reply playback and stays held rolls directly into the follow-up
+     recording.
    - `failed` → error screen; the WAV stays on SD.
    - No terminal state within 60 seconds → sleep. The bridge redirects a late reply to
      the notification queue; nothing is lost.
@@ -212,7 +232,9 @@ Every response's `server_time` corrects the RTC whenever drift exceeds two secon
 ```
 /config.json               bridge base URL, bearer token, initial sync interval
                            seconds (superseded by the server's `sync_interval`),
-                           log level, optional silence-timeout seconds
+                           log level, optional silence-timeout seconds, optional
+                           `timezone` (POSIX TZ string, added in C7: the status
+                           clock renders local time; absent = UTC)
 /wifi.json                 ordered profiles: ssid, password, optional static IP
 /rec/<capture-id>.wav      original audio, retained (§7.4 of the protocol design)
 /rec/<capture-id>.json     sidecar — the device's per-capture source of truth
@@ -250,22 +272,36 @@ key; the device never generates it twice.
 
 | Screen | Content |
 |---|---|
-| **Dashboard** (home) | Hermes-published title and items (done items rendered per their state/style hints), notification banner area, status line: battery, Wi-Fi, pending-upload count, time |
-| **Recordings** | Newest-first: time + transcript opening words, or `(transcript pending)` / `(not uploaded)` |
-| **Entry view** | Full scrollable transcript of one recording; Record-short plays the WAV |
-| **Settings** | MAC address, firmware version, battery %, bridge host, sync interval — display-only in MVP |
+| **Dashboard** (home, and the resting/sleep image) | Hermes-published title and items (done items struck through per their state/style hints), notification banner strip (occupies the last row band while up), status line: battery, Wi-Fi fan glyph, pending-upload count, clock (12-hour, no AM/PM, no leading zero, local per the config `timezone`) |
+| **Menu** (as built, C7 — the reference product's interaction model) | Dashboard / Recordings / Settings / Sleep, opened by a Power tap from the resting dashboard |
+| **Recordings** | Newest-first two-line transcript previews, or `(pending)` / `(not uploaded)`. **Conversation captures are excluded** — matched on the sidecar's `conversation_id`, a protocol-level mode field stamped at capture time, never a reading of the transcript, so the content-blindness invariant holds. They stay on the card and in every sync path |
+| **Entry view** | Full paged transcript of one recording; Record-short plays the WAV |
+| **Settings** | MAC address, firmware version, bridge host, sync interval — display-only in MVP |
 
 ### 7.2 Gestures
+
+As built (C7 rounds 5–7). The original design used cursor-first navigation with a
+double-tap screen cycle; the bench showed the operator's muscle memory (and the
+reference product) expect a **menu-first grammar**, and retiring the double-tap lets a
+tap resolve on its release edge instead of after a 250 ms wait. Every **accepted**
+press gets an instant audio click (low blip = Power/next, high blip = Record/select)
+before the e-paper refresh, so feedback never waits on the ink; a press that changes
+nothing is silent.
 
 | Gesture | Action |
 |---|---|
 | Record — hold (≥350 ms) | Capture — always, from any screen. The one sacred gesture |
-| Record — short | Context action: Dashboard → mark item under cursor complete; entry view → play WAV; banner visible → dismiss |
-| Record — press during playback | Stop playback |
-| Power — short | Cursor down / scroll, wrapping |
-| Power — long (≥600 ms, fires on release) | Enter / back: open Recordings entry; leave entry view |
-| Power — double | Cycle screen: Dashboard → Recordings → Settings → Dashboard |
-| Power — hold 5 s (fires while held, after an on-screen countdown warning) | Power off (release the VBAT latch) |
+| Record — short | Select / context action: menu → open row; dashboard (opened) → mark item under cursor complete; recordings → open entry; entry view → play WAV; dashboard banner visible → dismiss |
+| Record — press during playback | Stop playback (held past the stop, it rolls into the follow-up recording) |
+| Power — short | Next: resting dashboard → open menu; menu/lists → cursor down (wraps); entry view → next page. Advances only when ≥ 2 positions exist, else climbs one level — a tap always lands a visible change |
+| Power — long (≥600 ms, fires on release) | Back / up one level (entry → recordings → menu → resting dashboard) |
+| Power — tap during the reply follow-up window | End the conversation immediately |
+| Power — hold 5 s (fires while held, after an on-screen countdown warning at 2 s) | Power off (release the VBAT latch, after a deliberate blank full refresh — e-paper keeps its last image unpowered) |
+
+Both buttons run an edge-latched FSM with a release debounce
+(`GEST_RELEASE_DEBOUNCE_MS`) so contact chatter can neither split a press into two
+gestures nor misclassify a hold; press duration is measured to the moment the button
+opened, never to the end of the debounce window.
 
 Marking complete sends `POST /complete` immediately and redraws the item as done on
 `{"ok": true}` — no confirmation step. The agent is truth (§5.6) and can resurrect an
@@ -282,10 +318,15 @@ deduplicates.
 
 ### 7.4 Refresh discipline
 
-Partial refresh for cursor moves, banner changes, and status-line updates; full refresh
-on screen transitions and after every ~8 partials to clear ghosting. An unchanged
-dashboard `rev` costs zero display activity. The display power rail is gated on only
-while a refresh is in flight.
+As built (C7 finding A): **partial refresh is the default for every within-session
+update** — cursor moves, strikes, banners, page turns, and screen transitions alike. A
+full refresh (the visible black/white strobe) happens only (1) on the session's first
+draw after deep sleep, where the controller's previous-image RAM was lost, and (2) as a
+ghost-clear every `UI_GHOST_CLEAR_EVERY` (12, untuned) partials. Exactly one full per
+wake is the invariant; the several black flashes visible inside that one full are the
+SSD1681's OTP waveform inversions, not extra refreshes. An unchanged dashboard `rev` —
+or a changed `rev` whose rendered content is pixel-identical — costs zero display
+activity. The display power rail is gated on only while the panel is in use.
 
 ---
 
@@ -370,14 +411,19 @@ for flashing from any machine with USB access to the device.
 
 ## 11. Open items for implementation
 
-None affect the design; all are verified or decided during implementation.
+All closed at wrap-up (Task 19):
 
-1. **Exact IDF version pin** — latest stable v5.x at implementation start.
-2. **E-paper controller confirmation** — the LUT structure identifies an SSD1681-class
-   controller; confirmed against the panel during the display task.
-3. **Battery curve calibration** — ADC-to-percent mapping measured on real hardware.
-4. **Silence-timeout default** — MVP ships with release-to-stop only; a timeout value
-   is chosen if field use shows it is needed.
+1. **Exact IDF version pin** — **v5.5** (installed by `firmware/tools/setup-idf.sh`,
+   which records any change).
+2. **E-paper controller confirmation** — SSD1681 confirmed on hardware (C2). Mode-2
+   partial refresh works fast and flash-free; the datasheet-derived LUT fallback was
+   never needed and no LUT is uploaded.
+3. **Battery curve calibration** — **provisional**: the endpoints remain the Li-ion
+   nominals (3300/4200 mV in `battery.c`); no discharge measurement was taken before
+   the bench wrapped. The calibration procedure is written out in `firmware/README.md`.
+4. **Silence-timeout default** — MVP ships with release-to-stop only;
+   `silence_timeout_s` is parsed but not acted on. Wiring it later is a small change
+   in `audio_record_to`.
 
 ---
 

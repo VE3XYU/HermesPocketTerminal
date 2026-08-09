@@ -1,0 +1,46 @@
+# Reference module confirmed by hardware probe at C1: N8R8 (8 MB flash, 8 MB octal
+# PSRAM) — not the 16 MB/quad variant assumed before flashing real hardware.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+# Sessions (capture + UI + sync) run on the main task. C5 fix round 1:
+# Task 17's ~12 KB estimate missed rec_index_list's 16.4 KB local read
+# buffer under capture_retry_pending's 3.3 KB frame -- ~20.5 KB of app
+# frames alone, overflow on the first hardware sync. Every multi-KB local
+# on the session paths is file-scope static now (rec_index, sidecar_load,
+# capture_retry_pending, htp_poll_captures, ui_flow render models, the
+# Task 18 dashboard snapshot). Worst chain re-measured from the Task 18
+# ELF's entry prologues (ui_session syncs too, and its frame is the
+# largest session frame): baseline 80 B -> app_main 80 B -> ui_session
+# 336 B -> run_sync 64 B -> sync_cycle 128 B -> backfill 1392 B ->
+# htp_poll_captures 192 B -> perform 240 B -> tr_perform 384 B ~= 2.9 KB
+# of app frames -> esp_http_client/lwIP sockets ~2 KB (TCP runs on the
+# tcpip task; core locking off) or newlib/VFS/FatFS/sdmmc ~2.5 KB ->
+# deepest ESP_LOG vfprintf (full newlib) ~1.6 KB, plus ~0.7 KB pre-ISR
+# interrupt overhead: ~7.5 KB peak. No frame in the image beyond 1.4 KB
+# is ours (next are mbedtls/wpa at ~1.1 KB on other tasks). 16 KB leaves
+# >= 8.5 KB headroom; "stack hwm" log lines report real numbers per session.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# Task 14 serial provisioning (C3): stdin must reach the USB-Serial-JTAG
+# port as the *primary* console, not just the (output-only, non-blocking)
+# secondary channel the default config already routes logs through. This
+# also pulls stdin/stdout onto /dev/usbserjtag before app_main runs.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# C3 root cause (round 4): ESP-IDF FatFS defaults to CONFIG_FATFS_LFN_NONE
+# (8.3 short names only), so fopen() on "config.json.tmp" and even plain
+# "config.json" (4-char extension) fails with FR_INVALID_NAME (EINVAL) on
+# an otherwise perfectly healthy card/filesystem. Every design filename
+# (wifi.json, c-<timestamp>-<hex>.wav sidecars) needs long filenames.
+# LFN_HEAP allocates the LFN work buffer from heap per-operation rather
+# than reserving it on every call's stack (LFN_STACK) or not at all
+# (LFN_NONE); CONFIG_FATFS_MAX_LFN=255 is the (unmodified) default buffer
+# size cap.
+CONFIG_FATFS_LFN_HEAP=y

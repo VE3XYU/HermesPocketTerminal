@@ -4,13 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-Design documents and an implementation plan for the **Hermes Pocket Terminal** — an ESP32-S3 handheld that acts as a thin client to the Hermes personal AI system — and the **HTP Bridge**, the server that connects it to Hermes Agent. There is no code yet; the bridge will be built under `bridge/` by executing the implementation plan.
+The **Hermes Pocket Terminal** — an ESP32-S3 handheld that acts as a thin client to the Hermes personal AI system — and the **HTP Bridge**, the server that connects it to Hermes Agent. Both are built: the bridge lives under `bridge/` (Python/FastAPI, with a `--mock` mode), the device firmware under `firmware/` (pure ESP-IDF, with three pure-C host-tested components). Each was executed from its TDD implementation plan; the firmware is hardware-verified through bench checkpoints C1–C7.
 
-The three documents, in dependency order:
+The documents, in dependency order:
 
 1. `hermes-pocket-terminal-spec.md` — device spec: what the terminal does and deliberately does not do.
-2. `docs/superpowers/specs/2026-08-04-hermes-terminal-protocol-design.md` — the authoritative design: the HTP wire protocol (endpoints, schemas, capture states, idempotency) and the bridge architecture. Section references elsewhere (§4, §5.3…) point into this file.
-3. `docs/superpowers/plans/2026-08-04-htp-bridge.md` — 15-task TDD implementation plan for the bridge, with checkbox tracking. It expects execution via superpowers:subagent-driven-development or superpowers:executing-plans, one commit per task.
+2. `docs/superpowers/specs/2026-08-04-hermes-terminal-protocol-design.md` — the authoritative protocol design: the HTP wire protocol (endpoints, schemas, capture states, idempotency) and the bridge architecture. Section references elsewhere (§4, §5.3…) point into this file.
+3. `docs/superpowers/specs/2026-08-05-htp-firmware-design.md` — the firmware design (architecture, runtime model, UI, power), reconciled with the as-built device at wrap-up.
+4. `docs/superpowers/plans/` — the executed implementation plans for both (checkbox tracking, one commit per task).
+
+`firmware/README.md` is the operator manual: build, flashing, SD provisioning, calibration, tuning knobs, and the reliability-checklist status.
 
 `reference/pala_note/` is third-party firmware kept locally for hardware reference only. It is gitignored and must never be committed or redistributed.
 
@@ -25,7 +28,7 @@ Two invariants govern every design decision:
 
 The capture ID (device-generated, also the SD-card filename) is the end-to-end idempotency key: re-uploads are no-ops, retries are always safe. Reliability guarantees are enumerated in design §8 — the reliability test suite (plan Task 15) asserts those behaviors, not just happy paths.
 
-## Bridge development (once `bridge/` exists)
+## Bridge development
 
 ```bash
 cd bridge
@@ -35,7 +38,22 @@ python -m pytest tests/test_captures.py -v        # one file
 python -m pytest tests/ -k test_name -v           # one test
 ```
 
-The plan's **Global Constraints** section binds all bridge code. The ones most often violated by default habits:
+## Firmware development
+
+```bash
+bash firmware/tools/setup-idf.sh                  # one-time; pins ESP-IDF v5.5
+source ~/esp/esp-idf/export.sh
+idf.py -C firmware build                          # device build
+
+# host tests: plain cmake + gcc, no ESP-IDF needed
+cmake -S firmware/tests/host -B firmware/tests/host/build
+cmake --build firmware/tests/host/build
+ctest --test-dir firmware/tests/host/build --output-on-failure
+```
+
+Firmware's binding rules: `components/htp_client`, `components/app_core`, and `components/ui` are pure C — no ESP-IDF includes, no direct OS/hardware calls; everything arrives through injected port structs. Verify before any commit touching them (must print nothing): `grep -rn "esp_\|freertos\|driver/" firmware/components/htp_client/src firmware/components/app_core/src firmware/components/ui/src`. All host tests green before every commit. Fixed-size buffers; heap only inside cJSON and transport bodies. Commits use `feat(firmware): ...` / `fix(firmware): ...` / `test(firmware): ...` / `docs(firmware): ...` subjects.
+
+The plans' **Global Constraints** sections bind all code. The bridge ones most often violated by default habits:
 
 - Time and ID generation are injected (`clock: Callable[[], int]`), never called inline — no `time.time()`, `datetime.now()`, or `uuid4()` in business logic.
 - Tests never touch the network; speech/agent clients are faked, provider tests mock the HTTP transport.
