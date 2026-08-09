@@ -518,9 +518,18 @@ static int screen_ready(void) {
     return 0;
 }
 
+/* Per-session refresh ledger (C7 round 7, finding 2). The operator counts
+ * black flashes on a PWR wake; this counts what the firmware actually
+ * ISSUED, so the two numbers can be compared instead of guessed at. One
+ * line at teardown, reset per session. The inversions inside a single full
+ * refresh are the SSD1681's OTP waveform (0x22/0xF7 -- no custom LUT is
+ * uploaded, see epd_ssd1681.c) and are not ours to count or reduce. */
+static int s_fulls, s_partials;
+
 static void present(int want_full) {
     if (!s_base_drawn || want_full) {
         epd_full(s_fb.px);
+        s_fulls++;
         s_base_drawn = 1;
         /* Every ACTUAL full clears all ghosting, so the ghost-clear budget
          * restarts here rather than at the (several) call sites that ask
@@ -534,6 +543,7 @@ static void present(int want_full) {
         (void)ui_flow_wants_full(&s_uif, UIF_REDRAW_FULL);
     } else {
         epd_partial(s_fb.px);
+        s_partials++;
     }
 }
 
@@ -1759,6 +1769,14 @@ void app_main(void) {
         else                            sync_session(wc);     /* timer + cold */
 
         awake_cap_cancel();
+
+        /* What this session actually asked the panel to do. A wake should
+         * read fulls=1 (the first draw after deep sleep, where the
+         * controller's previous-image RAM was lost); anything more is a
+         * bug, and the several inversions the operator sees inside that
+         * one full are the OTP waveform, not extra refreshes. */
+        ESP_LOGI(TAG, "display: fulls=%d partials=%d", s_fulls, s_partials);
+        s_fulls = s_partials = 0;
 
         /* Common teardown: radio off, codec + rail off, panel asleep. All
          * of these are safe no-ops when the session never brought them up. */
