@@ -937,8 +937,12 @@ static void capture_bg_join(void) {
 
 /* Records one capture: id, WAV to SD, sidecar + rec index (the durable
  * step), with the glyph (and optionally the Wi-Fi kickoff) overlapped.
- * Returns 0 = captured (sc filled, durable on card), 1 = too short
- * (discarded), -1 = recording/SD failure (WAV removed). */
+ * Returns 0 = captured (sc filled, durable AND queued on card), 1 = too
+ * short (discarded), -1 = recording/SD failure (WAV removed), 2 = WAV
+ * durable but the sidecar/index write failed (card filled by the WAV
+ * itself, or a FAT error): sc is filled and an in-session upload is still
+ * honest, but NO retry will ever find this capture -- callers must never
+ * show a screen that promises a later upload (final review, Important 2). */
 static int record_capture(sidecar_t *sc, const char *conversation_id,
                           int start_wifi, long *bytes_out) {
     uint8_t r2[2];
@@ -981,8 +985,18 @@ static int record_capture(sidecar_t *sc, const char *conversation_id,
     sc->recorded_at = now;
     if (conversation_id && conversation_id[0])
         str_copy(sc->conversation_id, sizeof sc->conversation_id, conversation_id);
-    sidecar_save(&s_st, sc);
-    rec_index_append(&s_st, id);
+    /* The durable step. Both writes checked (final review, Important 2 --
+     * deferred twice before): a WAV that landed while the sidecar or index
+     * write failed is durable audio that NOTHING will ever retry, and the
+     * old fall-through let the session end on "Saved, will upload later"
+     * for it. Index append is skipped after a sidecar failure so the index
+     * never lists an id whose sidecar_load can only fail. */
+    if (sidecar_save(&s_st, sc) != 0 || rec_index_append(&s_st, id) != 0) {
+        ESP_LOGE(TAG, "sidecar/index write failed for %s: WAV kept on card "
+                      "but the capture is NOT queued for retry", id);
+        invalidate_capture_caches();
+        return 2;
+    }
     invalidate_capture_caches();   /* one more not_uploaded sidecar on the card */
     return 0;
 }
@@ -1255,10 +1269,11 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
 
         long bytes = 0;
         int rr = record_capture(&s_sc_next, s_sc.conversation_id, 0, &bytes);
-        if (rr != 0) {
-            screen_status(rr > 0 ? "Too short" : "SD full");
-            break;
-        }
+        if (rr == 1) { screen_status("Too short"); break; }
+        if (rr < 0)  { screen_status("SD full"); break; }
+        int queued = (rr == 0);   /* rr == 2: WAV durable, capture NOT queued
+                                     (Important 2, same rule as the primary
+                                     capture path) */
         ESP_LOGI(TAG, "follow-up recorded %ld bytes (~%ld ms)", bytes, bytes / 32);
         s_sc = s_sc_next;   /* the follow-up is now the current capture */
 
@@ -1266,6 +1281,12 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
         capture_outcome_t out = capture_run(cx, &s_sc);
         invalidate_capture_caches();
         if (out == CAPTURE_REPLY_READY) continue;
+        if (!queued && out == CAPTURE_OFFLINE) {
+            /* "Saved, will upload later" would be false here -- nothing
+             * will retry an unqueued capture. Show the card problem. */
+            screen_status("SD full");
+            break;
+        }
         show_outcome(out);
         break;
     }
@@ -1293,13 +1314,20 @@ static void capture_session_run(int from_ui) {
     long bytes = 0;
     int rr = record_capture(&s_sc, NULL, !s_bg_wifi_started, &bytes);
     if (rr < 0) { screen_fatal("SD full"); return; }
-    if (rr > 0) { screen_status("Too short"); return; }
+    if (rr == 1) { screen_status("Too short"); return; }
+    /* rr == 2: the WAV is on the card but the capture never entered the
+     * retry queue (sidecar/index write failed). The in-session upload is
+     * still an honest last chance -- but every screen that promises a
+     * LATER upload must show the card problem instead (final review,
+     * Important 2). */
+    int queued = (rr == 0);
     ESP_LOGI(TAG, "recorded %ld bytes (~%ld ms of 16 kHz mono)", bytes, bytes / 32);
 
-    /* 3. network path. The recording is already durable on the card, so
-     * every failure from here lands on "Saved, will upload later" and the
-     * next sync retries it -- no retry loops in the session itself. */
+    /* 3. network path. When queued, the recording is durable AND queued,
+     * so every failure from here lands on "Saved, will upload later" and
+     * the next sync retries it -- no retry loops in the session itself. */
     if (!s_bg_wifi_started || idf_wifi_wait_connected(CAPTURE_WIFI_WAIT_MS) != 0) {
+        if (!queued) { screen_fatal("SD full"); return; }
         screen_status("Saved, will upload later");
         return;
     }
@@ -1318,6 +1346,14 @@ static void capture_session_run(int from_ui) {
     awake_cap_arm(AWAKE_CAP_NET_S);   /* upload retries + poll window */
     capture_outcome_t out = capture_run(&cx, &s_sc);
     invalidate_capture_caches();      /* capture_run moved the upload state */
+    if (!queued && out == CAPTURE_OFFLINE) {
+        /* capture_run's own "Saved, will upload later" paint is the lie in
+         * this corner (nothing will retry an unqueued capture): overwrite
+         * it with the card problem and end the session on that screen --
+         * the sync below could repaint the dashboard over it. */
+        screen_fatal("SD full");
+        return;
+    }
     if (out == CAPTURE_REPLY_READY)
         play_reply_and_follow_up(&cx);
     else
