@@ -340,9 +340,12 @@ static void render_dashboard(ui_flow_t *u, ui_fb_t *fb) {
         /* Zero items used to render a bare screen under the status bar
          * (C7 round 6, finding 3). Title stays; the centered hint makes
          * the emptiness read as deliberate. Centered in the rows region
-         * only -- the banner strip stays reserved on the dashboard. */
+         * only -- the banner strip is reserved ONLY while a banner is
+         * actually up (round 7 retired its permanent reservation; with
+         * no banner the hint gets the full rows region down to UI_H). */
         widget_empty_state(fb, "Nothing yet", "Hold REC to talk",
-                           UI_STATUS_H + UI_TITLE_H, UI_H - UI_BANNER_H);
+                           UI_STATUS_H + UI_TITLE_H,
+                           UI_H - (u->banner[0] ? UI_BANNER_H : 0));
     if (u->banner[0]) widget_banner(fb, u->banner);
 }
 

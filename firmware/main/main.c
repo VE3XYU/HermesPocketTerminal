@@ -1784,7 +1784,7 @@ void app_main(void) {
         s_bg_wifi_started = 0;   /* the radio is down: a linger-launched session
                                     must start (and wait on) its own join, not
                                     trust a flag from the stopped one */
-        s_wifi_ok = 0;           /* keep the status header's "W" honest */
+        s_wifi_ok = 0;           /* keep the status header's wifi glyph honest */
         audio_deinit();
         if (s_epd_up && !s_panel_lost) {
             epd_sleep();

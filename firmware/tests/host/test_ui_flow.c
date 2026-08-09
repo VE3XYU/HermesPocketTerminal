@@ -287,23 +287,55 @@ int main(void) {
     }
 
     /* ---- empty dashboard (round 6, finding 3): title retained, centered
-     * hint in the rows region, banner strip untouched -- an obviously
-     * deliberate screen, not a bare one ---- */
+     * hint in the rows region -- an obviously deliberate screen, not a
+     * bare one. Round 7 retired the banner strip's PERMANENT reservation:
+     * with no banner up, the hint now centers across the FULL rows
+     * region (UI_H - UI_STATUS_H - UI_TITLE_H = 150 px), not the old
+     * fixed 120 px window that always left the banner band untouched
+     * whether or not a banner was actually pending.
+     *
+     * Re-derived from widget_empty_state's math (band = ASC 18 +
+     * LINE_H 24 + DESC 5 = 47 px): base1 = y0 + (y1-y0-band)/2 + ASC
+     *   = 50 + (150-47)/2 + 18 = 119
+     * so line 1's baseline is 119 and line 2's is 143 (+UI_TEXT_LINE_H);
+     * with the descender band the ink spans y in [101,148] -- comfortably
+     * inside the old 120 px window and nowhere near y=170. The old
+     * "banner_ink == 0" assertion therefore still holds, but for a
+     * different reason than before the fix: not because the strip is
+     * reserved (it isn't, with no banner up), just because two short
+     * centered lines don't reach that far down even in the taller
+     * region. ---- */
     {
         u.dash.item_count = 0;
         str_copy(u.dash.title, sizeof u.dash.title, "Today");
         ui_flow_rest(&u);
         ui_flow_render(&u, &fb);
-        int title_ink = 0, hint_ink = 0, banner_ink = 0;
+        int title_ink = 0, hint_ink = 0, tail_ink = 0;
         for (int y = UI_STATUS_H; y < UI_STATUS_H + UI_TITLE_H; y++)
             for (int x = 0; x < UI_W; x++) title_ink += fb_get(&fb, x, y);
-        for (int y = UI_STATUS_H + UI_TITLE_H; y < UI_H - UI_BANNER_H; y++)
+        for (int y = UI_STATUS_H + UI_TITLE_H; y < UI_H; y++)
             for (int x = 0; x < UI_W; x++) hint_ink += fb_get(&fb, x, y);
         for (int y = UI_H - UI_BANNER_H; y < UI_H; y++)
-            for (int x = 0; x < UI_W; x++) banner_ink += fb_get(&fb, x, y);
+            for (int x = 0; x < UI_W; x++) tail_ink += fb_get(&fb, x, y);
         CHECK(title_ink > 0);        /* "Today" is still there */
-        CHECK(hint_ink > 0);         /* "Nothing yet" / "Hold REC to talk" */
-        CHECK_EQ_INT(banner_ink, 0); /* the banner strip stays reserved */
+        CHECK(hint_ink > 0);         /* "Nothing yet" / "Hold REC to talk", full region */
+        CHECK_EQ_INT(tail_ink, 0);   /* still empty -- not reserved, just unreached */
+
+        /* ---- same empty dashboard, but with a banner up: the fix keeps
+         * the OLD fixed 120 px window in this case (y1 is UI_H -
+         * UI_BANNER_H whenever u->banner[0] is set), so the hint is
+         * confined above the banner strip and the banner itself owns the
+         * bottom band, matching the pre-fix geometry exactly. ---- */
+        str_copy(u.banner, sizeof u.banner, "Sync complete");
+        ui_flow_render(&u, &fb);
+        int hint_ink2 = 0, banner_ink = 0;
+        for (int y = UI_STATUS_H + UI_TITLE_H; y < UI_H - UI_BANNER_H; y++)
+            for (int x = 0; x < UI_W; x++) hint_ink2 += fb_get(&fb, x, y);
+        for (int y = UI_H - UI_BANNER_H; y < UI_H; y++)
+            for (int x = 0; x < UI_W; x++) banner_ink += fb_get(&fb, x, y);
+        CHECK(hint_ink2 > 0);                        /* hint still shows, confined above the banner */
+        CHECK(banner_ink > UI_W * UI_BANNER_H / 2);  /* the banner's inverted strip, not the hint */
+        u.banner[0] = '\0';
     }
 
     /* ---- C7 round 7: the banner strip IS the list's last row band ----
