@@ -44,6 +44,17 @@ static int status_to_err(const htp_response_t *r) {
  * unless req->sink_file was set, in which case out_json is untouched. */
 static int perform(htp_client_t *c, htp_request_t *req, cJSON **out_json) {
     static char battery[12];   /* fits any int %d (incl. sign) + NUL; -Wformat-truncation on the IDF cross-compiler needs the full range provable, not just the 0-100 domain */
+    /* Slot guard (final review, minor 2): the two appends below wrote
+     * headers[header_count++] unchecked -- fine at today's worst case
+     * (upload's 4 + these 2 of 8), but one header added at a call site
+     * would be an out-of-bounds write. NOT HTP_ERR_CLIENT on overflow:
+     * capture_flow drains a capture as "upload_rejected" on that code,
+     * relying on htp_upload_capture having no local HTP_ERR_CLIENT path
+     * -- a local buffer fault must stay retryable, so HTP_ERR_PROTO. */
+    int slots = (int)(sizeof req->headers / sizeof req->headers[0]);
+    int need = 1 + (c->battery_pct >= 0 ? 1 : 0);
+    if (req->header_count < 0 || req->header_count + need > slots)
+        return HTP_ERR_PROTO;
     char auth[192];
     snprintf(auth, sizeof auth, "Bearer %s", c->token);
     req->headers[req->header_count++] = (htp_header_t){ "Authorization", auth };
