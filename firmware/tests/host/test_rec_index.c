@@ -47,6 +47,40 @@ int main(void) {
     CHECK_EQ_STR(ids_300[6], "id-293");
     CHECK_EQ_STR(ids_300[7], "id-292");  /* oldest in window */
 
+    /* ---- Paged listing (final review, Important 1): skip_newest steps
+     * past the newest entries so a 32-slot buffer can walk the whole
+     * retained window. ---- */
+    n = rec_index_list_page(&st, ids_300, 8, 0);      /* page 0 == plain list */
+    CHECK_EQ_INT(n, 8);
+    CHECK_EQ_STR(ids_300[0], "id-299");
+    CHECK_EQ_STR(ids_300[7], "id-292");
+    n = rec_index_list_page(&st, ids_300, 8, 8);      /* next page continues */
+    CHECK_EQ_INT(n, 8);
+    CHECK_EQ_STR(ids_300[0], "id-291");
+    CHECK_EQ_STR(ids_300[7], "id-284");
+    n = rec_index_list_page(&st, ids_300, 8, 296);    /* short final page */
+    CHECK_EQ_INT(n, 4);
+    CHECK_EQ_STR(ids_300[0], "id-3");
+    CHECK_EQ_STR(ids_300[3], "id-0");                 /* the oldest entry is reachable */
+    CHECK_EQ_INT(rec_index_list_page(&st, ids_300, 8, 300), 0);   /* past the end */
+    CHECK_EQ_INT(rec_index_list_page(&st, ids_300, 8, 1000), 0);
+    CHECK_EQ_INT(rec_index_list_page(&st, ids_300, 8, -1), 0);    /* rejected */
+
+    /* A full page walk (the retry scan's loop shape) visits every entry
+     * exactly once, newest first, and terminates on the short page. */
+    {
+        char page[32][64];
+        int seen = 0, pn = 0;
+        for (int skip = 0; ; skip += 32) {
+            pn = rec_index_list_page(&st, page, 32, skip);
+            if (pn <= 0) break;
+            if (seen == 0) CHECK_EQ_STR(page[0], "id-299");
+            seen += pn;
+            if (pn < 32) { CHECK_EQ_STR(page[pn - 1], "id-0"); break; }
+        }
+        CHECK_EQ_INT(seen, 300);
+    }
+
     /* ---- Task 19 compaction: crossing the 8 KB threshold must keep the
      * NEWEST-first listing correct. 60-char ids make each line 61 bytes,
      * so 400 appends are ~24 KB raw -- far past the 16 KB read cap that,
@@ -71,6 +105,38 @@ int main(void) {
             CHECK(raw != NULL);
             CHECK(strlen(raw) < 16384);
         }
+        /* ...and the page walk still covers the WHOLE post-compaction
+         * window: at least the newest 128 survive, contiguous down to the
+         * oldest retained id (final review, Important 1). */
+        {
+            char page[32][64];
+            int seen = 0, pn = 0;
+            char last[64] = "";
+            for (int skip = 0; ; skip += 32) {
+                pn = rec_index_list_page(&st, page, 32, skip);
+                if (pn <= 0) break;
+                seen += pn;
+                snprintf(last, sizeof last, "%s", page[pn - 1]);
+                if (pn < 32) break;
+            }
+            CHECK(seen >= 128);
+            char expect_oldest[64];
+            snprintf(expect_oldest, sizeof expect_oldest,
+                     "c-%04d-padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpa",
+                     400 - seen);
+            CHECK_EQ_STR(last, expect_oldest);
+        }
+    }
+
+    /* ---- append-failure propagation (final review, Important 2 relies on
+     * it): record_capture() in main.c now checks this return to avoid
+     * promising "will upload later" for a capture that never entered the
+     * queue. ---- */
+    {
+        fstore_init(&fs, &st);
+        fs.fail_writes = 1;
+        CHECK_EQ_INT(rec_index_append(&st, "c-unqueued") == 0, 0);   /* must report failure */
+        fs.fail_writes = 0;
     }
 
     /* ---- compaction-failure fallback: when the atomic rewrite cannot

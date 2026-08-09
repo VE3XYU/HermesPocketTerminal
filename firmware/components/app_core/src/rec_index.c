@@ -14,12 +14,14 @@
  * real id that is roughly 780 recordings. Once an append sees the file
  * above REC_INDEX_COMPACT_AT, it atomically rewrites it down to the
  * newest REC_INDEX_KEEP complete lines first. 8 KB / 128 keeps the file
- * permanently under the read cap with wide margin, and 128 retained ids
- * is 4x the 32 that any consumer actually reads (rec_index_list caps max
- * at 32; retry/backfill scan the newest 32). Trade-off, documented in
- * firmware/README.md: ids older than the retained window are forgotten
- * for listing and retry -- the WAV/sidecar files themselves stay on the
- * card. Compacting a legacy index whose unread tail already exceeds the
+ * permanently under the read cap with wide margin. Consumers: the
+ * Recordings menu and the sync backfill read the newest 32; the
+ * upload-retry scan and the pending count page through the WHOLE retained
+ * window via rec_index_list_page (final review, Important 1 -- newest-32
+ * scans silently stranded capture #33+ of an offline backlog). Trade-off,
+ * documented in firmware/README.md: ids older than the retained window
+ * are forgotten for listing and retry -- the WAV/sidecar files themselves
+ * stay on the card. Compacting a legacy index whose unread tail already exceeds the
  * old 16 KB read cap is a one-way door: that tail was already unreachable
  * to every reader either way, but compaction deletes it outright, so a
  * future firmware build that raised REC_INDEX_CAP could no longer recover
@@ -97,6 +99,10 @@ int rec_index_append(port_storage_t *st, const char *capture_id) {
 }
 
 int rec_index_list(port_storage_t *st, char ids[][64], int max) {
+    return rec_index_list_page(st, ids, max, 0);
+}
+
+int rec_index_list_page(port_storage_t *st, char ids[][64], int max, int skip_newest) {
     char *const buf = s_index_buf;
     size_t len = 0;
 
@@ -109,60 +115,42 @@ int rec_index_list(port_storage_t *st, char ids[][64], int max) {
     if (len > REC_INDEX_CAP - 1) len = REC_INDEX_CAP - 1;
     buf[len] = 0;
 
-    if (max <= 0 || max > 32) return 0;
+    if (max <= 0 || max > 32 || skip_newest < 0) return 0;
 
-    size_t offsets[32];
-    memset(offsets, 0, sizeof(offsets));
-    int offset_count = 0;
-
-    /* Scan through buffer collecting line offsets (last max only) */
+    /* Pass 1: count the non-empty lines (a trailing line without '\n'
+     * counts, matching the pre-paging scan). */
+    int total = 0;
     for (size_t i = 0; i < len; ) {
         size_t line_start = i;
-
-        /* Find next newline */
         while (i < len && buf[i] != '\n') i++;
+        if (i > line_start) total++;
+        if (i < len) i++;   /* skip '\n' */
+    }
 
-        /* Process this line */
+    /* The requested page, in file order (0 = oldest line): newest-first
+     * indices [skip_newest, skip_newest + max) map to file indices
+     * [total-1-skip_newest-(max-1), total-1-skip_newest]. */
+    int hi = total - 1 - skip_newest;
+    if (hi < 0) return 0;   /* page starts past the oldest retained entry */
+    int lo = hi - (max - 1);
+    if (lo < 0) lo = 0;
+
+    /* Pass 2: copy lines lo..hi into ids, newest first. */
+    int line_no = 0;
+    for (size_t i = 0; i < len && line_no <= hi; ) {
+        size_t line_start = i;
+        while (i < len && buf[i] != '\n') i++;
         if (i > line_start) {
-            /* Non-empty line */
-            if (offset_count < max) {
-                offsets[offset_count] = line_start;
-                offset_count++;
-            } else {
-                /* Shift and add */
-                for (int j = 0; j < max - 1; j++) {
-                    offsets[j] = offsets[j + 1];
-                }
-                offsets[max - 1] = line_start;
+            if (line_no >= lo) {
+                size_t line_len = i - line_start;
+                if (line_len > 63) line_len = 63;
+                memcpy(ids[hi - line_no], buf + line_start, line_len);
+                ids[hi - line_no][line_len] = 0;
             }
+            line_no++;
         }
-
-        /* Move past newline */
-        if (i < len) i++;  /* skip '\n' */
+        if (i < len) i++;   /* skip '\n' */
     }
 
-    /* Output in reverse (newest first) */
-    int out_count = 0;
-    for (int i = offset_count - 1; i >= 0 && out_count < max; i--) {
-        size_t off = offsets[i];
-        if (off >= len) break;
-
-        /* Find end of line */
-        size_t end = off;
-        while (end < len && buf[end] != '\n') end++;
-
-        /* Extract line */
-        size_t line_len = end - off;
-        if (line_len > 63) line_len = 63;
-
-        if (line_len > 0) {
-            for (size_t k = 0; k < line_len; k++) {
-                ids[out_count][k] = buf[off + k];
-            }
-            ids[out_count][line_len] = 0;
-            out_count++;
-        }
-    }
-
-    return out_count;
+    return hi - lo + 1;
 }

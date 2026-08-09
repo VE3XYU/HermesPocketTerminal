@@ -145,9 +145,13 @@ state files.
 **Recordings-index compaction:** the index is append-only and its reader sees only the
 first 16 KB, so once the file exceeds 8 KB an append first compacts it down to the
 newest 128 entries (atomic rewrite; on any failure it falls back to a plain append —
-the index is never destroyed). Trade-off: ids older than the retained 128 are forgotten
-for listing and upload-retry; the WAV and sidecar files themselves stay on the card
-indefinitely. This is implemented and host-tested (`test_rec_index`: a 400-append run
+the index is never destroyed). The upload-retry scan and the pending-uploads count
+cover **everything the index retains** (they page through it 32 ids at a time), so any
+capture the index still lists will eventually upload — a backlog larger than one
+sync's 32-upload budget drains across successive wakes, newest first. Trade-off: ids
+older than what the index retains (at least the newest 128, guaranteed by compaction)
+are forgotten for listing and upload-retry; the WAV and sidecar files themselves stay
+on the card indefinitely. This is implemented and host-tested (`test_rec_index`: a 400-append run
 that crosses the compaction threshold keeps newest-first listing exact and the on-disk
 file under the cap; a 200-append run under a forced write-failure fake proves the
 never-destroyed fallback) — it postdates checkpoint C7, so on-device confirmation

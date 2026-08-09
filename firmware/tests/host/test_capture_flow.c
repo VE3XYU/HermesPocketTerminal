@@ -248,6 +248,51 @@ static void test_client_error_on_retry_drains_pending_queue(void) {
     CHECK_EQ_INT(ft.req_count, 1);                   /* no new request made */
 }
 
+/* Final review, Important 1: a backlog LARGER than one 32-id page must
+ * (a) be reported truthfully by the pending count and (b) upload in full
+ * across successive syncs -- before the fix both scanned only the newest
+ * 32 index entries by recency, so capture #33+ of an offline weekend
+ * stayed not_uploaded forever while the header showed 0 pending. The
+ * per-wake upload budget (32 attempts) still bounds one sync's work: the
+ * first call drains the newest 32, the next call reaches past them. */
+static void test_backlog_beyond_32_uploads_everything(void) {
+    fresh("c-seed");                 /* seed sidecar is NOT in the index */
+    char id[64], body[128];
+    for (int i = 1; i <= 40; i++) {
+        sidecar_t p;
+        snprintf(id, sizeof id, "c-%02d", i);
+        sidecar_init(&p, id);        /* not_uploaded */
+        sidecar_save(&st, &p);
+        rec_index_append(&st, id);
+    }
+
+    /* the status header must see the WHOLE backlog, not the newest 32 */
+    CHECK_EQ_INT(capture_pending_count(&st), 40);
+
+    /* sync 1: newest-first, budget-bounded at 32 upload attempts */
+    for (int i = 40; i >= 9; i--) {
+        snprintf(body, sizeof body, "{\"id\":\"c-%02d\",\"state\":\"received\"}", i);
+        ft_push(&ft, 0, 200, body);
+    }
+    CHECK_EQ_INT(capture_retry_pending(&cx), 32);
+    CHECK_EQ_INT(ft.req_count, 32);              /* the per-wake budget held */
+    CHECK_EQ_INT(capture_pending_count(&st), 8); /* count keeps telling the truth */
+
+    /* sync 2: the pages now reach past the (uploaded) newest 32 */
+    for (int i = 8; i >= 1; i--) {
+        snprintf(body, sizeof body, "{\"id\":\"c-%02d\",\"state\":\"received\"}", i);
+        ft_push(&ft, 0, 200, body);
+    }
+    CHECK_EQ_INT(capture_retry_pending(&cx), 8);
+    CHECK_EQ_INT(ft.req_count, 40);
+    CHECK_EQ_INT(capture_pending_count(&st), 0);
+
+    sidecar_t back;
+    sidecar_load(&st, "c-01", &back);            /* the OLDEST capture made it */
+    CHECK_EQ_STR(back.state, "uploaded");
+    CHECK(back.uploaded_at > 0);
+}
+
 static void test_retry_pending(void) {
     fresh("c-one");                               /* c-one: not_uploaded */
     sidecar_t two; sidecar_init(&two, "c-two");   /* c-two: already uploaded */
@@ -281,6 +326,7 @@ int main(void) {
     test_client_error_drains_pending_queue();
     test_auth_error_leaves_capture_pending();
     test_client_error_on_retry_drains_pending_queue();
+    test_backlog_beyond_32_uploads_everything();
     test_retry_pending();
     return HARNESS_REPORT();
 }

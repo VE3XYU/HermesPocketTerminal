@@ -146,48 +146,74 @@ capture_outcome_t capture_run(capture_ctx_t *cx, sidecar_t *sc) {
 static char s_retry_ids[32][64];
 static sidecar_t s_retry_sc;
 
+/* Final review, Important 1: the retry scan and the pending count used to
+ * read only the newest 32 index entries -- but the window is by RECENCY,
+ * not by pending state, so capture #33+ of an offline backlog stayed
+ * not_uploaded forever while the status header reported 0 pending. Both
+ * now page through the whole retained index (rec_index_list_page walks
+ * skip = 0, 32, 64... until a short page), reusing the same 32-slot batch
+ * statics -- no new memory. The scan is unbounded; the upload WORK per
+ * wake is not: RETRY_UPLOAD_BUDGET caps upload attempts (each can cost a
+ * full transport timeout) at the old implicit bound, so a huge backlog
+ * drains across wakes instead of wedging one against the awake watchdog.
+ * Successful uploads leave the pending set, so the next wake's pages reach
+ * the next-newest 32 pending -- every retained capture uploads eventually. */
+#define RETRY_PAGE          32   /* ids per page = the batch statics' size */
+#define RETRY_UPLOAD_BUDGET 32   /* upload attempts per call (per wake) */
+
 int capture_retry_pending(capture_ctx_t *cx) {
-    int n = rec_index_list(cx->storage, s_retry_ids, 32);
-    int confirmed = 0;
-    for (int i = 0; i < n; i++) {
-        sidecar_t *sc = &s_retry_sc;
-        if (sidecar_load(cx->storage, s_retry_ids[i], sc) != 0) continue;
-        if (strcmp(sc->state, "not_uploaded") != 0) continue;
-        if (wav_refused(cx, sc)) continue;   /* torn header: now failed on
-                                                the card, out of the queue */
-        int err = upload_once(cx, sc);
-        if (err == HTP_OK) {
-            str_copy(sc->state, sizeof sc->state, "uploaded");
-            sc->uploaded_at = cx->clock->epoch_s(cx->clock->ctx);
-            sidecar_save(cx->storage, sc);
-            confirmed++;
-        } else if (err == HTP_ERR_CLIENT) {
-            /* Same guarantee as capture_run's HTP_ERR_CLIENT branch (see
-             * the trace there): upload_once -> htp_upload_capture can only
-             * return HTP_ERR_CLIENT from a real server 4xx, never a local
-             * fault, so retrying gets the same rejection forever. Reached
-             * when a capture went not_uploaded via a genuine offline/server
-             * failure and is THEN rejected on a later retry (capture_run's
-             * own upload already drains this on the first attempt; this is
-             * the same poison-pill class on the second-chance path). Drain
-             * it the same way instead of re-streaming the WAV every sync. */
-            str_copy(sc->state, sizeof sc->state, "failed");
-            str_copy(sc->error, sizeof sc->error, "upload_rejected");
-            sidecar_save(cx->storage, sc);
+    int confirmed = 0, attempts = 0;
+    for (int skip = 0; ; skip += RETRY_PAGE) {
+        int n = rec_index_list_page(cx->storage, s_retry_ids, RETRY_PAGE, skip);
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) {
+            sidecar_t *sc = &s_retry_sc;
+            if (sidecar_load(cx->storage, s_retry_ids[i], sc) != 0) continue;
+            if (strcmp(sc->state, "not_uploaded") != 0) continue;
+            if (wav_refused(cx, sc)) continue;   /* torn header: now failed on
+                                                    the card, out of the queue */
+            if (attempts >= RETRY_UPLOAD_BUDGET) return confirmed;
+            attempts++;
+            int err = upload_once(cx, sc);
+            if (err == HTP_OK) {
+                str_copy(sc->state, sizeof sc->state, "uploaded");
+                sc->uploaded_at = cx->clock->epoch_s(cx->clock->ctx);
+                sidecar_save(cx->storage, sc);
+                confirmed++;
+            } else if (err == HTP_ERR_CLIENT) {
+                /* Same guarantee as capture_run's HTP_ERR_CLIENT branch (see
+                 * the trace there): upload_once -> htp_upload_capture can only
+                 * return HTP_ERR_CLIENT from a real server 4xx, never a local
+                 * fault, so retrying gets the same rejection forever. Reached
+                 * when a capture went not_uploaded via a genuine offline/server
+                 * failure and is THEN rejected on a later retry (capture_run's
+                 * own upload already drains this on the first attempt; this is
+                 * the same poison-pill class on the second-chance path). Drain
+                 * it the same way instead of re-streaming the WAV every sync. */
+                str_copy(sc->state, sizeof sc->state, "failed");
+                str_copy(sc->error, sizeof sc->error, "upload_rejected");
+                sidecar_save(cx->storage, sc);
+            }
+            /* HTP_ERR_AUTH / SERVER / NETWORK / PROTO: sc is left untouched,
+             * so it stays not_uploaded and is retried on the next sync --
+             * unchanged from before this fix. */
         }
-        /* HTP_ERR_AUTH / SERVER / NETWORK / PROTO: sc is left untouched,
-         * so it stays not_uploaded and is retried on the next sync --
-         * unchanged from before this fix. */
+        if (n < RETRY_PAGE) break;   /* short page = the index is exhausted */
     }
     return confirmed;
 }
 
 int capture_pending_count(port_storage_t *st) {
-    int n = rec_index_list(st, s_retry_ids, 32);   /* shares the batch statics */
     int pending = 0;
-    for (int i = 0; i < n; i++) {
-        if (sidecar_load(st, s_retry_ids[i], &s_retry_sc) != 0) continue;
-        if (strcmp(s_retry_sc.state, "not_uploaded") == 0) pending++;
+    for (int skip = 0; ; skip += RETRY_PAGE) {
+        /* shares the batch statics */
+        int n = rec_index_list_page(st, s_retry_ids, RETRY_PAGE, skip);
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) {
+            if (sidecar_load(st, s_retry_ids[i], &s_retry_sc) != 0) continue;
+            if (strcmp(s_retry_sc.state, "not_uploaded") == 0) pending++;
+        }
+        if (n < RETRY_PAGE) break;
     }
     return pending;
 }
