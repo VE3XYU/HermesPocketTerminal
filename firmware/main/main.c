@@ -645,9 +645,9 @@ static void draw_wrapped(const char *msg, int x, int base0, int max_lines) {
 #define OUTCOME_HERO_TOP     26
 #define OUTCOME_BODY_ADVANCE 31   /* the reference hero line advance */
 #define OUTCOME_BODY_LINES   5
-#define GLYPH_DOT_X          92
-#define GLYPH_DOT_Y          72
 #define GLYPH_DOT_SIZE       16
+#define GLYPH_DOT_X          ((UI_W - GLYPH_DOT_SIZE) / 2)   /* centered */
+#define GLYPH_DOT_Y          72
 #define GLYPH_TEXT_TOP       104
 
 _Static_assert(STATUS_TEXT_TOP >= UI_STATUS_H,
