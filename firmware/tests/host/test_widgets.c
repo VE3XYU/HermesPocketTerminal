@@ -79,10 +79,35 @@ int main(void) {
     int row2 = region_ink(0, rows_y + 2 * UI_ROW_H, UI_W, UI_ROW_H);
     CHECK(row0 > 0);
     CHECK(row1 > row0 * 3);          /* inversion floods the cursor row with ink */
-    /* a row's ink stays inside its band: the rows above/below the ones
-     * with text stay empty (baseline + ascent/descent contained) */
+    /* a row's ink stays inside its band: the bands below the ones with
+     * text stay empty (baseline + ascent/descent contained) */
     CHECK_EQ_INT(region_ink(0, rows_y + 3 * UI_ROW_H, UI_W,
-                            UI_H - UI_BANNER_H - (rows_y + 3 * UI_ROW_H)), 0);
+                            UI_H - (rows_y + 3 * UI_ROW_H)), 0);
+
+    /* C7 round 7, finding 3 -- breathing room. The clear bands are
+     * derived, not guessed: nothing may be drawn in the top
+     * (UI_ROW_BASE - ascent) or bottom (UI_ROW_H - UI_ROW_BASE - descent)
+     * rows of a band, and both must leave >= 3 px clear of the CAP and of
+     * the baseline. The same bands hold on the INVERTED cursor row --
+     * where they read as solid black -- so the column never shifts. */
+    {
+        int top_clear = UI_ROW_BASE - UI_FONT_BODY_ASC;
+        int bot_clear = UI_ROW_H - UI_ROW_BASE - UI_FONT_BODY_DESC;
+        CHECK(UI_ROW_BASE - UI_FONT_BODY_CAP >= 3);     /* above the cap */
+        CHECK(UI_ROW_H - UI_ROW_BASE >= 3);             /* below the baseline */
+        CHECK(top_clear >= 1 && bot_clear >= 1);
+        CHECK_EQ_INT(region_ink(0, rows_y, UI_W, top_clear), 0);
+        CHECK_EQ_INT(region_ink(0, rows_y + UI_ROW_H - bot_clear, UI_W, bot_clear), 0);
+        int inv_y = rows_y + UI_ROW_H;                  /* the cursor row */
+        CHECK_EQ_INT(region_ink(0, inv_y, UI_W, top_clear), UI_W * top_clear);
+        CHECK_EQ_INT(region_ink(0, inv_y + UI_ROW_H - bot_clear, UI_W, bot_clear),
+                     UI_W * bot_clear);
+        /* left inset: the first UI_ROW_PAD_X columns carry no glyph ink on
+         * a normal row and are solid black on the inverted one */
+        CHECK_EQ_INT(region_ink(0, rows_y, UI_ROW_PAD_X, UI_ROW_H), 0);
+        CHECK_EQ_INT(region_ink(0, inv_y, UI_ROW_PAD_X, UI_ROW_H),
+                     UI_ROW_PAD_X * UI_ROW_H);
+    }
 
     /* done rows get a strike-through (more ink than the same row plain) */
     l.rows[2].done = 1;
@@ -99,13 +124,12 @@ int main(void) {
            "an item text that is much wider than one hundred ninety six pixels");
     widget_list(&fb, &wide);
     CHECK(region_ink(0, rows_y, UI_W, UI_ROW_H) > 0);
-    CHECK_EQ_INT(region_ink(UI_MARGIN_X + UI_TEXT_W, rows_y,
-                            UI_W - UI_MARGIN_X - UI_TEXT_W, UI_ROW_H), 0);
+    CHECK_EQ_INT(region_ink(UI_W - UI_ROW_PAD_X, rows_y, UI_ROW_PAD_X, UI_ROW_H), 0);
 
     /* scrolling: cursor 15 of 20 keeps the cursor row visible, and the
-     * one-line grid (title + UI_LIST_ROWS at UI_ROW_H) exactly fills the
-     * space above the banner -- the strip below stays untouched, cursor
-     * inversion included */
+     * one-line grid (title + UI_LIST_ROWS at UI_ROW_H) fills the height
+     * below the title -- the LAST band is a real row when no banner is up
+     * (C7 round 7: the banner strip is that band, not a reservation) */
     ui_list_t big = { .row_count = 20, .cursor = 15 };
     strcpy(big.title, "T");
     for (int i = 0; i < 20; i++)
@@ -113,7 +137,17 @@ int main(void) {
     fb_clear(&fb);
     widget_list(&fb, &big);
     CHECK(fb_count_black(&fb) > 0);   /* rendered without crash; window math in unit below */
+    CHECK(region_ink(0, UI_H - UI_ROW_H, UI_W, UI_ROW_H) > 0);   /* 5th row drew */
+    /* ...and with a banner up the list gives that band back: one fewer
+     * visible row, nothing painted over */
+    big.reserve_banner = 1;
+    fb_clear(&fb);
+    widget_list(&fb, &big);
     CHECK_EQ_INT(region_ink(0, UI_H - UI_BANNER_H, UI_W, UI_BANNER_H), 0);
+    /* the cursor row stays visible: the window scrolled so it is the last
+     * drawn band, inverted */
+    CHECK(region_ink(0, UI_H - 2 * UI_ROW_H, UI_W, UI_ROW_H) > UI_W * UI_ROW_H / 2);
+    big.reserve_banner = 0;
 
     /* two-line rows (Recordings previews): a text wider than one line
      * spills onto the row's second body line at the text pitch;
@@ -155,7 +189,7 @@ int main(void) {
         ui_list_t wbl = { .row_count = 1, .cursor = -1, .two_line = 1 };
         strcpy(wbl.title, "Recordings");
         strcpy(wbl.rows[0].text, txt);
-        int br = fb_wrap_break_prop(txt, UI_FONT_BODY, UI_TEXT_W);
+        int br = fb_wrap_break_prop(txt, UI_FONT_BODY, UI_ROW_TEXT_W);
         CHECK(br < (int)strlen(txt));            /* it does wrap */
         CHECK_EQ_INT(txt[br], ' ');              /* and on a boundary */
         char l1[64];
@@ -165,10 +199,10 @@ int main(void) {
         fb_clear(&fb);
         widget_list(&fb, &wbl);
         int b1_y = r0_y + UI_ROW2_BASE1 - UI_FONT_BODY_ASC;
-        CHECK(region_ink(UI_MARGIN_X, b1_y, w1, bh) > 0);
+        CHECK(region_ink(UI_ROW_PAD_X, b1_y, w1, bh) > 0);
         /* the old hard split painted "ne" past the last space -- banned */
-        CHECK_EQ_INT(region_ink(UI_MARGIN_X + w1, b1_y,
-                                UI_W - UI_MARGIN_X - w1, bh), 0);
+        CHECK_EQ_INT(region_ink(UI_ROW_PAD_X + w1, b1_y,
+                                UI_W - UI_ROW_PAD_X - w1, bh), 0);
         CHECK(region_ink(0, r0_y + UI_ROW2_BASE2 - UI_FONT_BODY_ASC,
                          UI_W, bh) > 0);         /* rest continued on line 2 */
 

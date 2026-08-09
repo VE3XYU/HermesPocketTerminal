@@ -13,12 +13,15 @@
  */
 
 /* The vertical budget must partition the panel exactly (see ui_widgets.h):
- * the one-line grid reserves the banner strip (banners are only drawn over
- * the dashboard); the two-line grid owns the full height below the title
- * (Recordings never shows a banner -- a reserved strip would cost a
- * preview row). */
-_Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST_ROWS * UI_ROW_H + UI_BANNER_H == UI_H,
-               "status + title + rows + banner must partition the 200 px height");
+ * the one-line grid fills the height below the title, and the banner strip
+ * IS its last row band (a banner costs one visible row while it is up --
+ * ui_list_t.reserve_banner -- and is only ever drawn over the dashboard);
+ * the two-line grid owns the full height below the title (Recordings never
+ * shows a banner -- a reserved strip would cost a preview row). */
+_Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST_ROWS * UI_ROW_H == UI_H,
+               "status + title + rows must partition the 200 px height");
+_Static_assert(UI_BANNER_H == UI_ROW_H,
+               "the banner strip is exactly the last one-line row band");
 _Static_assert(UI_STATUS_H + UI_TITLE_H + UI_LIST2_ROWS * UI_ROW2_H == UI_H,
                "the two-line row grid must partition the full 200 px height");
 /* Every baseline keeps its font's full ascent/descent band inside its
@@ -39,6 +42,25 @@ _Static_assert(UI_ROW2_BASE1 >= UI_FONT_BODY_ASC &&
 _Static_assert(UI_BANNER_BASE >= UI_FONT_BODY_ASC &&
                UI_BANNER_BASE + UI_FONT_BODY_DESC <= UI_BANNER_H,
                "banner ink stays inside the banner strip");
+
+/* C7 round 7, finding 3 -- the cramped-highlight rule, on every band that
+ * can carry an inverted bar or sit under one: at least UI_ROW_CLEAR px of
+ * clear space above the cap top and below the baseline. Containment
+ * (above) is about ink not escaping the band; this is about the band not
+ * hugging the ink. */
+#define UI_ROW_CLEAR 3
+_Static_assert(UI_ROW_BASE - UI_FONT_BODY_CAP >= UI_ROW_CLEAR &&
+               UI_ROW_H - UI_ROW_BASE >= UI_ROW_CLEAR,
+               "a one-line row must breathe above the cap and below the baseline");
+_Static_assert(UI_ROW2_BASE1 - UI_FONT_BODY_CAP >= UI_ROW_CLEAR &&
+               UI_ROW2_H - UI_ROW2_BASE2 >= UI_ROW_CLEAR,
+               "a two-line row must breathe above line 1 and below line 2");
+_Static_assert(UI_BANNER_BASE - UI_FONT_BODY_CAP >= UI_ROW_CLEAR &&
+               UI_BANNER_H - UI_BANNER_BASE >= UI_ROW_CLEAR,
+               "the banner strip must breathe like a row");
+/* Rows and the banner under them share one text column. */
+_Static_assert(UI_ROW_PAD_X == UI_BANNER_PAD,
+               "list rows and the banner must start at the same x");
 /* Text pages fill the height below the status strip (no banner is ever
  * drawn over an entry). */
 _Static_assert(UI_TEXT_FIRST_BASE - UI_FONT_BODY_ASC >= UI_STATUS_H &&
@@ -110,14 +132,19 @@ static void row_line(ui_fb_t *f, int x, int baseline, const char *text,
 }
 
 void widget_list(ui_fb_t *f, const ui_list_t *l) {
+    /* The title shares the rows' left inset so the whole list reads as one
+     * column (C7 round 7, finding 3). */
     char title[sizeof l->title];
-    fb_ellipsize_prop(title, sizeof title, l->title, UI_FONT_EMPH, UI_TEXT_W);
-    fb_text_prop(f, UI_MARGIN_X, UI_STATUS_H + UI_TITLE_BASE, title,
+    fb_ellipsize_prop(title, sizeof title, l->title, UI_FONT_EMPH, UI_ROW_TEXT_W);
+    fb_text_prop(f, UI_ROW_PAD_X, UI_STATUS_H + UI_TITLE_BASE, title,
                  UI_FONT_EMPH, 1);
 
-    /* One-line rows (dashboard) or two-line rows (recordings previews):
-     * same scroll-window arithmetic, parametrized by the row grid. */
-    int rows_max = l->two_line ? UI_LIST2_ROWS : UI_LIST_ROWS;
+    /* One-line rows (dashboard, menu) or two-line rows (recordings
+     * previews): same scroll-window arithmetic, parametrized by the row
+     * grid. On the one-line grid a banner takes the last row band, so the
+     * window is one row shorter while one is up. */
+    int rows_max = l->two_line ? UI_LIST2_ROWS
+                              : UI_LIST_ROWS - (l->reserve_banner ? 1 : 0);
     int row_h    = l->two_line ? UI_ROW2_H    : UI_ROW_H;
 
     int max_start = l->row_count - rows_max;
@@ -136,8 +163,8 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
 
         /* A dim row leads with a measured ". " marker; the text budget
          * shrinks by its width. */
-        int x = UI_MARGIN_X;
-        int max_w = UI_TEXT_W;
+        int x = UI_ROW_PAD_X;
+        int max_w = UI_ROW_TEXT_W;
         int base1 = y + (l->two_line ? UI_ROW2_BASE1 : UI_ROW_BASE);
         if (row->dim) {
             fb_text_prop(f, x, base1, ". ", UI_FONT_BODY, 1);

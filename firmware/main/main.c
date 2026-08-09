@@ -1045,38 +1045,29 @@ static int render_notifications_cb(void *ui_ctx, const htp_notifications_t *n) {
         if (n->items[i].urgent) { pick = i; break; }
     str_copy(s_uif.banner, sizeof s_uif.banner, n->items[pick].text);
 
-    if (s_base_drawn) {
-        /* The framebuffer already holds this session's screen: stamp the
-         * banner strip over it instead of clearing -- same pixels a full
-         * ui_flow_render would put there -- widget_banner is the last thing
-         * render_dashboard() draws -- minus the wipe. C7 round 6 fix round:
-         * that y 170-199 strip is only RESERVED blank space by design on
-         * SCR_DASHBOARD (both resting, cursor < 0, and opened, cursor >= 0
-         * -- ui_flow.h: SCR_DASHBOARD doubles as both). Since round 6's
-         * layout, the same rows are real content on Recordings (row 3's
-         * second preview line) and on an entry page (line 7); stamping
-         * there mid-session would erase a line of text until the next
-         * repaint. Skip the draw off-dashboard -- the banner text stays in
-         * the model (already copied above) and ui_flow_render() paints it
-         * (screen-aware, via render_dashboard()) whenever the operator next
-         * lands on the dashboard. This does not touch sync.c's ack gate
-         * (keyed on s_notifs.count > 0 and this callback returning 0, not
-         * on whether anything was painted) or the urgent chime (fired by
-         * sync.c before this callback even runs). */
-        if (s_uif.screen != SCR_DASHBOARD) {
-            ESP_LOGI(TAG, "notification banner deferred: screen=%d owns that strip",
-                     (int)s_uif.screen);
-            return 0;
-        }
-        widget_banner(&s_fb, s_uif.banner);
-    } else {
-        /* First draw of the session: the framebuffer is blank and the panel's
-         * previous-image RAM was lost to epd_init(), so there is nothing to
-         * stamp onto and the full flow render is the only complete screen we
-         * can produce. */
-        status_line_fill(&s_uif.status);
-        ui_flow_render(&s_uif, &s_fb);
+    /* The banner strip is only ever drawn over the DASHBOARD (C7 round 5
+     * scoped its dismissal there; round 6 found that painting it elsewhere
+     * erases real content -- since round 6's layout those rows are a
+     * preview line on Recordings and line 7 of an entry page). Off the
+     * dashboard the banner text just stays in the model (copied above) and
+     * ui_flow_render() paints it, screen-aware, whenever the operator next
+     * lands on the dashboard. This does not touch sync.c's ack gate (keyed
+     * on count > 0 and this callback returning 0, not on whether anything
+     * was painted) or the urgent chime (fired by sync.c before this
+     * callback even runs). */
+    if (s_base_drawn && s_uif.screen != SCR_DASHBOARD) {
+        ESP_LOGI(TAG, "notification banner deferred: screen=%d owns that strip",
+                 (int)s_uif.screen);
+        return 0;
     }
+    /* Re-render rather than stamp (C7 round 7): the strip is now the list's
+     * last ROW band, so the dashboard has to reflow to UI_LIST_ROWS - 1
+     * rows to make room -- stamping would paint over a real row. Rendering
+     * the whole screen costs framebuffer writes only (microseconds against
+     * the 300-500 ms panel refresh below) and is the same path the
+     * first-draw case already took. */
+    status_line_fill(&s_uif.status);
+    ui_flow_render(&s_uif, &s_fb);
     present(ui_flow_wants_full(&s_uif, UIF_REDRAW_PARTIAL));
     return 0;
 }

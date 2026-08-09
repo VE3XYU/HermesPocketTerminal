@@ -327,6 +327,10 @@ static void render_dashboard(ui_flow_t *u, ui_fb_t *fb) {
     str_copy(l->title, sizeof l->title, u->dash.title);
     l->cursor = u->cursor;        /* < 0 while resting: no row inverts */
     l->row_count = u->dash.item_count;
+    /* C7 round 7: the banner strip IS the last row band, so a pending
+     * banner costs the list its last visible row rather than painting over
+     * it. Dashboard-only, because the banner is drawn nowhere else. */
+    l->reserve_banner = (u->banner[0] != '\0');
     for (int i = 0; i < u->dash.item_count && i < 32; i++) {
         str_copy(l->rows[i].text, sizeof l->rows[i].text, u->dash.items[i].text);
         l->rows[i].done = u->dash.items[i].done;

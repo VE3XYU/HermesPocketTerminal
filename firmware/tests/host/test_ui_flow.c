@@ -306,6 +306,45 @@ int main(void) {
         CHECK_EQ_INT(banner_ink, 0); /* the banner strip stays reserved */
     }
 
+    /* ---- C7 round 7: the banner strip IS the list's last row band ----
+     * With no banner the dashboard uses all UI_LIST_ROWS bands; with one
+     * up it renders UI_LIST_ROWS - 1 rows and the banner takes the band
+     * the dropped row vacated. Nothing is ever painted over. */
+    {
+        ui_flow_init(&u, &cl, &st, &kv);
+        u.dash.item_count = UI_LIST_ROWS + 1;   /* more items than bands */
+        str_copy(u.dash.title, sizeof u.dash.title, "Today");
+        for (int i = 0; i < u.dash.item_count; i++)
+            snprintf(u.dash.items[i].text, 64, "item number %d", i);
+        u.cursor = 0;
+
+        int last_y = UI_H - UI_ROW_H;
+        ui_flow_render(&u, &fb);
+        int rows_only = 0;
+        for (int y = last_y; y < UI_H; y++)
+            for (int x = 0; x < UI_W; x++) rows_only += fb_get(&fb, x, y);
+        CHECK(rows_only > 0);                   /* the 5th row drew there */
+        CHECK(rows_only < UI_W * UI_ROW_H / 2); /* as text, not an inverted strip */
+
+        str_copy(u.banner, sizeof u.banner, "Meeting with Alex at 10:00");
+        ui_flow_render(&u, &fb);
+        int with_banner = 0;
+        for (int y = last_y; y < UI_H; y++)
+            for (int x = 0; x < UI_W; x++) with_banner += fb_get(&fb, x, y);
+        CHECK(with_banner > UI_W * UI_ROW_H / 2);   /* now the inverted banner */
+        CHECK(with_banner < UI_W * UI_ROW_H);       /* with its text cut white */
+        /* the 4th row is still real content, not overpainted */
+        {
+            int fourth = 0;
+            for (int y = last_y - UI_ROW_H; y < last_y; y++)
+                for (int x = 0; x < UI_W; x++) fourth += fb_get(&fb, x, y);
+            CHECK(fourth > 0);
+            CHECK(fourth < UI_W * UI_ROW_H / 2);
+        }
+        u.banner[0] = '\0';
+        fresh();
+    }
+
     /* dashboard content diff (C7 finding B): a bridge rev bump with
      * pixel-identical content must not repaint. rev and item ids are NOT
      * content -- they never touch the panel. */
