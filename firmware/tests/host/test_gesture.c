@@ -59,6 +59,7 @@ int main(void) {
     CHECK_EQ_INT(gesture_feed(&g, 1, 0, 0), GEST_NONE);
     CHECK_EQ_INT(gesture_feed(&g, 1, 0, 100), GEST_NONE);
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 200), GEST_NONE);   /* release seen... */
+    CHECK_EQ_INT(gesture_feed(&g, 0, 0, 220), GEST_NONE);   /* ...20 ms: not yet */
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 240), GEST_NONE);   /* ...40 ms: not yet */
     CHECK_EQ_INT(gesture_feed(&g, 0, 0, 260), GEST_REC_SHORT);   /* 60 ms >= 60 */
 
@@ -209,6 +210,34 @@ int main(void) {
         }
         CHECK_EQ_INT(n, 1);
         CHECK_EQ_INT(got[0], GEST_REC_SHORT);
+    }
+
+    /* ---- Fix round (review finding, Minor 6): the documented flip side of
+     * the 60 ms debounce -- two DELIBERATE taps separated by only ~80 ms
+     * must still classify as two gestures, not merge into one. This is the
+     * boundary right past the ~70 ms the header comment documents as
+     * absorbed; the pre-existing "two genuinely separate presses" case
+     * above uses a comfortable 100 ms gap and does not pressure the edge.
+     * Before the debounce widened to 60 ms this margin was much larger, so
+     * this case would not have caught a regression back then -- it exists
+     * to catch the debounce being widened further without re-checking this
+     * cost. */
+    {
+        gesture_fsm_t s;
+        gesture_init(&s);
+        int n = 0;
+        for (int t = 0; t <= 400; t += 20) {
+            /* tap 1: closed [0,100), open at 100 -> classifies SHORT at
+             * 160 (100 + 60 ms debounce). tap 2 starts at 180, an 80 ms
+             * gap measured from the release edge at 100 -- well after the
+             * first tap already classified and released the FSM. */
+            int down = (t < 100) || (t >= 180 && t < 280);
+            gesture_t r = gesture_feed(&s, 0, down, (unsigned)t);
+            if (r != GEST_NONE && n < 8) got[n++] = r;
+        }
+        CHECK_EQ_INT(n, 2);
+        CHECK_EQ_INT(got[0], GEST_PWR_SHORT);
+        CHECK_EQ_INT(got[1], GEST_PWR_SHORT);
     }
 
     /* ---- Task 19 blessing of two emergent behaviors (ledger r6) ----

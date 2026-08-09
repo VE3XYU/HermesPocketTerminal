@@ -44,9 +44,19 @@ typedef enum { GEST_NONE, GEST_REC_HOLD_START, GEST_REC_SHORT,
  * It is NOT a minimum press duration: any latched press still classifies
  * on its debounced release, and the press length that decides SHORT vs
  * LONG is measured to the moment the button opened, never to the end of
- * the debounce window -- a 599 ms tap stays a tap. Cost: classification
- * lands one poll later (~60 ms after the open edge instead of ~40),
- * against the 250 ms window round 5 removed. */
+ * the debounce window -- a 599 ms tap stays a tap. Cost, two-fold: (1)
+ * classification lands one poll later (~60 ms after the open edge instead
+ * of ~40), against the 250 ms window round 5 removed; (2) this is the
+ * flip side of the chatter absorption -- TWO DELIBERATE presses (a real
+ * double-tap, or PWR-tap-then-immediately-REC-tap on the same button)
+ * separated by <= ~70 ms now read as one continuous press instead of two
+ * gestures, because a re-close inside the debounce window cancels the
+ * pending release unconditionally; the FSM cannot distinguish a chattering
+ * contact from a fast second finger. Round 5 already establishes taps
+ * this close together are not a supported input (no double-tap
+ * vocabulary), so this was judged acceptable; test_gesture.c covers the
+ * boundary (both the chatter-absorption side and the ~80-100 ms
+ * genuinely-separate side). */
 #define GEST_RELEASE_DEBOUNCE_MS 60
 
 typedef struct {
