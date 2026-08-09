@@ -90,7 +90,7 @@ static const uint16_t k_wifi_rows[UI_WIFI_H] = {
     0x0C06,   /* 0110000000110 */
     0x1001,   /* 1000000000001 */
     0x0000,
-    0x00E0,   /* 0000001110000 */
+    0x00E0,   /* 0000011100000 */
     0x0318,   /* 0001100011000 */
     0x0000,
     0x00E0,
@@ -158,6 +158,13 @@ void widget_status_line(ui_fb_t *f, const ui_status_t *st) {
 
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n'; }
 
+/* Done-strike height: the 2 px bar crosses mid-cap (cap/2 above the
+ * baseline -- 8 px for the 17 px body). Re-derived in Task 19: the old
+ * baseline-5 offset was tuned for the pre-round-6 8 px-cap body and on
+ * the escalated font underlined the lower third instead of striking
+ * through. */
+#define UI_STRIKE_UP (UI_FONT_BODY_CAP / 2)
+
 /* One body line of a list row: ellipsized to the pixel budget, struck
  * through when done (the strike is what the completion gesture promises;
  * two rows thick so it survives partial-refresh ghosting). */
@@ -168,7 +175,8 @@ static void row_line(ui_fb_t *f, int x, int baseline, const char *text,
     if (!line[0]) return;
     fb_text_prop(f, x, baseline, line, UI_FONT_BODY, 1);
     if (done)
-        fb_fill(f, x, baseline - 5, fb_text_width_prop(line, UI_FONT_BODY), 2, 1);
+        fb_fill(f, x, baseline - UI_STRIKE_UP,
+                fb_text_width_prop(line, UI_FONT_BODY), 2, 1);
 }
 
 void widget_list(ui_fb_t *f, const ui_list_t *l) {
@@ -228,7 +236,7 @@ void widget_list(ui_fb_t *f, const ui_list_t *l) {
             if (seg[0]) {
                 fb_text_prop(f, x, base1, seg, UI_FONT_BODY, 1);
                 if (row->done)
-                    fb_fill(f, x, base1 - 5,
+                    fb_fill(f, x, base1 - UI_STRIKE_UP,
                             fb_text_width_prop(seg, UI_FONT_BODY), 2, 1);
             }
             const char *rest = row->text + fit;

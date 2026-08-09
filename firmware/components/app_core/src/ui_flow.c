@@ -326,7 +326,12 @@ static void render_dashboard(ui_flow_t *u, ui_fb_t *fb) {
     memset(l, 0, sizeof *l);
     str_copy(l->title, sizeof l->title, u->dash.title);
     l->cursor = u->cursor;        /* < 0 while resting: no row inverts */
-    l->row_count = u->dash.item_count;
+    /* Belt-and-braces cap (Task 19): every current item_count source
+     * already clamps at 32 (the network parser, the cache loader), but
+     * widget_list indexes rows[row_count - 1] and scrolls by it -- a
+     * future source of a bad count must degrade to a truncated list, not
+     * an OOB read of ui_list_t.rows[32]. */
+    l->row_count = u->dash.item_count <= 32 ? u->dash.item_count : 32;
     /* C7 round 7: the banner strip IS the last row band, so a pending
      * banner costs the list its last visible row rather than painting over
      * it. Dashboard-only, because the banner is drawn nowhere else. */
@@ -417,10 +422,14 @@ static int settings_lines(ui_fb_t *fb, int baseline, const char *s, int max_line
     return baseline;
 }
 
+/* Worst case 1 (MAC) + 1 (fw) + 2 (host) + 1 (sync) = 5 baselines ends at
+ * UI_TEXT_FIRST_BASE + 4 * UI_TEXT_LINE_H = 136 (+5 descent = 141), well
+ * inside the panel -- compile-checked (Task 19), the same discipline as
+ * widgets.c's grid asserts. */
+_Static_assert(UI_TEXT_FIRST_BASE + 4 * UI_TEXT_LINE_H + UI_FONT_BODY_DESC < UI_H,
+               "the 5-baseline settings ladder must stay on the panel");
+
 static void render_settings(ui_flow_t *u, ui_fb_t *fb) {
-    /* Worst case 1+1+2+1 = 5 baselines ends at UI_TEXT_FIRST_BASE +
-     * 4 * UI_TEXT_LINE_H = 136 (+5 descent = 141), well inside the
-     * panel. */
     int y = UI_TEXT_FIRST_BASE;
     /* The MAC (17 chars) measures ~215-227 px in the escalated body --
      * wider than the 196 px line -- and its one job is to be compared to

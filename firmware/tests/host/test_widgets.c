@@ -187,14 +187,20 @@ int main(void) {
     fb_clear(&fb);
     widget_list(&fb, &two);
     int r0_y = UI_STATUS_H + UI_TITLE_H;
-    /* both body lines drew inside their ascent..descent bands */
-    CHECK(region_ink(0, r0_y + UI_ROW2_BASE1 - UI_FONT_BODY_ASC, UI_W,
+    /* Both body lines drew inside their ascent..descent bands -- checked
+     * on ROW 1, which is NOT the cursor row (Task 19 discrimination fix:
+     * row 0 is inverted, so its band ink counts pass from the inversion
+     * flood alone whether or not any text was drawn there). */
+    int r1_y = r0_y + UI_ROW2_H;
+    CHECK(region_ink(0, r1_y + UI_ROW2_BASE1 - UI_FONT_BODY_ASC, UI_W,
                      UI_FONT_BODY_ASC + UI_FONT_BODY_DESC) > 0);
-    CHECK(region_ink(0, r0_y + UI_ROW2_BASE2 - UI_FONT_BODY_ASC, UI_W,
+    CHECK(region_ink(0, r1_y + UI_ROW2_BASE2 - UI_FONT_BODY_ASC, UI_W,
                      UI_FONT_BODY_ASC + UI_FONT_BODY_DESC) > 0);
-    /* cursor inversion floods the full two-line row height */
+    /* cursor inversion floods the full two-line row height -- and its own
+     * text cuts white back into the flood (not a solid slab) */
     int inv = region_ink(0, r0_y, UI_W, UI_ROW2_H);
     CHECK(inv > UI_W * UI_ROW2_H / 2);
+    CHECK(inv < UI_W * UI_ROW2_H);
     /* scrolled: the last visible row ends exactly at the panel's bottom
      * edge -- the grid reclaims the old banner reservation (rows there
      * prove the 3 x 50 partition, nothing paints below y 199 by

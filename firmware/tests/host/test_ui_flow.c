@@ -321,6 +321,22 @@ int main(void) {
         CHECK(hint_ink > 0);         /* "Nothing yet" / "Hold REC to talk", full region */
         CHECK_EQ_INT(tail_ink, 0);   /* still empty -- not reserved, just unreached */
 
+        /* Discriminators for the exact centering bug (Task 19): centered
+         * over the FULL 150 px rows region, the hint's ink spans
+         * y [101,148) (derivation above); mis-centered in the old fixed
+         * 120 px window it would span [86,133). The plain hint_ink > 0
+         * check passes either way -- zero ink above y 101 plus ink in
+         * [134,148) is what tells the two apart. */
+        {
+            int above = 0, low = 0;
+            for (int y = UI_STATUS_H + UI_TITLE_H; y < 101; y++)
+                for (int x = 0; x < UI_W; x++) above += fb_get(&fb, x, y);
+            for (int y = 134; y < 148; y++)
+                for (int x = 0; x < UI_W; x++) low += fb_get(&fb, x, y);
+            CHECK_EQ_INT(above, 0);
+            CHECK(low > 0);
+        }
+
         /* ---- same empty dashboard, but with a banner up: the fix keeps
          * the OLD fixed 120 px window in this case (y1 is UI_H -
          * UI_BANNER_H whenever u->banner[0] is set), so the hint is

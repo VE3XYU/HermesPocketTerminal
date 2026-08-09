@@ -595,8 +595,10 @@ static void status_line_fill(ui_status_t *stt) {
  * font, greedy per measured pixel width: each line breaks at the last
  * space that fits (a word longer than the line hard-splits) -- the same
  * fb_wrap_break_prop rule every other wrap point uses since C7 round 6.
- * x is the left edge, base0 the first BASELINE, lines advance by
- * UI_TEXT_LINE_H. */
+ * A message that would overflow max_lines gets a measured ellipsis on
+ * the last line (the settings_lines pattern; Task 19 -- it used to be
+ * cut silently). x is the left edge, base0 the first BASELINE, lines
+ * advance by UI_TEXT_LINE_H. */
 static void draw_wrapped(const char *msg, int x, int base0, int max_lines) {
     int max_w = UI_W - x - UI_MARGIN_X;
     char line[80];
@@ -605,6 +607,13 @@ static void draw_wrapped(const char *msg, int x, int base0, int max_lines) {
     while (*p && lines < max_lines) {
         while (*p == ' ') p++;
         if (!*p) break;
+        if (lines == max_lines - 1) {
+            /* last allowed line: whole tail when it fits, else prefix
+             * plus a measured "..." -- never a silent mid-message cut */
+            fb_ellipsize_prop(line, sizeof line, p, UI_FONT_BODY, max_w);
+            fb_text_prop(&s_fb, x, base, line, UI_FONT_BODY, 1);
+            return;
+        }
         int take = fb_wrap_break_prop(p, UI_FONT_BODY, max_w);
         if (take > (int)sizeof line - 1) take = (int)sizeof line - 1;
         memcpy(line, p, (size_t)take);
@@ -616,6 +625,48 @@ static void draw_wrapped(const char *msg, int x, int base0, int max_lines) {
     }
 }
 
+/* Geometry of the main.c-drawn screens, compile-checked (Task 19 -- the
+ * same discipline widgets.c applies to the list grids; these screens are
+ * drawn with the constants below rather than the UI_ROW_* grid, so they
+ * get their own asserts).
+ *   status/fatal:  STATUS_TEXT_LINES wrapped body lines, block top at
+ *                  STATUS_TEXT_TOP
+ *   outcome:       hero word with its cap top at OUTCOME_HERO_TOP, then
+ *                  OUTCOME_BODY_LINES transcript lines a hero advance
+ *                  (OUTCOME_BODY_ADVANCE) below
+ *   glyph:         "REC" hero with its cap top at GLYPH_TEXT_TOP, dot
+ *                  block just above */
+#define STATUS_TEXT_TOP      44
+#define STATUS_TEXT_LINES    6
+#define OUTCOME_HERO_TOP     26
+#define OUTCOME_BODY_ADVANCE 31   /* the reference hero line advance */
+#define OUTCOME_BODY_LINES   5
+#define GLYPH_DOT_X          92
+#define GLYPH_DOT_Y          72
+#define GLYPH_DOT_SIZE       16
+#define GLYPH_TEXT_TOP       104
+
+_Static_assert(STATUS_TEXT_TOP >= UI_STATUS_H,
+               "status text starts below the status strip");
+_Static_assert(STATUS_TEXT_TOP + UI_FONT_BODY_ASC
+                   + (STATUS_TEXT_LINES - 1) * UI_TEXT_LINE_H
+                   + UI_FONT_BODY_DESC < UI_H,
+               "the wrapped status block stays on the panel");
+_Static_assert(OUTCOME_HERO_TOP + UI_FONT_HERO_CAP - UI_FONT_HERO_ASC >= UI_STATUS_H,
+               "the hero word's ascender band clears the status strip");
+_Static_assert(UI_FONT_HERO_DESC < OUTCOME_BODY_ADVANCE - UI_FONT_BODY_ASC,
+               "the hero descender clears the transcript's first line");
+_Static_assert(OUTCOME_HERO_TOP + UI_FONT_HERO_CAP + OUTCOME_BODY_ADVANCE
+                   + (OUTCOME_BODY_LINES - 1) * UI_TEXT_LINE_H
+                   + UI_FONT_BODY_DESC < UI_H,
+               "the outcome transcript block stays on the panel");
+_Static_assert(GLYPH_DOT_X + GLYPH_DOT_SIZE <= UI_W &&
+               GLYPH_DOT_Y + GLYPH_DOT_SIZE
+                   <= GLYPH_TEXT_TOP + UI_FONT_HERO_CAP - UI_FONT_HERO_ASC,
+               "the REC dot fits and clears the hero text band");
+_Static_assert(GLYPH_TEXT_TOP + UI_FONT_HERO_CAP + UI_FONT_HERO_DESC < UI_H,
+               "the hero REC baseline keeps its descender on the panel");
+
 /* Status line + body-font message, partial refresh. */
 static void screen_status(const char *msg) {
     ESP_LOGI(TAG, "status: %s", msg);
@@ -624,7 +675,7 @@ static void screen_status(const char *msg) {
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    draw_wrapped(msg, 4, 44 + UI_FONT_BODY_ASC, 6);
+    draw_wrapped(msg, 4, STATUS_TEXT_TOP + UI_FONT_BODY_ASC, STATUS_TEXT_LINES);
     present(0);
 }
 
@@ -636,8 +687,9 @@ static void screen_status_cb(void *ui_ctx, const char *line) {
 
 /* Primary status word at the hero size (25 px caps -- "Noted"/"Done"
  * must be readable at arm's length) + the opening of the transcript in
- * the body font below, on the hero's 31 px line advance. 5 body lines
- * at the round-6 pitch: baselines 82..178, descent 183 -- on-panel. */
+ * the body font below, on the hero's line advance. 5 body lines at the
+ * round-6 pitch: baselines 82..178, descent 183 -- compile-checked with
+ * the other screens above. */
 static void screen_status_transcript(const char *status, const char *transcript) {
     ESP_LOGI(TAG, "status: %s transcript=%.80s", status, transcript);
     if (screen_ready() != 0) return;
@@ -645,10 +697,10 @@ static void screen_status_transcript(const char *status, const char *transcript)
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    int hero_base = 26 + UI_FONT_HERO_CAP;      /* cap tops at y = 26 */
+    int hero_base = OUTCOME_HERO_TOP + UI_FONT_HERO_CAP;
     fb_text_prop(&s_fb, 4, hero_base, status, UI_FONT_HERO, 1);
     draw_wrapped(transcript[0] ? transcript : "(no transcript)", 4,
-                 hero_base + 31, 5);
+                 hero_base + OUTCOME_BODY_ADVANCE, OUTCOME_BODY_LINES);
     present(0);
 }
 
@@ -665,7 +717,7 @@ static void screen_fatal(const char *msg) {
     status_line_fill(&stt);
     fb_clear(&s_fb);
     widget_status_line(&s_fb, &stt);
-    draw_wrapped(msg, 4, 44 + UI_FONT_BODY_ASC, 6);
+    draw_wrapped(msg, 4, STATUS_TEXT_TOP + UI_FONT_BODY_ASC, STATUS_TEXT_LINES);
     present(0);
     epd_sleep();
     s_epd_up = 0;
@@ -822,11 +874,12 @@ static int rec_held(void *ctx) { (void)ctx; return board_btn_rec(); }
 static void draw_rec_glyph(void) {
     if (screen_ready() != 0) return;
     fb_clear(&s_fb);
-    fb_fill(&s_fb, 92, 72, 16, 16, 1);      /* small centered dot */
+    fb_fill(&s_fb, GLYPH_DOT_X, GLYPH_DOT_Y, GLYPH_DOT_SIZE, GLYPH_DOT_SIZE, 1);
     /* hero size (25 px caps), centered by measured width, cap tops at
-     * y = 104 (baseline = 104 + cap height) */
+     * GLYPH_TEXT_TOP (baseline = top + cap height); compile-checked with
+     * the other screens above */
     int w = fb_text_width_prop("REC", UI_FONT_HERO);
-    fb_text_prop(&s_fb, (UI_W - w) / 2, 104 + UI_FONT_HERO_CAP, "REC",
+    fb_text_prop(&s_fb, (UI_W - w) / 2, GLYPH_TEXT_TOP + UI_FONT_HERO_CAP, "REC",
                  UI_FONT_HERO, 1);
     present(0);
 }

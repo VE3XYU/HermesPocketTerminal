@@ -192,7 +192,12 @@ int sync_cycle(sync_ctx_t *cx, sync_report_t *out) {
     /* 4. transcript backfill */
     backfill(cx, &net_calls, &net_failures);
 
-    /* 5. ack — only what render_notifications actually got onto the panel */
+    /* 5. ack — only what render_notifications ACCEPTED (returned 0 with
+     * count > 0). Since C7's banner gating that means "painted now, or
+     * held in the model and painted on the operator's next dashboard
+     * visit" — not necessarily pixels this cycle. A crash before a
+     * deferred paint redelivers on the next fetch (at-least-once), and
+     * the kv "acked" ring dedups the chime. */
     if (notif_ok && render_ok && s_notifs.count > 0) {
         const char *ack_ids[16];
         for (int i = 0; i < s_notifs.count; i++) ack_ids[i] = s_notifs.items[i].id;

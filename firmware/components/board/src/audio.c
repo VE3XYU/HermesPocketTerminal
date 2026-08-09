@@ -75,8 +75,9 @@ static const char *TAG = "audio";
                                       so the tail of a clip is actually heard before
                                       the PA is cut */
 
-/* DMA ring: 8 x 512 frames = 4096 frames = 256 ms at 16 kHz, 16 kB of
- * internal RAM. Deliberately larger than the IDF default (6 x 240 = 90 ms):
+/* DMA ring: 8 x 512 frames = 4096 frames = 256 ms at 16 kHz — 16 kB per
+ * direction, and BOTH tx and rx channels are allocated, so ~32 kB of
+ * internal RAM total. Deliberately larger than the IDF default (6 x 240 = 90 ms):
  * capture is streamed straight to the SD card and a FAT allocation stall of
  * a hundred-odd milliseconds is normal, so the ring has to cover it or the
  * recording drops samples. Untuned. */
