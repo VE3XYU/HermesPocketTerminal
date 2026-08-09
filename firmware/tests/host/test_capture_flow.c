@@ -2,6 +2,7 @@
 #include "capture_flow.h"
 #include "sidecar.h"
 #include "rec_index.h"
+#include "wav.h"
 #include "fakes/fake_transport.h"
 #include "fakes/fake_storage.h"
 #include <string.h>
@@ -102,6 +103,68 @@ static void test_failed_capture(void) {
     CHECK_EQ_STR(back.error, "transcription_failed");
 }
 
+/* Design §10 torn-file rule (Task 19): power lost mid-recording leaves the
+ * placeholder all-zero header (patched only on clean stop) -- upload must
+ * REFUSE it, not stream it to the bridge, and must not keep refusing it on
+ * every future sync. */
+static void test_torn_wav_refused(void) {
+    fresh("c-torn");
+    uint8_t zeroed[44];
+    memset(zeroed, 0, sizeof zeroed);
+    CHECK_EQ_INT(st.write(st.ctx, "/rec/c-torn.wav", zeroed, sizeof zeroed), 0);
+    rec_index_append(&st, "c-torn");
+
+    CHECK_EQ_INT(capture_run(&cx, &sc), CAPTURE_FAILED);
+    CHECK_EQ_INT(ft.req_count, 0);               /* never reached the network */
+    CHECK(status_count > 0);                     /* the clear note was surfaced */
+    CHECK_EQ_STR(status_log[0], "Recording unreadable - not uploaded");
+    sidecar_t back; sidecar_load(&st, "c-torn", &back);
+    CHECK_EQ_STR(back.state, "failed");
+    CHECK_EQ_STR(back.error, "bad_wav_header");
+    CHECK_EQ_INT(capture_pending_count(&st), 0); /* out of the pending queue */
+}
+
+/* ...while a truncated-but-VALID-header file (clean stop, data cut short
+ * afterwards) is fine and uploads normally, per the same design row. */
+static void test_truncated_valid_header_uploads(void) {
+    fresh("c-trunc");
+    uint8_t hdr[44];
+    wav_write_header(hdr, 16000, 16, 1, 32000);  /* claims 32000 data bytes... */
+    CHECK_EQ_INT(st.write(st.ctx, "/rec/c-trunc.wav", hdr, sizeof hdr), 0);
+    /* ...but the file ends right after the header */
+    ft_push(&ft, 0, 200, "{\"id\":\"c-trunc\",\"state\":\"received\"}");
+    ft_push(&ft, 0, 200, "{\"server_time\":1,\"captures\":[{\"id\":\"c-trunc\",\"state\":\"done\"}]}");
+    CHECK_EQ_INT(capture_run(&cx, &sc), CAPTURE_DONE);
+    CHECK_EQ_INT(ft.req_count, 2);               /* the upload happened */
+}
+
+/* The sync retry path refuses a torn WAV the same way: it drops out of the
+ * queue without a network call while healthy pending captures still go. */
+static void test_retry_skips_torn_wav(void) {
+    fresh("c-torn2");                            /* not_uploaded, zeroed header */
+    uint8_t zeroed[44];
+    memset(zeroed, 0, sizeof zeroed);
+    CHECK_EQ_INT(st.write(st.ctx, "/rec/c-torn2.wav", zeroed, sizeof zeroed), 0);
+    sidecar_t good; sidecar_init(&good, "c-good");   /* not_uploaded, valid header */
+    sidecar_save(&st, &good);
+    uint8_t hdr[44];
+    wav_write_header(hdr, 16000, 16, 1, 8000);
+    CHECK_EQ_INT(st.write(st.ctx, "/rec/c-good.wav", hdr, sizeof hdr), 0);
+    rec_index_append(&st, "c-torn2");
+    rec_index_append(&st, "c-good");
+
+    CHECK_EQ_INT(capture_pending_count(&st), 2);
+    ft_push(&ft, 0, 200, "{\"id\":\"c-good\",\"state\":\"received\"}");
+    CHECK_EQ_INT(capture_retry_pending(&cx), 1);
+    CHECK_EQ_INT(ft.req_count, 1);               /* only c-good hit the network */
+    sidecar_t back; sidecar_load(&st, "c-torn2", &back);
+    CHECK_EQ_STR(back.state, "failed");
+    CHECK_EQ_STR(back.error, "bad_wav_header");
+    sidecar_load(&st, "c-good", &back);
+    CHECK_EQ_STR(back.state, "uploaded");
+    CHECK_EQ_INT(capture_pending_count(&st), 0); /* refusal drained it too */
+}
+
 static void test_retry_pending(void) {
     fresh("c-one");                               /* c-one: not_uploaded */
     sidecar_t two; sidecar_init(&two, "c-two");   /* c-two: already uploaded */
@@ -129,6 +192,9 @@ int main(void) {
     test_auth_error_stops_immediately();
     test_poll_window_timeout();
     test_failed_capture();
+    test_torn_wav_refused();
+    test_truncated_valid_header_uploads();
+    test_retry_skips_torn_wav();
     test_retry_pending();
     return HARNESS_REPORT();
 }

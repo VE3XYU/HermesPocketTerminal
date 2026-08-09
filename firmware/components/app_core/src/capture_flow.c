@@ -2,10 +2,38 @@
 #include "htp_backoff.h"
 #include "rec_index.h"
 #include "util.h"
+#include "wav.h"
 #include <string.h>
 
 static void status(capture_ctx_t *cx, const char *line) {
     if (cx->on_status) cx->on_status(cx->ui_ctx, line);
+}
+
+/* Design §10's torn-file rule: the recorder writes a ZEROED 44-byte header
+ * and patches it only on a clean stop, so a WAV that lost power
+ * mid-recording (or was bit-rotted on the card) fails wav_parse_header --
+ * and must be REFUSED by upload rather than streamed to the bridge as
+ * audio. Only the first 64 bytes are read: every device-recorded file has
+ * the canonical 44-byte header, and only device-recorded files are ever
+ * uploaded. An UNREADABLE file is not refused here (return 0): that is a
+ * storage/transport failure with its own reporting, and the transport
+ * surfaces it on the upload attempt. On refusal the sidecar is marked
+ * failed/bad_wav_header and saved, so the capture leaves the pending
+ * queue instead of being refused again on every future sync; the WAV
+ * stays on the card. Returns 1 = refused. */
+static int wav_refused(capture_ctx_t *cx, sidecar_t *sc) {
+    char wav[96];
+    sidecar_wav_path(wav, sc->id);
+    uint8_t head[64];
+    size_t got = 0;
+    if (cx->storage->read(cx->storage->ctx, wav, head, sizeof head, &got) != 0)
+        return 0;
+    wav_info_t inf;
+    if (wav_parse_header(head, got, &inf) == 0) return 0;
+    str_copy(sc->state, sizeof sc->state, "failed");
+    str_copy(sc->error, sizeof sc->error, "bad_wav_header");
+    sidecar_save(cx->storage, sc);
+    return 1;
 }
 
 static int upload_once(capture_ctx_t *cx, sidecar_t *sc) {
@@ -30,6 +58,12 @@ static int upload_with_retry(capture_ctx_t *cx, sidecar_t *sc) {
 
 capture_outcome_t capture_run(capture_ctx_t *cx, sidecar_t *sc) {
     if (strcmp(sc->state, "not_uploaded") == 0) {
+        if (wav_refused(cx, sc)) {
+            /* the on_status line doubles as the serial note (main.c logs
+             * every status callback) */
+            status(cx, "Recording unreadable - not uploaded");
+            return CAPTURE_FAILED;
+        }
         status(cx, "Uploading...");
         int err = upload_with_retry(cx, sc);
         if (err == HTP_ERR_AUTH) { status(cx, "Auth error"); return CAPTURE_AUTH_ERROR; }
@@ -102,6 +136,8 @@ int capture_retry_pending(capture_ctx_t *cx) {
         sidecar_t *sc = &s_retry_sc;
         if (sidecar_load(cx->storage, s_retry_ids[i], sc) != 0) continue;
         if (strcmp(sc->state, "not_uploaded") != 0) continue;
+        if (wav_refused(cx, sc)) continue;   /* torn header: now failed on
+                                                the card, out of the queue */
         if (upload_once(cx, sc) == HTP_OK) {
             str_copy(sc->state, sizeof sc->state, "uploaded");
             sc->uploaded_at = cx->clock->epoch_s(cx->clock->ctx);
