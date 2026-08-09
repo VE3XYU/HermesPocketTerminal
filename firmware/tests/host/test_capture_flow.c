@@ -165,6 +165,60 @@ static void test_retry_skips_torn_wav(void) {
     CHECK_EQ_INT(capture_pending_count(&st), 0); /* refusal drained it too */
 }
 
+/* Fix round (review Important 2): a capture the bridge rejects with a 4xx
+ * must leave the pending queue -- upload_with_retry already never retries
+ * HTP_ERR_CLIENT within one capture_run call (it would only get the same
+ * rejection again), but leaving the sidecar untouched left it
+ * "not_uploaded" forever, so every following sync re-streamed the whole
+ * WAV. Trace: htp_upload_capture (client.c) has no local path that
+ * returns HTP_ERR_CLIENT -- unlike htp_poll_captures/htp_complete_item/
+ * htp_ack_notifications, its only HTP_ERR_CLIENT comes from status_to_err
+ * mapping a real server 4xx -- so draining on it here can never discard a
+ * capture over a local buffer-build failure. */
+static void test_client_error_drains_pending_queue(void) {
+    fresh("c-rej");
+    rec_index_append(&st, "c-rej");
+    uint8_t hdr[44];
+    wav_write_header(hdr, 16000, 16, 1, 8000);
+    CHECK_EQ_INT(st.write(st.ctx, "/rec/c-rej.wav", hdr, sizeof hdr), 0);
+
+    ft_push(&ft, 0, 422, "{\"error\":\"malformed_capture\"}");
+    CHECK_EQ_INT(capture_run(&cx, &sc), CAPTURE_FAILED);
+    CHECK_EQ_INT(ft.req_count, 1);                  /* no retries on a 4xx */
+    sidecar_t back; sidecar_load(&st, "c-rej", &back);
+    CHECK_EQ_STR(back.state, "failed");
+    CHECK_EQ_STR(back.error, "upload_rejected");
+    CHECK_EQ_INT(capture_pending_count(&st), 0);    /* out of the pending queue */
+
+    /* a following sync must not re-upload it */
+    CHECK_EQ_INT(capture_retry_pending(&cx), 0);
+    CHECK_EQ_INT(ft.req_count, 1);                  /* no new request made */
+}
+
+/* ...but a 401 is a token-configuration problem, not a rejection of this
+ * capture -- it must NOT drain. Once the operator fixes the token, the
+ * same capture must still be sitting there to upload. */
+static void test_auth_error_leaves_capture_pending(void) {
+    fresh("c-tok");
+    rec_index_append(&st, "c-tok");
+    uint8_t hdr[44];
+    wav_write_header(hdr, 16000, 16, 1, 8000);
+    CHECK_EQ_INT(st.write(st.ctx, "/rec/c-tok.wav", hdr, sizeof hdr), 0);
+
+    ft_push(&ft, 0, 401, "{\"error\":\"unauthorized\"}");
+    CHECK_EQ_INT(capture_run(&cx, &sc), CAPTURE_AUTH_ERROR);
+    sidecar_t back; sidecar_load(&st, "c-tok", &back);
+    CHECK_EQ_STR(back.state, "not_uploaded");       /* still pending, not drained */
+    CHECK_EQ_INT(capture_pending_count(&st), 1);
+
+    /* once the token is fixed, the next sync uploads it normally */
+    ft_push(&ft, 0, 200, "{\"id\":\"c-tok\",\"state\":\"received\"}");
+    CHECK_EQ_INT(capture_retry_pending(&cx), 1);
+    sidecar_load(&st, "c-tok", &back);
+    CHECK_EQ_STR(back.state, "uploaded");
+    CHECK_EQ_INT(capture_pending_count(&st), 0);
+}
+
 static void test_retry_pending(void) {
     fresh("c-one");                               /* c-one: not_uploaded */
     sidecar_t two; sidecar_init(&two, "c-two");   /* c-two: already uploaded */
@@ -195,6 +249,8 @@ int main(void) {
     test_torn_wav_refused();
     test_truncated_valid_header_uploads();
     test_retry_skips_torn_wav();
+    test_client_error_drains_pending_queue();
+    test_auth_error_leaves_capture_pending();
     test_retry_pending();
     return HARNESS_REPORT();
 }

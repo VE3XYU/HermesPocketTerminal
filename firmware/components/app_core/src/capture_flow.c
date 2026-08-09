@@ -15,9 +15,12 @@ static void status(capture_ctx_t *cx, const char *line) {
  * and must be REFUSED by upload rather than streamed to the bridge as
  * audio. Only the first 64 bytes are read: every device-recorded file has
  * the canonical 44-byte header, and only device-recorded files are ever
- * uploaded. An UNREADABLE file is not refused here (return 0): that is a
- * storage/transport failure with its own reporting, and the transport
- * surfaces it on the upload attempt. On refusal the sidecar is marked
+ * uploaded. An UNREADABLE file is not refused here (return 0, fail OPEN):
+ * a transient card-busy/I-O read failure must not permanently discard a
+ * genuine recording just because the read happened to fail on this one
+ * attempt -- that is a storage/transport failure with its own reporting,
+ * and the transport surfaces it (and gets to retry) on the upload attempt
+ * that follows. On refusal the sidecar is marked
  * failed/bad_wav_header and saved, so the capture leaves the pending
  * queue instead of being refused again on every future sync; the WAV
  * stays on the card. Returns 1 = refused. */
@@ -71,7 +74,21 @@ capture_outcome_t capture_run(capture_ctx_t *cx, sidecar_t *sc) {
             status(cx, "Saved, will upload later");
             return CAPTURE_OFFLINE;
         }
-        if (err == HTP_ERR_CLIENT) { status(cx, "Upload rejected"); return CAPTURE_FAILED; }
+        if (err == HTP_ERR_CLIENT) {
+            /* the bridge rejected THIS capture (status_to_err maps a real
+             * 4xx response here -- htp_upload_capture has no local path
+             * that returns HTP_ERR_CLIENT, unlike htp_poll_captures/
+             * htp_complete_item/htp_ack_notifications' buffer-build
+             * checks), so retrying would only get the same 4xx again.
+             * Drain it out of the pending queue the same way wav_refused
+             * does above, instead of leaving it not_uploaded forever --
+             * without this the whole WAV re-streams on every sync. */
+            str_copy(sc->state, sizeof sc->state, "failed");
+            str_copy(sc->error, sizeof sc->error, "upload_rejected");
+            sidecar_save(cx->storage, sc);
+            status(cx, "Upload rejected");
+            return CAPTURE_FAILED;
+        }
         str_copy(sc->state, sizeof sc->state, "uploaded");
         sc->uploaded_at = cx->clock->epoch_s(cx->clock->ctx);
         sidecar_save(cx->storage, sc);
