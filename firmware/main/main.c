@@ -796,9 +796,15 @@ static int load_wifi(void) {
     return 0;
 }
 
-/* Monotone boot counter in NVS; feeds htp_make_capture_id's clockless
- * fallback ("c-b<bootcount>-<mono_ms>-xxxx"). */
-static uint32_t boot_count_bump(void) {
+/* Monotone per-CAPTURE counter in NVS; feeds htp_make_capture_id's
+ * clockless fallback ("c-b<n>-<mono_ms>-xxxx"). Historically named (and
+ * keyed) "boot count", but it bumps once per capture, not per boot --
+ * strictly tighter for id uniqueness, since two clockless captures in one
+ * boot get distinct counts even before mono_ms differs. The NVS key stays
+ * "bootcnt" so devices provisioned before the rename keep their counter
+ * (final review, minor 3: rename what the code calls it, not what the
+ * flash stores it under). */
+static uint32_t capture_seq_bump(void) {
     char v[16];
     unsigned long n = 0;
     if (s_kv.get(s_kv.ctx, "bootcnt", v, sizeof v) == 0) n = strtoul(v, NULL, 10);
@@ -949,7 +955,7 @@ static int record_capture(sidecar_t *sc, const char *conversation_id,
     s_rng.fill(s_rng.ctx, r2, 2);
     long long now = s_ck.epoch_s(s_ck.ctx);   /* system clock, else PCF85063, else 0 */
     char id[64];
-    htp_make_capture_id(id, now, boot_count_bump(), s_ck.mono_ms(s_ck.ctx), r2);
+    htp_make_capture_id(id, now, capture_seq_bump(), s_ck.mono_ms(s_ck.ctx), r2);
 
     char wavl[96];
     sidecar_wav_path(wavl, id);
@@ -1450,7 +1456,13 @@ static void sync_session(wake_cause_t wc) {
      * that case still needs this screen. */
     if ((rep.uploads_retried > 0 || pending_uploads() != pend_before) &&
         !s_dash_painted)
-        screen_status(pending_uploads() == 0 ? "Uploaded" : "Upload retried");
+        /* "Upload retried" only when a retry actually ran: this branch is
+         * also reached when BACKFILL re-marked an unknown capture
+         * not_uploaded (pending went UP with uploads_retried == 0), where
+         * "Upload pending" is what is true (final review, minor 7). */
+        screen_status(pending_uploads() == 0    ? "Uploaded"
+                      : rep.uploads_retried > 0 ? "Upload retried"
+                                                : "Upload pending");
 }
 
 /* Settings screen data: factory MAC (never spoofed, by design -- some
@@ -1611,6 +1623,10 @@ static void ui_session(wake_cause_t wc) {
              * the release, then drop the press from the FSM. */
             while (board_btn_rec()) vTaskDelay(pdMS_TO_TICKS(20));
             gesture_init(&g);
+            /* Playback time is not idle time: without this, playing a
+             * recording longer than the 30 s idle timeout ended the
+             * session the instant it finished (final review, minor 1). */
+            idle_t0 = s_ck.mono_ms(s_ck.ctx);
             break;
         }
         case UIF_COMPLETE:
@@ -1724,6 +1740,7 @@ static wake_cause_t dev_linger(unsigned sleep_s) {
 
     char line[16];
     size_t n = 0;
+    int overlong = 0;   /* mid-line overflow: eat the REST of the line too */
     int64_t t_last_input = esp_timer_get_time() / 1000;
     int64_t t_next_heartbeat = t_last_input + DEV_HEARTBEAT_MS;
     int64_t t_pwr_down_since = -1;   /* -1 = no latched press; else its press edge */
@@ -1743,15 +1760,25 @@ static wake_cause_t dev_linger(unsigned sleep_s) {
             if (c == '\n' || c == '\r') {
                 line[n] = 0;
                 n = 0;
-                if (strcmp(line, "sleep") == 0) {
+                if (overlong) {
+                    /* The WHOLE line is junk, including this tail: the old
+                     * reset-and-keep-typing kept the last 15 bytes, so
+                     * pasted junk ending in "sleep\n" executed sleep
+                     * (final review, minor 6). */
+                    overlong = 0;
+                    ESP_LOGI(TAG, "overlong line discarded");
+                } else if (strcmp(line, "sleep") == 0) {
                     ESP_LOGI(TAG, "sleep command received");
                     break;
+                } else if (line[0]) {
+                    ESP_LOGI(TAG, "unknown command '%s' (commands: sleep)", line);
                 }
-                if (line[0]) ESP_LOGI(TAG, "unknown command '%s' (commands: sleep)", line);
+            } else if (overlong) {
+                /* eating the rest of the overlong line */
             } else if (n + 1 < sizeof line) {
                 line[n++] = (char)c;
             } else {
-                n = 0;   /* overlong line: discard, resync at the next line end */
+                overlong = 1;   /* longer than any command: discard the line */
             }
         }
 
