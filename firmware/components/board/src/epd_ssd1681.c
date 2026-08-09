@@ -94,6 +94,7 @@ static bool busy_wait(void) {
  * one poll tick and we'd rather not false-fail on a fast partial. */
 static bool busy_wait_after_trigger(void) {
     int64_t start = uptime_ms();
+    bool asserted = false;
     ESP_LOGI(TAG, "BUSY=%d just after trigger", gpio_get_level(PIN_BUSY));
     while (gpio_get_level(PIN_BUSY) == 0) {
         if (uptime_ms() - start >= EPD_BUSY_ASSERT_MS) {
@@ -102,7 +103,9 @@ static bool busy_wait_after_trigger(void) {
         }
         poll_delay();
     }
+    asserted = (gpio_get_level(PIN_BUSY) == 1);
     while (gpio_get_level(PIN_BUSY) == 1) {
+        asserted = true;
         if (uptime_ms() - start >= EPD_BUSY_ASSERT_MS + EPD_BUSY_TRIGGER_TIMEOUT_MS) {
             ESP_LOGE(TAG, "BUSY timeout after trigger (still high %lld ms after trigger)",
                      (long long)(uptime_ms() - start));
@@ -110,8 +113,17 @@ static bool busy_wait_after_trigger(void) {
         }
         poll_delay();
     }
-    ESP_LOGI(TAG, "refresh done: BUSY cleared %lld ms after trigger",
-             (long long)(uptime_ms() - start));
+    /* "refresh done" only when BUSY was actually seen driving: when it
+     * never asserted, the clear-wait above fell straight through and the
+     * old unconditional line contradicted the warning in exactly the case
+     * where the distinction matters -- trigger possibly never delivered
+     * (final review, minor 4). */
+    if (asserted)
+        ESP_LOGI(TAG, "refresh done: BUSY cleared %lld ms after trigger",
+                 (long long)(uptime_ms() - start));
+    else
+        ESP_LOGW(TAG, "BUSY never seen asserted: refresh NOT confirmed "
+                      "(trigger may not have reached the panel)");
     return true;
 }
 
@@ -294,6 +306,13 @@ int epd_init(void) {
     return 0;
 }
 
+/* Known gap, recorded and deliberately left (final review, minor 4): both
+ * refresh entry points below ignore busy_wait_after_trigger()'s result, so
+ * a genuine >5 s refresh would still fall through to the caller and
+ * eventually epd_sleep()'s rail cut mid-waveform. Measured fulls run
+ * ~1.4 s against the 5 s cap (partials 300-500 ms), and changing error
+ * handling on the display path with no bench available to re-verify it is
+ * a worse trade than the residual risk. */
 void epd_full(const uint8_t *fb5000) {
     frame_write(fb5000);
     /* Mirror the same frame into RAM 0x26 (the "previous image" buffer)

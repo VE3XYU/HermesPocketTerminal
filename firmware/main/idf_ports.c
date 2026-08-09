@@ -94,13 +94,17 @@ void idf_ports_last_write_fail(idf_write_fail_t *out) {
  * fp and tmp are never both "new" data — tmp only outlives a successful
  * promotion when fp still holds the un-replaced old value.
  */
-static int rename_replacing(const char *tmp, const char *fp) {
+/* note_fail = 0 for st_read()'s best-effort orphan promotion: recording a
+ * "write failed: rename" during a READ clobbered the diagnostic that the
+ * provisioning write-failure prompt reports to the operator (final
+ * review, minor 5). Real writes pass 1. */
+static int rename_replacing(const char *tmp, const char *fp, int note_fail) {
     if (rename(tmp, fp) == 0) return 0;
     /* This first failure is the routine/expected FR_EXIST case (see
      * above) -- not diagnostic-worthy on its own, only the final one is. */
     remove(fp);
     if (rename(tmp, fp) == 0) return 0;
-    note_write_fail("rename");
+    if (note_fail) note_write_fail("rename");
     return -1;
 }
 
@@ -130,7 +134,7 @@ static int st_read(void *ctx, const char *path, void *buf, size_t cap, size_t *l
     if (read_whole_file(tmp, buf, cap, len) != 0) return -1;   /* genuinely missing */
 
     ESP_LOGW(TAG, "recovered orphaned tmp file for %s", path);
-    if (rename_replacing(tmp, fp) != 0)
+    if (rename_replacing(tmp, fp, 0) != 0)
         ESP_LOGW(TAG, "promotion of %s failed; will retry recovery on next read", path);
     /* Promotion is best-effort tidying, not required for this read to
      * succeed — the data is already in buf either way. */
@@ -165,7 +169,7 @@ static int st_write(void *ctx, const char *path, const void *data, size_t len) {
     /* tmp now holds the one durable copy of this write. From here on,
      * never remove(tmp) on a failure path — only a successful promotion
      * retires it. See the recovery contract above. */
-    if (rename_replacing(tmp, fp) != 0) return -1;   /* tmp intentionally left in place; step already noted */
+    if (rename_replacing(tmp, fp, 1) != 0) return -1;   /* tmp intentionally left in place; step already noted */
     return 0;
 }
 
