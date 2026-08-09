@@ -19,10 +19,29 @@
  * at 32; retry/backfill scan the newest 32). Trade-off, documented in
  * firmware/README.md: ids older than the retained window are forgotten
  * for listing and retry -- the WAV/sidecar files themselves stay on the
- * card. Safety rule: the index is NEVER destroyed here -- if the read or
+ * card. Compacting a legacy index whose unread tail already exceeds the
+ * old 16 KB read cap is a one-way door: that tail was already unreachable
+ * to every reader either way, but compaction deletes it outright, so a
+ * future firmware build that raised REC_INDEX_CAP could no longer recover
+ * it -- today's compaction is written against today's cap.
+ *
+ * Safety rule: the index is NEVER destroyed here -- if the read or
  * the rewrite fails, this falls through to the plain append and the
  * worst case is yesterday's behavior (oversized index, newest entries
- * unlistable), not a lost index. */
+ * unlistable), not a lost index. One narrow edge in that guarantee: before
+ * this change /rec/index was only ever appended to, so /rec/index.tmp
+ * could never exist; the rewrite below goes through st_write(), whose
+ * tmp-then-rename replace now creates one. If the process dies between
+ * that write and its rename, the compacted content is left stranded in
+ * the .tmp file while /rec/index itself still holds its pre-compaction
+ * (still valid) content -- normal reads are unaffected. But st_read()'s
+ * documented orphan-recovery contract promotes a "<path>.tmp" back to
+ * "<path>" whenever "<path>" becomes unreadable, so if /rec/index were to
+ * fail a read for an unrelated reason before the next successful
+ * compaction, recovery would resurrect the stale compacted snapshot and
+ * silently roll back every append made since. The next successful
+ * compaction overwrites the orphan and closes the window; it is narrow
+ * (requires two independent failures) but real. */
 #define REC_INDEX_COMPACT_AT 8192
 #define REC_INDEX_KEEP       128
 
