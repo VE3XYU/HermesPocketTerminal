@@ -147,7 +147,12 @@ first 16 KB, so once the file exceeds 8 KB an append first compacts it down to t
 newest 128 entries (atomic rewrite; on any failure it falls back to a plain append —
 the index is never destroyed). Trade-off: ids older than the retained 128 are forgotten
 for listing and upload-retry; the WAV and sidecar files themselves stay on the card
-indefinitely.
+indefinitely. This is implemented and host-tested (`test_rec_index`: a 400-append run
+that crosses the compaction threshold keeps newest-first listing exact and the on-disk
+file under the cap; a 200-append run under a forced write-failure fake proves the
+never-destroyed fallback) — it postdates checkpoint C7, so on-device confirmation
+would need a card carrying several hundred real recordings to trigger compaction
+naturally, which has not happened.
 
 **Capture IDs** are the SD filenames and the end-to-end idempotency key. With the RTC
 set they look like `c-YYYYMMDD-HHMMSS-xxxx`; if the PCF85063 has never been set (first

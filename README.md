@@ -12,7 +12,7 @@ A pocket-sized, battery-powered voice terminal for a personal AI assistant. Pres
 
 ## Status
 
-Protocol, bridge, and device firmware are all complete; the firmware is bench-verified end to end on real hardware (capture → upload → transcription → dashboard/notifications → spoken conversation replies). The golden request/response fixtures in `bridge/tests/fixtures/contract/` remain the wire reference both ends are tested against.
+Protocol, bridge, and device firmware are all complete; the firmware is bench-verified end to end on real hardware through checkpoints C1–C7 (capture → upload → transcription → dashboard/notifications → spoken conversation replies). The release wrap-up changes made after C7 — see `firmware/README.md` for the list — are host-tested only; the bench was not run again for them. The golden request/response fixtures in `bridge/tests/fixtures/contract/` remain the wire reference both ends are tested against.
 
 ## License
 
