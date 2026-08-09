@@ -1234,7 +1234,13 @@ static void show_outcome(capture_outcome_t out) {
  * host-tested in test_gesture); its behavior rides the target build. */
 static void play_reply_and_follow_up(capture_ctx_t *cx) {
     for (;;) {
-        /* One conversation turn: playback + 30 s window + one recording. */
+        /* This arm covers reply playback + the 30 s follow-up window; the
+         * follow-up RECORDING re-arms below, at the moment it starts. One
+         * arm used to cover all three phases, so a long TTS reply (~60 s+)
+         * followed by a 120 s dictation crossed the 210 s cap and
+         * awake_cap_cb deep-slept MID-WRITE -- the torn WAV was then
+         * correctly refused and the recording lost (final review,
+         * Important 3). Each phase alone fits its cap with margin. */
         awake_cap_arm(AWAKE_CAP_REC_S);
         ESP_LOGI(TAG, "playing reply %s", REPLY_FS);
         if (audio_play_wav(REPLY_FS, rec_held, NULL) != 0)
@@ -1268,6 +1274,10 @@ static void play_reply_and_follow_up(capture_ctx_t *cx) {
         }
 
         long bytes = 0;
+        awake_cap_arm(AWAKE_CAP_REC_S);   /* fresh cap for the recording phase:
+                                             the turn's first arm has been
+                                             burning since before playback
+                                             (final review, Important 3) */
         int rr = record_capture(&s_sc_next, s_sc.conversation_id, 0, &bytes);
         if (rr == 1) { screen_status("Too short"); break; }
         if (rr < 0)  { screen_status("SD full"); break; }
