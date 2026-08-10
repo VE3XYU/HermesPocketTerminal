@@ -78,10 +78,26 @@ class Pipeline:
         # Created after the early return: a duplicate upload of a finished
         # capture does no work and should not look like a measured run.
         timer = CaptureTimer(capture_id, monotonic=self._monotonic, clock=self._clock)
+        # _record_timing runs in this `finally`, which fires before the caller's
+        # own safety net (api._run_pipeline, or resume()) has a chance to write
+        # failed/pipeline_error to the capture row. Left alone, an unexpected
+        # exception would read back a capture that is still non-terminal with
+        # error IS NULL and record outcome=ok -- a timing row claiming success for
+        # a capture that never delivered anything. `override` captures that an
+        # exception escaped the body so `_record_timing` can fall back to it,
+        # while still letting the capture row's own error win (see there): a note
+        # whose write-ahead ingest_failed flag is already set must keep that
+        # outcome, not get overwritten by the generic pipeline_error. BaseException
+        # on purpose -- a cancelled task is not a success either -- and the bare
+        # `raise` re-raises the original exception unchanged.
+        override = None
         try:
             await self._process(capture, timer)
+        except BaseException:
+            override = "pipeline_error"
+            raise
         finally:
-            self._record_timing(capture_id, timer)
+            self._record_timing(capture_id, timer, override)
 
     async def _process(self, capture: Capture, timer: CaptureTimer) -> None:
         capture_id = capture.id
@@ -121,14 +137,24 @@ class Pipeline:
                 capture_id, remainder or transcript, capture.conversation_id, timer
             )
 
-    def _record_timing(self, capture_id: str, timer: CaptureTimer) -> None:
+    def _record_timing(
+        self, capture_id: str, timer: CaptureTimer, override: str | None = None
+    ) -> None:
         """Write the timing row. Swallows its own failures on purpose: a
         diagnostic that can lose someone's note is worse than no diagnostic.
         Runs in a `finally`, so an exception from the pipeline body still
-        propagates."""
+        propagates.
+
+        `override` is set by the caller when an exception escaped the pipeline
+        body. The capture row's own error still takes precedence over it: e.g.
+        `_finish_note`'s write-ahead `ingest_failed` flag must be preserved even
+        if the exception that ultimately escaped was some other unexpected error,
+        not the `AgentError` that flag anticipates.
+        """
         try:
             capture = self._captures.get(capture_id)
-            outcome = capture.error if capture is not None and capture.error else "ok"
+            error = capture.error if capture is not None else None
+            outcome = error or override or "ok"
             timing = timer.finish(outcome)
             log_timing(timing)
             self._timings.record(timing)

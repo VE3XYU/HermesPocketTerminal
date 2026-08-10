@@ -3,7 +3,7 @@ import itertools
 import pytest
 
 from htp_bridge.agent import AgentError, FakeAgentClient
-from htp_bridge.captures import CaptureStore
+from htp_bridge.captures import INGEST_FAILED, CaptureStore
 from htp_bridge.config import StorageConfig
 from htp_bridge.notifications import NotificationStore
 from htp_bridge.pipeline import Pipeline
@@ -640,3 +640,78 @@ async def test_timing_write_failure_does_not_fail_the_capture(parts, fake_clock)
 
     assert captures.get("c-1").state == "done"
     assert captures.get("c-1").error is None
+
+
+async def test_unexpected_exception_records_pipeline_error_and_still_propagates(
+    parts, fake_clock, db
+):
+    """Reproduces the reviewer's finding: an OSError from a full disk during
+    save_reply (the api._run_pipeline scenario) must not leave the timing row
+    saying outcome=ok for a capture that never delivered a reply -- and the
+    exception must still reach the caller's own safety net."""
+    captures, storage, notifications = parts
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "hey hermes what is on my list"})
+    agent = FakeAgentClient(reply_text="Milk and bread.")
+    upload(parts, "c-1")
+
+    class FullDiskStorage:
+        def upload_path(self, capture_id):
+            return storage.upload_path(capture_id)
+
+        def save_reply(self, capture_id, data):
+            raise OSError(28, "No space left on device")
+
+    pipeline = Pipeline(
+        captures=captures,
+        storage=FullDiskStorage(),
+        notifications=notifications,
+        speech=speech,
+        agent=agent,
+        salutation_prefixes=PREFIXES,
+        clock=fake_clock,
+        conversation_id_factory=lambda: "v-1",
+        timings=timings,
+        monotonic=StepMonotonic(),
+    )
+
+    with pytest.raises(OSError):
+        await pipeline.process("c-1")
+
+    (row,) = timings.recent()
+    assert row.outcome == "pipeline_error"
+    assert row.stages == {"transcribe": 1000, "agent": 1000, "synthesize": 1000, "save": 1000}
+    # The capture row itself is left non-terminal here; cleaning that up is
+    # api._run_pipeline's / resume()'s own safety net, a separate concern from
+    # what this timing row should say.
+    assert captures.get("c-1").state == "processing"
+
+
+async def test_unexpected_exception_after_write_ahead_flag_keeps_its_own_outcome(
+    parts, fake_clock, db
+):
+    """Ordering requirement: the capture row's own error must win over the
+    generic pipeline_error override. Otherwise a note whose write-ahead
+    ingest_failed flag is already set (see _finish_note) would lose that outcome
+    in the timing row when some other unexpected exception escapes ingest()."""
+    captures, storage, notifications = parts
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    upload(parts, "c-1")
+
+    class ExplodingAgent:
+        async def ingest(self, transcript, recorded_at):
+            raise RuntimeError("agent client misbehaving")
+
+    pipeline = build_timed(
+        parts, fake_clock, speech=speech, agent=ExplodingAgent(), timings=timings
+    )
+
+    with pytest.raises(RuntimeError):
+        await pipeline.process("c-1")
+
+    capture = captures.get("c-1")
+    assert capture.state == "done"
+    assert capture.error == INGEST_FAILED
+    (row,) = timings.recent()
+    assert row.outcome == "ingest_failed"
