@@ -23,6 +23,7 @@ from htp_bridge.notifications import NotificationStore
 from htp_bridge.pipeline import Pipeline
 from htp_bridge.speech import build_speech_provider
 from htp_bridge.storage import AudioStorage
+from htp_bridge.timing import TimingStore
 
 SWEEP_INTERVAL_SECONDS = 60
 PRUNE_INTERVAL_SECONDS = 3600
@@ -38,6 +39,7 @@ def build_deps(config: Config) -> tuple[Deps, HermesTools]:
     dashboard = DashboardStore(db, config.dashboard)
     devices = DeviceRegistry(db, config.devices)
     agent = AgentClient(config.agent)
+    timings = TimingStore(db)
     pipeline = Pipeline(
         captures=captures,
         storage=storage,
@@ -45,6 +47,7 @@ def build_deps(config: Config) -> tuple[Deps, HermesTools]:
         speech=build_speech_provider(config.speech),
         agent=agent,
         salutation_prefixes=config.salutations.prefixes,
+        timings=timings,
     )
     deps = Deps(
         server=config.server,

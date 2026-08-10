@@ -7,16 +7,27 @@ from typing import Callable
 
 from htp_bridge import salutation
 from htp_bridge.agent import AgentError
-from htp_bridge.captures import INGEST_FAILED, TERMINAL_STATES, CaptureStore
+from htp_bridge.captures import INGEST_FAILED, TERMINAL_STATES, Capture, CaptureStore
 from htp_bridge.notifications import NotificationStore
 from htp_bridge.speech import SpeechError
 from htp_bridge.storage import AudioStorage
+from htp_bridge.timing import CaptureTimer, NullTimingStore, TimingStore, log_timing
 
 log = logging.getLogger(__name__)
 
 
 def _default_conversation_id() -> str:
     return f"v-{uuid.uuid4().hex[:8]}"
+
+
+def _file_size(path) -> int | None:
+    """Upload size for the timing row. Absent audio is a real case (the crash
+    window resume() documents), so a missing file records nothing rather than
+    raising inside instrumentation."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
 
 
 class Pipeline:
@@ -39,6 +50,8 @@ class Pipeline:
         reply_grace_seconds: int = 90,
         clock: Callable[[], int] = lambda: int(time.time()),
         conversation_id_factory: Callable[[], str] = _default_conversation_id,
+        timings: TimingStore | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         # Captures whose ingest call is in flight right now. Deliberately in
         # memory and never persisted: the ingest-failed flag on disk cannot tell
@@ -54,24 +67,40 @@ class Pipeline:
         self._grace = reply_grace_seconds
         self._clock = clock
         self._new_conversation_id = conversation_id_factory
+        self._timings = timings or NullTimingStore()
+        self._monotonic = monotonic
 
     async def process(self, capture_id: str) -> None:
         capture = self._captures.get(capture_id)
         if capture is None or capture.state in TERMINAL_STATES:
             return
 
-        self._captures.set_state(capture_id, "transcribing")
+        # Created after the early return: a duplicate upload of a finished
+        # capture does no work and should not look like a measured run.
+        timer = CaptureTimer(capture_id, monotonic=self._monotonic, clock=self._clock)
         try:
-            transcript = await self._speech.transcribe(self._storage.upload_path(capture_id))
+            await self._process(capture, timer)
+        finally:
+            self._record_timing(capture_id, timer)
+
+    async def _process(self, capture: Capture, timer: CaptureTimer) -> None:
+        capture_id = capture.id
+        self._captures.set_state(capture_id, "transcribing")
+        upload_path = self._storage.upload_path(capture_id)
+        timer.note(audio_bytes=_file_size(upload_path))
+        try:
+            with timer.stage("transcribe"):
+                transcript = await self._speech.transcribe(upload_path)
         except (SpeechError, OSError):
             log.exception("capture %s: transcription failed", capture_id)
-            if self._storage.upload_path(capture_id).exists():
+            if upload_path.exists():
                 error = "transcription_failed"
             else:
                 error = "audio_missing"
             self._captures.set_state(capture_id, "failed", error=error)
             return
 
+        timer.note(transcript_chars=len(transcript))
         self._captures.set_transcript(capture_id, transcript)
         remainder = salutation.detect(transcript, self._prefixes)
 
@@ -84,11 +113,31 @@ class Pipeline:
         # follow-up into an orphaned note. The prompt is still the stripped
         # remainder when a salutation is present, and the full transcript otherwise.
         if remainder is None and capture.conversation_id is None:
-            await self._finish_note(capture_id, transcript, capture.recorded_at)
+            timer.set_kind("note")
+            await self._finish_note(capture_id, transcript, capture.recorded_at, timer)
         else:
-            await self._answer(capture_id, remainder or transcript, capture.conversation_id)
+            timer.set_kind("conversation")
+            await self._answer(
+                capture_id, remainder or transcript, capture.conversation_id, timer
+            )
 
-    async def _finish_note(self, capture_id: str, transcript: str, recorded_at: int | None) -> None:
+    def _record_timing(self, capture_id: str, timer: CaptureTimer) -> None:
+        """Write the timing row. Swallows its own failures on purpose: a
+        diagnostic that can lose someone's note is worse than no diagnostic.
+        Runs in a `finally`, so an exception from the pipeline body still
+        propagates."""
+        try:
+            capture = self._captures.get(capture_id)
+            outcome = capture.error if capture is not None and capture.error else "ok"
+            timing = timer.finish(outcome)
+            log_timing(timing)
+            self._timings.record(timing)
+        except Exception:
+            log.exception("capture %s: failed to record timing", capture_id)
+
+    async def _finish_note(
+        self, capture_id: str, transcript: str, recorded_at: int | None, timer: CaptureTimer
+    ) -> None:
         """Mark the note done first: the device is waiting, the agent is not.
 
         The ingest-failed flag is written *before* calling ingest, not only after
@@ -102,7 +151,8 @@ class Pipeline:
         self._captures.set_state(capture_id, "done", error=INGEST_FAILED)
         self._ingesting.add(capture_id)
         try:
-            await self._agent.ingest(transcript, recorded_at)
+            with timer.stage("agent"):
+                await self._agent.ingest(transcript, recorded_at)
         except AgentError:
             log.exception("capture %s: agent ingestion failed, queued for retry", capture_id)
             return
@@ -110,28 +160,35 @@ class Pipeline:
             self._ingesting.discard(capture_id)
         self._captures.set_state(capture_id, "done", error=None)
 
-    async def _answer(self, capture_id: str, prompt: str, conversation_id: str | None) -> None:
+    async def _answer(
+        self, capture_id: str, prompt: str, conversation_id: str | None, timer: CaptureTimer
+    ) -> None:
         self._captures.set_state(capture_id, "processing")
         conversation_id = conversation_id or self._new_conversation_id()
         self._captures.set_conversation(capture_id, conversation_id)
         history = self._captures.conversation_history(conversation_id, exclude_id=capture_id)
 
         try:
-            reply = await self._agent.converse(prompt, history)
+            with timer.stage("agent"):
+                reply = await self._agent.converse(prompt, history)
         except AgentError:
             log.exception("capture %s: agent unavailable", capture_id)
             self._captures.set_state(capture_id, "failed", error="agent_unavailable")
             return
 
+        timer.note(reply_chars=len(reply))
         try:
-            audio = await self._speech.synthesize(reply)
+            with timer.stage("synthesize"):
+                audio = await self._speech.synthesize(reply)
         except SpeechError:
             log.exception("capture %s: synthesis failed", capture_id)
             self._captures.set_state(capture_id, "failed", error="synthesis_failed")
             return
 
-        self._storage.save_reply(capture_id, audio)
-        self._captures.set_reply(capture_id, reply)
+        timer.note(reply_bytes=len(audio))
+        with timer.stage("save"):
+            self._storage.save_reply(capture_id, audio)
+            self._captures.set_reply(capture_id, reply)
 
     async def resume(self) -> int:
         """Reprocess captures that were mid-pipeline when the process last stopped.

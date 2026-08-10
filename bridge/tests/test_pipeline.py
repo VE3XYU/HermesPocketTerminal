@@ -514,3 +514,129 @@ async def test_resume_continues_past_a_capture_with_missing_audio(parts, fake_cl
     assert captures.get("c-1").error == "audio_missing"
     assert captures.get("c-2").state == "done"
     assert agent.ingested == [("Add milk", 1)]
+
+
+from htp_bridge.timing import TimingStore
+
+
+class StepMonotonic:
+    """Advances one second per call, so each stage measures exactly 1000 ms
+    regardless of how many calls the surrounding code makes."""
+
+    def __init__(self):
+        self._calls = 0
+
+    def __call__(self):
+        value = float(self._calls)
+        self._calls += 1
+        return value
+
+
+class ExplodingTimingStore:
+    def record(self, timing):
+        raise RuntimeError("disk full")
+
+
+def build_timed(parts, fake_clock, *, speech, agent, timings):
+    captures, storage, notifications = parts
+    conversations = itertools.count(1)
+    return Pipeline(
+        captures=captures,
+        storage=storage,
+        notifications=notifications,
+        speech=speech,
+        agent=agent,
+        salutation_prefixes=PREFIXES,
+        clock=fake_clock,
+        conversation_id_factory=lambda: f"v-{next(conversations)}",
+        timings=timings,
+        monotonic=StepMonotonic(),
+    )
+
+
+async def test_conversation_records_all_four_stages(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "hey hermes what is on my list"})
+    agent = FakeAgentClient(reply_text="Milk and bread.")
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "conversation"
+    assert row.outcome == "ok"
+    assert row.stages == {"transcribe": 1000, "agent": 1000, "synthesize": 1000, "save": 1000}
+    assert row.sizes["transcript_chars"] == len("hey hermes what is on my list")
+    assert row.sizes["reply_chars"] == len("Milk and bread.")
+    assert row.sizes["audio_bytes"] == len(b"RIFFfake")
+    assert row.sizes["reply_bytes"] == len(b"RIFF-fake-reply")
+    assert row.total_ms >= sum(row.stages.values())
+
+
+async def test_note_records_transcribe_and_agent_only(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "note"
+    assert row.outcome == "ok"
+    assert row.stages == {"transcribe": 1000, "agent": 1000}
+
+
+async def test_failed_transcription_records_a_partial_row(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcribe_error=SpeechError("boom"))
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "unknown"
+    assert row.outcome == "transcription_failed"
+    assert row.stages == {"transcribe": 1000}
+
+
+async def test_failed_ingest_records_ingest_failed_outcome(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient(error=AgentError("down"))
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "note"
+    assert row.outcome == "ingest_failed"
+
+
+async def test_already_terminal_capture_writes_no_timing_row(parts, fake_clock, db):
+    captures, _, _ = parts
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+    captures.set_state("c-1", "done")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    assert timings.recent() == []
+
+
+async def test_timing_write_failure_does_not_fail_the_capture(parts, fake_clock):
+    captures, _, _ = parts
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+
+    pipeline = build_timed(
+        parts, fake_clock, speech=speech, agent=agent, timings=ExplodingTimingStore()
+    )
+    await pipeline.process("c-1")
+
+    assert captures.get("c-1").state == "done"
+    assert captures.get("c-1").error is None

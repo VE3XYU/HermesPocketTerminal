@@ -107,3 +107,11 @@ def test_main_reports_missing_config_without_traceback(tmp_path, capsys):
     exit_code = main(["--config", str(tmp_path / "absent.toml")])
     assert exit_code == 1
     assert "not found" in capsys.readouterr().err
+
+
+def test_build_deps_gives_the_pipeline_a_real_timing_store(config_path):
+    from htp_bridge.timing import NullTimingStore, TimingStore
+
+    deps, _ = build_deps(load_config(config_path))
+    assert isinstance(deps.pipeline._timings, TimingStore)
+    assert not isinstance(deps.pipeline._timings, NullTimingStore)
