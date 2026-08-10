@@ -3,7 +3,7 @@ import itertools
 import pytest
 
 from htp_bridge.agent import AgentError, FakeAgentClient
-from htp_bridge.captures import CaptureStore
+from htp_bridge.captures import INGEST_FAILED, CaptureStore
 from htp_bridge.config import StorageConfig
 from htp_bridge.notifications import NotificationStore
 from htp_bridge.pipeline import Pipeline
@@ -514,3 +514,204 @@ async def test_resume_continues_past_a_capture_with_missing_audio(parts, fake_cl
     assert captures.get("c-1").error == "audio_missing"
     assert captures.get("c-2").state == "done"
     assert agent.ingested == [("Add milk", 1)]
+
+
+from htp_bridge.timing import TimingStore
+
+
+class StepMonotonic:
+    """Advances one second per call, so each stage measures exactly 1000 ms
+    regardless of how many calls the surrounding code makes."""
+
+    def __init__(self):
+        self._calls = 0
+
+    def __call__(self):
+        value = float(self._calls)
+        self._calls += 1
+        return value
+
+
+class ExplodingTimingStore:
+    def record(self, timing):
+        raise RuntimeError("disk full")
+
+
+def build_timed(parts, fake_clock, *, speech, agent, timings):
+    captures, storage, notifications = parts
+    conversations = itertools.count(1)
+    return Pipeline(
+        captures=captures,
+        storage=storage,
+        notifications=notifications,
+        speech=speech,
+        agent=agent,
+        salutation_prefixes=PREFIXES,
+        clock=fake_clock,
+        conversation_id_factory=lambda: f"v-{next(conversations)}",
+        timings=timings,
+        monotonic=StepMonotonic(),
+    )
+
+
+async def test_conversation_records_all_four_stages(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "hey hermes what is on my list"})
+    agent = FakeAgentClient(reply_text="Milk and bread.")
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "conversation"
+    assert row.outcome == "ok"
+    assert row.stages == {"transcribe": 1000, "agent": 1000, "synthesize": 1000, "save": 1000}
+    assert row.sizes["transcript_chars"] == len("hey hermes what is on my list")
+    assert row.sizes["reply_chars"] == len("Milk and bread.")
+    assert row.sizes["audio_bytes"] == len(b"RIFFfake")
+    assert row.sizes["reply_bytes"] == len(b"RIFF-fake-reply")
+    assert row.total_ms >= sum(row.stages.values())
+
+
+async def test_note_records_transcribe_and_agent_only(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "note"
+    assert row.outcome == "ok"
+    assert row.stages == {"transcribe": 1000, "agent": 1000}
+
+
+async def test_failed_transcription_records_a_partial_row(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcribe_error=SpeechError("boom"))
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "unknown"
+    assert row.outcome == "transcription_failed"
+    assert row.stages == {"transcribe": 1000}
+
+
+async def test_failed_ingest_records_ingest_failed_outcome(parts, fake_clock, db):
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient(error=AgentError("down"))
+    upload(parts, "c-1")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    (row,) = timings.recent()
+    assert row.kind == "note"
+    assert row.outcome == "ingest_failed"
+
+
+async def test_already_terminal_capture_writes_no_timing_row(parts, fake_clock, db):
+    captures, _, _ = parts
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+    captures.set_state("c-1", "done")
+
+    await build_timed(parts, fake_clock, speech=speech, agent=agent, timings=timings).process("c-1")
+
+    assert timings.recent() == []
+
+
+async def test_timing_write_failure_does_not_fail_the_capture(parts, fake_clock):
+    captures, _, _ = parts
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    agent = FakeAgentClient()
+    upload(parts, "c-1")
+
+    pipeline = build_timed(
+        parts, fake_clock, speech=speech, agent=agent, timings=ExplodingTimingStore()
+    )
+    await pipeline.process("c-1")
+
+    assert captures.get("c-1").state == "done"
+    assert captures.get("c-1").error is None
+
+
+async def test_unexpected_exception_records_pipeline_error_and_still_propagates(
+    parts, fake_clock, db
+):
+    """Reproduces the reviewer's finding: an OSError from a full disk during
+    save_reply (the api._run_pipeline scenario) must not leave the timing row
+    saying outcome=ok for a capture that never delivered a reply -- and the
+    exception must still reach the caller's own safety net."""
+    captures, storage, notifications = parts
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "hey hermes what is on my list"})
+    agent = FakeAgentClient(reply_text="Milk and bread.")
+    upload(parts, "c-1")
+
+    class FullDiskStorage:
+        def upload_path(self, capture_id):
+            return storage.upload_path(capture_id)
+
+        def save_reply(self, capture_id, data):
+            raise OSError(28, "No space left on device")
+
+    pipeline = Pipeline(
+        captures=captures,
+        storage=FullDiskStorage(),
+        notifications=notifications,
+        speech=speech,
+        agent=agent,
+        salutation_prefixes=PREFIXES,
+        clock=fake_clock,
+        conversation_id_factory=lambda: "v-1",
+        timings=timings,
+        monotonic=StepMonotonic(),
+    )
+
+    with pytest.raises(OSError):
+        await pipeline.process("c-1")
+
+    (row,) = timings.recent()
+    assert row.outcome == "pipeline_error"
+    assert row.stages == {"transcribe": 1000, "agent": 1000, "synthesize": 1000, "save": 1000}
+    # The capture row itself is left non-terminal here; cleaning that up is
+    # api._run_pipeline's / resume()'s own safety net, a separate concern from
+    # what this timing row should say.
+    assert captures.get("c-1").state == "processing"
+
+
+async def test_unexpected_exception_after_write_ahead_flag_keeps_its_own_outcome(
+    parts, fake_clock, db
+):
+    """Ordering requirement: the capture row's own error must win over the
+    generic pipeline_error override. Otherwise a note whose write-ahead
+    ingest_failed flag is already set (see _finish_note) would lose that outcome
+    in the timing row when some other unexpected exception escapes ingest()."""
+    captures, storage, notifications = parts
+    timings = TimingStore(db)
+    speech = FakeSpeechProvider(transcripts={"c-1": "Add milk to the shopping list"})
+    upload(parts, "c-1")
+
+    class ExplodingAgent:
+        async def ingest(self, transcript, recorded_at):
+            raise RuntimeError("agent client misbehaving")
+
+    pipeline = build_timed(
+        parts, fake_clock, speech=speech, agent=ExplodingAgent(), timings=timings
+    )
+
+    with pytest.raises(RuntimeError):
+        await pipeline.process("c-1")
+
+    capture = captures.get("c-1")
+    assert capture.state == "done"
+    assert capture.error == INGEST_FAILED
+    (row,) = timings.recent()
+    assert row.outcome == "ingest_failed"

@@ -46,6 +46,23 @@ CREATE TABLE IF NOT EXISTS device_status (
     battery   INTEGER,
     last_seen INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS capture_timings (
+    capture_id       TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    outcome          TEXT NOT NULL,
+    started_at       INTEGER NOT NULL,
+    total_ms         INTEGER NOT NULL,
+    transcribe_ms    INTEGER,
+    agent_ms         INTEGER,
+    synthesize_ms    INTEGER,
+    save_ms          INTEGER,
+    audio_bytes      INTEGER,
+    transcript_chars INTEGER,
+    reply_chars      INTEGER,
+    reply_bytes      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_capture_timings_started ON capture_timings(started_at);
 """
 
 

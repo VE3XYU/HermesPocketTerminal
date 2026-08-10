@@ -85,6 +85,45 @@ without polling the agent directly.
    - `curl -i https://terminal.example.com/htp/v1/dashboard` from outside the host
      returns `401` without a bearer token, confirming the public route is protected.
 
+## Timings
+
+Every processed capture writes one row to the `capture_timings` table -- per-stage
+milliseconds (`transcribe`, `agent`, `synthesize`, `save`), outcome, and payload sizes --
+and one log line on the `htp_bridge.timing` logger, greppable with the fixed token
+`timing`. No migration is needed: the table appears on the bridge's next start.
+
+Read it back with `htp-timings`:
+
+```bash
+htp-timings --config config.toml
+```
+
+prints a per-stage summary (count, min, p50, p90, max per kind and stage) plus the
+two reply latencies the `captures` table already knows: `upload -> reply_ready` is
+bridge work, and `reply_ready -> fetched` is how long the device took to notice a reply
+was ready and download it -- time no bridge-side optimization can touch. Pass
+`--recent N` (N > 0) to list the N most recent captures one line each, with their
+size correlates (`audio`, `transcript`, `reply`, `reply_wav`) alongside the
+durations, instead of the summary.
+
+The summary aggregates successful captures only -- a timed-out or failed capture's
+duration is not a representative sample of that stage's normal cost, and at the
+small sample sizes this tool is used at, one such row can dominate the p90 or look
+like an implausibly fast success. Excluded captures are counted underneath the
+table instead, by outcome (e.g. `agent_unavailable`, `ingest_failed`). `p50` uses
+nearest-rank on the sorted sample (no interpolation), so on two samples it
+legitimately reports the lower one -- `min == p50` there is correct, not a bug.
+
+On the deployed host, run it as the service user against the database path directly,
+since the config file is mode 600 and `/var/lib/htp-bridge` belongs to that user. This
+is not just a permissions convenience: `Database` opens the file read-write and runs
+the schema script on connect, and running it as root while the service is stopped can
+leave root-owned `-wal`/`-shm` files behind that the service user then cannot write to.
+
+```bash
+sudo -u htp /opt/htp-bridge/venv/bin/htp-timings --db /var/lib/htp-bridge/htp.db
+```
+
 ## Test
 
 ```bash
