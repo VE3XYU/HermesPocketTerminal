@@ -85,6 +85,32 @@ without polling the agent directly.
    - `curl -i https://terminal.example.com/htp/v1/dashboard` from outside the host
      returns `401` without a bearer token, confirming the public route is protected.
 
+## Timings
+
+Every processed capture writes one row to the `capture_timings` table -- per-stage
+milliseconds (`transcribe`, `agent`, `synthesize`, `save`), outcome, and payload sizes --
+and one log line on the `htp_bridge.timing` logger, greppable with the fixed token
+`timing`. No migration is needed: the table appears on the bridge's next start.
+
+Read it back with `htp-timings`:
+
+```bash
+htp-timings --config config.toml
+```
+
+prints a per-stage summary (count, min, median, p90, max per kind and stage) plus the
+two reply latencies the `captures` table already knows: `upload -> reply_ready` is
+bridge work, and `reply_ready -> fetched` is how long the device took to notice a reply
+was ready and download it -- time no bridge-side optimization can touch. Pass
+`--recent N` to list the N most recent captures one line each, instead of the summary.
+
+On the deployed host, run it as the service user against the database path directly,
+since the config file is mode 600 and `/var/lib/htp-bridge` belongs to that user:
+
+```bash
+sudo -u htp /opt/htp-bridge/venv/bin/htp-timings --db /var/lib/htp-bridge/htp.db
+```
+
 ## Test
 
 ```bash

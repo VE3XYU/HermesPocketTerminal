@@ -29,6 +29,20 @@ class Capture:
     redirected: bool
 
 
+@dataclass(frozen=True)
+class ReplyLatency:
+    """How long a conversation took, split at the point the device took over.
+
+    `pipeline_seconds` is bridge work; `download_seconds` is how long the device
+    took to notice reply_ready and fetch the WAV -- time no bridge-side
+    optimization can touch.
+    """
+
+    capture_id: str
+    pipeline_seconds: int
+    download_seconds: int | None
+
+
 def _to_capture(row: sqlite3.Row) -> Capture:
     return Capture(
         id=row["id"],
@@ -179,6 +193,31 @@ class CaptureStore:
                 (INGEST_FAILED,),
             ).fetchall()
         return [_to_capture(row) for row in rows]
+
+    def reply_latencies(self, limit: int = 50) -> list[ReplyLatency]:
+        with self._db.read() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, reply_ready_at, reply_downloaded_at
+                  FROM captures
+                 WHERE reply_ready_at IS NOT NULL
+                 ORDER BY reply_ready_at DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            ReplyLatency(
+                capture_id=row["id"],
+                pipeline_seconds=row["reply_ready_at"] - row["created_at"],
+                download_seconds=(
+                    row["reply_downloaded_at"] - row["reply_ready_at"]
+                    if row["reply_downloaded_at"] is not None
+                    else None
+                ),
+            )
+            for row in rows
+        ]
 
     def conversation_history(self, conversation_id: str, *, exclude_id: str) -> list[tuple[str, str]]:
         """Completed (user, assistant) exchanges in this conversation, oldest first."""

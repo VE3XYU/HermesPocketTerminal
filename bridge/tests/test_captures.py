@@ -152,3 +152,21 @@ def test_clearing_the_error_removes_it_from_the_backlog(db, fake_clock):
     s.set_state("c-1", "done", error=None)
 
     assert s.ingestion_backlog() == []
+
+
+def test_reply_latencies_reports_pipeline_and_download_gaps(db, fake_clock):
+    s = store(db, fake_clock)
+    s.create(capture_id="c-1", device_id="pocket-01", recorded_at=1, conversation_id=None)
+    fake_clock.advance(20)
+    s.set_reply("c-1", "Milk and bread.")
+    fake_clock.advance(6)
+    s.mark_downloaded("c-1")
+
+    s.create(capture_id="c-2", device_id="pocket-01", recorded_at=1, conversation_id=None)
+    fake_clock.advance(5)
+    s.set_reply("c-2", "Still thinking.")
+
+    latencies = {row.capture_id: row for row in s.reply_latencies()}
+    assert latencies["c-1"].pipeline_seconds == 20
+    assert latencies["c-1"].download_seconds == 6
+    assert latencies["c-2"].download_seconds is None
