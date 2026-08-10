@@ -98,14 +98,27 @@ Read it back with `htp-timings`:
 htp-timings --config config.toml
 ```
 
-prints a per-stage summary (count, min, median, p90, max per kind and stage) plus the
+prints a per-stage summary (count, min, p50, p90, max per kind and stage) plus the
 two reply latencies the `captures` table already knows: `upload -> reply_ready` is
 bridge work, and `reply_ready -> fetched` is how long the device took to notice a reply
 was ready and download it -- time no bridge-side optimization can touch. Pass
-`--recent N` to list the N most recent captures one line each, instead of the summary.
+`--recent N` (N > 0) to list the N most recent captures one line each, with their
+size correlates (`audio`, `transcript`, `reply`, `reply_wav`) alongside the
+durations, instead of the summary.
+
+The summary aggregates successful captures only -- a timed-out or failed capture's
+duration is not a representative sample of that stage's normal cost, and at the
+small sample sizes this tool is used at, one such row can dominate the p90 or look
+like an implausibly fast success. Excluded captures are counted underneath the
+table instead, by outcome (e.g. `agent_unavailable`, `ingest_failed`). `p50` uses
+nearest-rank on the sorted sample (no interpolation), so on two samples it
+legitimately reports the lower one -- `min == p50` there is correct, not a bug.
 
 On the deployed host, run it as the service user against the database path directly,
-since the config file is mode 600 and `/var/lib/htp-bridge` belongs to that user:
+since the config file is mode 600 and `/var/lib/htp-bridge` belongs to that user. This
+is not just a permissions convenience: `Database` opens the file read-write and runs
+the schema script on connect, and running it as root while the service is stopped can
+leave root-owned `-wal`/`-shm` files behind that the service user then cannot write to.
 
 ```bash
 sudo -u htp /opt/htp-bridge/venv/bin/htp-timings --db /var/lib/htp-bridge/htp.db

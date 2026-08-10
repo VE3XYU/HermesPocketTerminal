@@ -1190,14 +1190,21 @@ Note in that section that the table needs no migration — it appears on the nex
 - [ ] **Step 11: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest tests/ -q`
-Expected: `277 passed`.
+Expected: `293 passed` (278 from the original four tasks, plus 15 added during the
+post-implementation review pass that fixed outcome tracking, the failed/ok
+split in `summary()`, and the readout's edge cases).
 
 - [ ] **Step 12: Verify the script is installed and runs**
 
 ```bash
 .venv/bin/pip install -e ".[dev]" >/dev/null && .venv/bin/htp-timings --db /tmp/nonexistent-timing-check.db
 ```
-Expected: prints `No timings recorded yet.` and exits 0 (the `Database` constructor creates an empty database).
+Expected (post-review-fix; see the design doc's changelog): prints
+`no such database: /tmp/nonexistent-timing-check.db` to stderr and exits 1,
+without creating the file. The `Database` constructor would otherwise create
+an empty database silently, making a typo'd `--db` path indistinguishable
+from a real, empty one -- caught in the post-implementation review and fixed
+before merge.
 
 - [ ] **Step 13: Commit**
 
@@ -1211,7 +1218,7 @@ git commit -m "feat(bridge): add htp-timings readout for stage and reply latenci
 
 ## Done criteria
 
-- `.venv/bin/python -m pytest tests/ -q` reports 277 passed.
+- `.venv/bin/python -m pytest tests/ -q` reports 293 passed.
 - A conversation processed through `--mock` or a real capture writes one `capture_timings` row and one `htp_bridge.timing` log line.
 - `htp-timings` prints a per-stage summary plus the two reply latencies.
 - Nothing in `git diff main` touches the HTP wire protocol, the device firmware, or the response shape of any endpoint.

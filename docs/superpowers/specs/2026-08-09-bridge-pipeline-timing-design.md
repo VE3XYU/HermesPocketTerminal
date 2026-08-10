@@ -131,14 +131,25 @@ emits it on the dedicated `htp_bridge.timing` logger.
 class TimingStore:
     def record(self, timing: CaptureTiming) -> None: ...        # INSERT OR REPLACE
     def recent(self, limit: int = 20) -> list[CaptureTiming]: ...
-    def summary(self) -> list[StageSummary]: ...   # per (kind, stage)
+    def summary(self) -> list[StageSummary]: ...        # per (kind, stage), outcome='ok' only
+    def failure_counts(self) -> dict[str, int]: ...     # non-'ok' rows, grouped by outcome slug
 ```
 
 `StageSummary` carries `kind`, `stage`, `count`, `min_ms`, `median_ms`, `p90_ms`,
 `max_ms`. Percentiles use nearest-rank on the sorted sample so the test is
 deterministic.
 
-`NullTimingStore` implements the same three methods as no-ops.
+`summary()` aggregates only rows with `outcome = 'ok'`. A failed capture's
+duration is not a representative sample of that stage's normal cost -- an
+`agent_unavailable` timeout dwarfs every real agent call, and a fast failure
+(an ingest rejected immediately) reads as an implausibly quick success. At the
+handful-of-captures sample sizes this tool is used at, one such row can own
+the p90 outright. `failure_counts()` reports what was excluded, as a count per
+outcome slug, so the readout can say what it left out instead of silently
+dropping it. (Corrected in post-implementation review; see "Review fixes"
+below -- the original cut pooled every outcome into one sample.)
+
+`NullTimingStore` implements the same four methods as no-ops.
 
 ### `pipeline.py`
 
@@ -161,6 +172,14 @@ separately. A note whose agent ingest failed therefore lands as
 `outcome=ingest_failed` for free, because `_finish_note` already writes that
 write-ahead flag before calling the agent.
 
+`process()` also catches `BaseException` around the call into `_process()` and
+records an `override = "pipeline_error"` when one escapes, then re-raises it
+unchanged (corrected in post-implementation review; see below). `_record_timing`
+uses `capture.error or override or "ok"` -- the capture row's own error still
+wins, so `_finish_note`'s write-ahead `ingest_failed` flag survives an
+unrelated exception, but an unexpected failure with no capture-row error no
+longer reads back as `outcome=ok`.
+
 The emit step is wrapped so a failing timing write logs and is swallowed. A
 diagnostic that can lose someone's note is worse than no diagnostic.
 
@@ -179,13 +198,21 @@ A `htp-timings` console script.
 htp-timings [--db PATH | --config PATH] [--recent N]
 ```
 
-Default output is the per-stage summary split by kind, followed by the
-whole-pipeline and device-lag figures. `--recent N` lists individual rows instead.
+Default output is the per-stage summary split by kind, followed by the excluded
+failure counts (if any) and then the whole-pipeline and device-lag figures.
+`--recent N` (N > 0) lists individual rows instead, each with its size
+correlates alongside the durations.
 
 `--db` exists alongside `--config` because the config file is mode 600 and the state
 directory belongs to the service user; in practice the command runs as that user
 against the database path directly. The exact invocation goes in `bridge/README.md`
 rather than being something to remember.
+
+Both entry points were tightened in post-implementation review (see "Review
+fixes" below): the readout requires `db_path.exists()` before opening it, so a
+typo'd `--db` path is reported and exits 1 instead of silently creating an
+empty database; and `--recent` only takes the recent-rows branch for a
+positive value, since SQLite treats `LIMIT -1` as unbounded.
 
 ## Log format
 
@@ -225,6 +252,41 @@ Tests first, per the plan's global constraints. All 252 existing tests stay gree
 `tests/test_timing_report.py`
 
 - Rendering of both output modes from seeded rows.
+
+## Review fixes (post-implementation, before merge)
+
+A whole-branch review after all four tasks landed found three correctness gaps
+and several readability issues. Fixed, each with a regression test:
+
+- **`summary()` pooled failed and successful captures together.** A timeout
+  could own the p90 outright, and a failure that happened to be fast read as
+  an implausibly quick success. `summary()` now aggregates `outcome = 'ok'`
+  rows only; `TimingStore.failure_counts()` reports what it excluded, and
+  `render_summary` prints that beneath the table.
+- **An unexpected exception recorded `outcome=ok`.** `_record_timing` ran in
+  `process()`'s `finally`, before the caller's own safety net
+  (`api._run_pipeline`, `resume()`) had written `failed`/`pipeline_error` to
+  the capture row, so it read back a non-terminal row with `error IS NULL` and
+  defaulted to `"ok"`. `process()` now catches `BaseException`, records an
+  `override = "pipeline_error"`, and re-raises unchanged; `_record_timing`
+  uses `capture.error or override or "ok"` so a write-ahead flag (e.g.
+  `_finish_note`'s `ingest_failed`) still wins.
+- **`render_summary`'s empty-table guard discarded the reply latencies.** A
+  freshly redeployed host has an empty `capture_timings` table but a
+  `captures` table with real history. The guard now suppresses only the stage
+  table (printing "No per-stage timings recorded yet.") and still renders the
+  latency block when there's data for it.
+- Minor: the summary header's numeric columns are 9 wide to match the
+  `{value:>7}ms` data cells (was 8, so the rule under-ran and `max` sat off
+  its column); the median column is labelled `p50` rather than `med` (a
+  correct nearest-rank `min == p50` on two samples read as a bug under the old
+  label); `render_recent`'s `capture_id` column is 24 wide, matching the real
+  22-character `c-YYYYMMDD-HHMMSS-XXXX` format; `--recent` rows now include
+  size correlates via the new `timing.format_sizes()` helper (shared with
+  `as_log_line()`); `--recent` with a value `<= 0` falls back to the summary
+  view rather than passing a negative `LIMIT` to SQLite; `htp-timings` checks
+  `db_path.exists()` before opening it, so a typo'd `--db` path is reported to
+  stderr and exits 1 instead of silently creating an empty database.
 
 ## Files touched
 
