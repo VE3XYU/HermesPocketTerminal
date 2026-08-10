@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from htp_bridge.captures import CaptureStore, ReplyLatency
-from htp_bridge.config import load_config
+from htp_bridge.config import ConfigError, load_config
 from htp_bridge.db import Database
 from htp_bridge.timing import STAGES, CaptureTiming, StageSummary, TimingStore
 
@@ -72,7 +73,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    db_path = Path(args.db) if args.db else load_config(Path(args.config)).storage.db_path
+    if args.db:
+        db_path = Path(args.db)
+    else:
+        try:
+            db_path = load_config(Path(args.config)).storage.db_path
+        except ConfigError as exc:
+            print(f"configuration error: {exc}", file=sys.stderr)
+            return 1
+
     db = Database(db_path)
     try:
         timings = TimingStore(db)

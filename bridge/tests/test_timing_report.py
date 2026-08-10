@@ -1,6 +1,6 @@
 from htp_bridge.captures import ReplyLatency
 from htp_bridge.timing import CaptureTiming, StageSummary
-from htp_bridge.timing_report import render_recent, render_summary
+from htp_bridge.timing_report import main, render_recent, render_summary
 
 
 def test_render_summary_groups_by_kind_and_shows_device_lag():
@@ -40,3 +40,12 @@ def test_render_recent_lists_one_line_per_capture():
     assert out.count("\n") >= 1
     assert "c-1" in out and "c-2" in out
     assert "ingest_failed" in out
+
+
+def test_main_reports_a_missing_config_cleanly_instead_of_raising(capsys):
+    exit_code = main(["--config", "/nonexistent/path.toml"])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "configuration error" in err
+    assert "/nonexistent/path.toml" in err
