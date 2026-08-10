@@ -1,6 +1,6 @@
 import pytest
 
-from htp_bridge.timing import CaptureTimer, CaptureTiming
+from htp_bridge.timing import CaptureTimer, CaptureTiming, format_sizes
 
 
 class ScriptedMonotonic:
@@ -170,3 +170,52 @@ def test_null_store_records_nothing(db):
     store.record(timing("c-1"))
     assert store.recent() == []
     assert store.summary() == []
+    assert store.failure_counts() == {}
+
+
+def test_summary_excludes_failed_captures_from_aggregation(db):
+    store = TimingStore(db)
+    # A fast "success" sample of 4800ms would be a plausible ingest time, but
+    # here it's a failed ingest -- it must not be read as a fast successful one.
+    store.record(
+        timing("c-1", kind="note", outcome="ok", stages={"agent": 9000}, total_ms=9100)
+    )
+    store.record(
+        timing(
+            "c-2", kind="note", outcome="ingest_failed", stages={"agent": 4800}, total_ms=4900
+        )
+    )
+    # A timeout that would otherwise own the p90 outright at this sample size.
+    store.record(
+        timing(
+            "c-3",
+            kind="conversation",
+            outcome="agent_unavailable",
+            stages={"agent": 28400},
+            total_ms=28500,
+        )
+    )
+
+    summaries = store.summary()
+
+    note_agent = next(s for s in summaries if s.kind == "note" and s.stage == "agent")
+    assert note_agent.count == 1
+    assert (note_agent.min_ms, note_agent.max_ms) == (9000, 9000)
+    assert not any(s.kind == "conversation" for s in summaries), (
+        "the only conversation sample is a failure and must not surface at all"
+    )
+
+
+def test_failure_counts_reports_excluded_rows_by_outcome_slug(db):
+    store = TimingStore(db)
+    store.record(timing("c-1", outcome="ok"))
+    store.record(timing("c-2", kind="note", outcome="ingest_failed"))
+    store.record(timing("c-3", kind="note", outcome="ingest_failed"))
+    store.record(timing("c-4", kind="conversation", outcome="agent_unavailable"))
+
+    assert store.failure_counts() == {"ingest_failed": 2, "agent_unavailable": 1}
+
+
+def test_format_sizes_only_includes_present_sizes():
+    assert format_sizes({}) == ""
+    assert format_sizes({"audio_bytes": 8, "reply_chars": 12}) == "audio=8B reply=12c"

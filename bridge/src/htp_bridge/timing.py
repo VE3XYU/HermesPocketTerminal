@@ -26,6 +26,19 @@ def _ms(seconds: float) -> int:
     return int(round(seconds * 1000))
 
 
+def format_sizes(sizes: dict[str, int]) -> str:
+    """Render size correlates in the compact `label=valueunit` form shared by the
+    log line and the `--recent` table, e.g. `audio=131116B transcript=42c`. Only
+    the sizes actually present are shown -- a note has no reply sizes -- and the
+    result is `""` when none are."""
+    parts = []
+    for name in SIZES:
+        if name in sizes:
+            label, unit = _SIZE_LABELS[name]
+            parts.append(f"{label}={sizes[name]}{unit}")
+    return " ".join(parts)
+
+
 @dataclass(frozen=True)
 class CaptureTiming:
     """One capture's measured pipeline run.
@@ -50,10 +63,9 @@ class CaptureTiming:
             f"total={self.total_ms}ms",
         ]
         parts += [f"{name}={self.stages[name]}ms" for name in STAGES if name in self.stages]
-        for name in SIZES:
-            if name in self.sizes:
-                label, unit = _SIZE_LABELS[name]
-                parts.append(f"{label}={self.sizes[name]}{unit}")
+        sizes = format_sizes(self.sizes)
+        if sizes:
+            parts.append(sizes)
         return " ".join(parts)
 
 
@@ -86,6 +98,11 @@ class CaptureTimer:
 
         A stage that times out is the most informative sample available and it
         exists only on the exception path.
+
+        The `ValueError` below is deliberately unguarded, unlike `_record_timing`
+        and `_file_size` in pipeline.py: every call site is exercised by the
+        pipeline tests, so a typo in a stage name cannot ship and does not need a
+        runtime fallback here.
         """
         if name not in STAGES:
             raise ValueError(f"unknown stage '{name}'")
@@ -98,7 +115,11 @@ class CaptureTimer:
     def note(self, **sizes: int | None) -> None:
         """Attach size correlates. A duration is not comparable across captures
         without them: synthesis scales with reply length, transcription with audio
-        length."""
+        length.
+
+        Same reasoning as `stage()`: the `ValueError` here is unguarded because
+        every call site is covered by the pipeline tests.
+        """
         for name, value in sizes.items():
             if name not in SIZES:
                 raise ValueError(f"unknown size '{name}'")
@@ -193,8 +214,20 @@ class TimingStore:
         return [_to_timing(row) for row in rows]
 
     def summary(self) -> list[StageSummary]:
+        """Aggregate successful captures only.
+
+        A failed capture's stage durations are not representative samples of that
+        stage's normal cost -- an `agent_unavailable` timeout dwarfs every real
+        agent call, and a fast failure (e.g. an ingest rejected immediately) reads
+        as an implausibly quick success. At the handful-of-captures sample sizes
+        this tool is used at, one such row can own the p90 outright. Failed rows
+        are counted separately by `failure_counts()` instead of being pooled in
+        here.
+        """
         with self._db.read() as conn:
-            rows = conn.execute("SELECT * FROM capture_timings").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM capture_timings WHERE outcome = 'ok'"
+            ).fetchall()
 
         samples: dict[tuple[str, str], list[int]] = {}
         for row in rows:
@@ -219,6 +252,19 @@ class TimingStore:
             )
         return summaries
 
+    def failure_counts(self) -> dict[str, int]:
+        """Count of non-`ok` rows per outcome slug, so the readout can report what
+        `summary()` excluded instead of silently dropping it."""
+        with self._db.read() as conn:
+            rows = conn.execute(
+                """
+                SELECT outcome, COUNT(*) AS n FROM capture_timings
+                 WHERE outcome != 'ok'
+                 GROUP BY outcome
+                """
+            ).fetchall()
+        return {row["outcome"]: row["n"] for row in rows}
+
 
 class NullTimingStore:
     """Default for a Pipeline built without persistence, so the pipeline has one
@@ -232,3 +278,6 @@ class NullTimingStore:
 
     def summary(self) -> list[StageSummary]:
         return []
+
+    def failure_counts(self) -> dict[str, int]:
+        return {}
