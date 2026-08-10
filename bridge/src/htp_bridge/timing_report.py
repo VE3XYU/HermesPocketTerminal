@@ -7,21 +7,43 @@ from pathlib import Path
 from htp_bridge.captures import CaptureStore, ReplyLatency
 from htp_bridge.config import ConfigError, load_config
 from htp_bridge.db import Database
-from htp_bridge.timing import STAGES, CaptureTiming, StageSummary, TimingStore
+from htp_bridge.timing import STAGES, CaptureTiming, StageSummary, TimingStore, format_sizes
 
-_HEADER = f"{'kind':<13} {'stage':<11} {'n':>4} {'min':>8} {'med':>8} {'p90':>8} {'max':>8}"
+# Numeric columns are 9 wide to match the data rows below, where each cell is a
+# 7-wide right-justified number followed by the fixed 2-char "ms" suffix
+# (`{value:>7}ms`). Keep these in lockstep -- a rule of `"-" * len(_HEADER)`
+# only lines up under the data if the header is exactly as wide as they are.
+_HEADER = f"{'kind':<13} {'stage':<11} {'n':>4} {'min':>9} {'p50':>9} {'p90':>9} {'max':>9}"
 
 
-def render_summary(summaries: list[StageSummary], latencies: list[ReplyLatency]) -> str:
-    if not summaries:
+def render_summary(
+    summaries: list[StageSummary],
+    latencies: list[ReplyLatency],
+    failures: dict[str, int] | None = None,
+) -> str:
+    failures = failures or {}
+    if not summaries and not latencies and not failures:
         return "No timings recorded yet."
 
-    lines = [_HEADER, "-" * len(_HEADER)]
-    for row in summaries:
-        lines.append(
-            f"{row.kind:<13} {row.stage:<11} {row.count:>4} "
-            f"{row.min_ms:>7}ms {row.median_ms:>7}ms {row.p90_ms:>7}ms {row.max_ms:>7}ms"
-        )
+    if summaries:
+        lines = [_HEADER, "-" * len(_HEADER)]
+        for row in summaries:
+            lines.append(
+                f"{row.kind:<13} {row.stage:<11} {row.count:>4} "
+                f"{row.min_ms:>7}ms {row.median_ms:>7}ms {row.p90_ms:>7}ms {row.max_ms:>7}ms"
+            )
+    else:
+        # A brand-new capture_timings table (e.g. right after a redeploy) is
+        # legitimately empty while the captures table -- and therefore the reply
+        # latencies below -- already has weeks of history. Only the stage table
+        # is missing; say so, rather than claiming there is nothing to report.
+        lines = ["No per-stage timings recorded yet."]
+
+    if failures:
+        excluded = sum(failures.values())
+        detail = ", ".join(f"{slug} {count}" for slug, count in sorted(failures.items()))
+        lines.append("")
+        lines.append(f"{excluded} capture(s) excluded as failed: {detail}")
 
     if latencies:
         pipeline = sorted(row.pipeline_seconds for row in latencies)
@@ -51,10 +73,18 @@ def render_recent(timings: list[CaptureTiming]) -> str:
         stages = " ".join(
             f"{name}={row.stages[name]}ms" for name in STAGES if name in row.stages
         )
-        lines.append(
-            f"{row.started_at} {row.capture_id:<16} {row.kind:<12} "
-            f"{row.outcome:<22} total={row.total_ms}ms {stages}"
+        # 24-wide: real capture ids are c-YYYYMMDD-HHMMSS-XXXX, 22 characters.
+        line = (
+            f"{row.started_at} {row.capture_id:<24} {row.kind:<12} "
+            f"{row.outcome:<22} total={row.total_ms}ms"
         )
+        # Size correlates (only the ones present -- a note has no reply sizes):
+        # a duration alone is not comparable across captures, since synthesis
+        # scales with reply length and transcription with audio length.
+        for extra in (stages, format_sizes(row.sizes)):
+            if extra:
+                line += f" {extra}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -82,13 +112,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"configuration error: {exc}", file=sys.stderr)
             return 1
 
+    # Database(path) creates the file and schema if it doesn't already exist, so
+    # a typo'd path would otherwise print "No timings recorded yet." and exit 0
+    # -- indistinguishable from a real, empty database. The readout only ever
+    # reads a database the bridge service already created.
+    if not db_path.exists():
+        print(f"no such database: {db_path}", file=sys.stderr)
+        return 1
+
     db = Database(db_path)
     try:
         timings = TimingStore(db)
-        if args.recent:
+        if args.recent and args.recent > 0:
             print(render_recent(timings.recent(limit=args.recent)))
         else:
-            print(render_summary(timings.summary(), CaptureStore(db).reply_latencies()))
+            print(
+                render_summary(
+                    timings.summary(),
+                    CaptureStore(db).reply_latencies(),
+                    timings.failure_counts(),
+                )
+            )
     finally:
         db.close()
     return 0
