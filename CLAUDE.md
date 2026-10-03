@@ -64,4 +64,4 @@ The plans' **Global Constraints** sections bind all code. The bridge ones most o
 
 ## Public repository hygiene
 
-This repo is public. Before committing any document, generalize away environment specifics: employer/workplace network details, host machine names, and operator access paths (write "the Linux host", not the actual setup). Credentials, tokens, and `wifi.json` are gitignored — keep it that way. The device uses its factory MAC address by design; do not add MAC spoofing or randomization.
+This repo is public. Before committing any document, generalize away environment specifics: employer/workplace network details, host machine names, and operator access paths (write "the Linux host", not the actual setup). Credentials, tokens, `wifi.json`, and the bridge's `config.toml` (it holds device tokens) are gitignored — keep it that way. The device uses its factory MAC address by design; do not add MAC spoofing or randomization.

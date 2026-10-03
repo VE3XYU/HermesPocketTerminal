@@ -5,6 +5,7 @@
 # Local configuration and credentials — never commit.
 secrets.h
 wifi.json
+config.toml
 *.env
 .env.*
 
