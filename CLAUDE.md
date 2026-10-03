@@ -15,8 +15,6 @@ The documents, in dependency order:
 
 `firmware/README.md` is the operator manual: build, flashing, SD provisioning, calibration, tuning knobs, and the reliability-checklist status. `bridge/README.md` covers config, deployment, and the `htp-timings` readout.
 
-`reference/pala_note/` is third-party firmware kept locally for hardware reference only (pin maps, init order). It is gitignored; never commit it, redistribute it, or copy code from it.
-
 ## Architecture
 
 Three components: **device → bridge** speaks HTP (device-initiated HTTPS only, JSON + raw WAV, no push, no WebSockets); **bridge → Hermes Agent** sends transcribed text via the agent's OpenAI-compatible API; **Hermes Agent → bridge** publishes dashboard/notification state through MCP tools the bridge exposes at `/mcp`.
